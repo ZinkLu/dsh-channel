@@ -2,7 +2,12 @@
 
 DeepSeek Harness (dsh) 的消息渠道公共层与 Telegram 验证实现。
 
-按照 [dsh-channel-design.md](./dsh-channel-design.md) 与 [dsh-channel-handoff.md](./dsh-channel-handoff.md) 拆为三个包：
+按照 [dsh-channel-design.md](./dsh-channel-design.md) 与 [dsh-channel-handoff.md](./dsh-channel-handoff.md) 拆为三个包。
+
+对 dsh 本身核心/seam 的对齐基线，见 [docs/dsh-core-reference.md](./docs/dsh-core-reference.md)
+（ctx seam/core 全表 + 核心包 + 生命周期 + 工具流水线 + 会话日志，逐条对照 rc.6 源码），
+以及 [docs/dsh-core-alignment-audit.md](./docs/dsh-core-alignment-audit.md)（设计文档对 dsh API
+的逐条核对结果）。
 
 | 包 | 目录 | 说明 |
 |---|---|---|
