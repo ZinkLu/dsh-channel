@@ -1,0 +1,14 @@
+# dsh-channel-telegram 装配示例（已按你的 user_id 配置）。
+# 注意：若宿主 harness 已加载 dsh-channel（注册表核心）或已由 bundle 自动加载，删除下面第一条 insert 即可。
+- insert:
+    - id: channel
+      name: dsh-channel
+- insert:
+    - id: channel-telegram
+      name: dsh-channel-telegram
+      config:
+        allowedUserIds: [5002186681]
+        provider: deepseek-official
+        model: deepseek-v4-flash
+        cwd: !!js process.env.HOME + '/agent-workspace'
+# token 不在此文件：dsh credentials set TELEGRAM_BOT_TOKEN 或环境变量 TELEGRAM_BOT_TOKEN。

@@ -1,0 +1,32 @@
+{
+  "name": "dsh-channel-kit",
+  "version": "0.1.0-rc.0",
+  "description": "Pure-function toolkit for DSH channel providers: chunk, merge, router, approval-render, store, format, and platform prompt hints.",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsx --test test/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^24.0.0"
+  }
+}

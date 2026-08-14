@@ -1,0 +1,52 @@
+import assert from 'node:assert/strict'
+import { test } from 'node:test'
+import { chunkText, splitMarkdownBlocks } from '../src/chunk.ts'
+
+test('splitMarkdownBlocks keeps fenced code atomic', () => {
+  const md = 'hello\n\n```js\nconst a = 1\nconst b = 2\n```\n\nworld'
+  const blocks = splitMarkdownBlocks(md)
+  assert.equal(blocks.length, 3)
+  assert.match(blocks[1]!, /^```js\nconst a = 1/)
+  assert.match(blocks[1]!, /```$/)
+})
+
+test('chunkText packs blocks greedily and does not split code block when possible', () => {
+  const md = 'short\n\n```js\ncode here\n```'
+  const chunks = chunkText(md, { maxChars: 100 })
+  assert.equal(chunks.length, 1)
+  assert.equal(chunks[0], md)
+})
+
+test('chunkText hard-splits oversized code blocks and re-fences each piece', () => {
+  const line = 'x'.repeat(80)
+  const md = `before\n\n\`\`\`js\n${line}\n${line}\n\`\`\``
+  const chunks = chunkText(md, { maxChars: 120, countBy: 'utf16' })
+  for (const chunk of chunks) {
+    assert.ok(chunk.length <= 120)
+  }
+  const codeChunks = chunks.filter((chunk) => chunk.startsWith('```js'))
+  assert.ok(codeChunks.length >= 1)
+  for (const chunk of codeChunks) {
+    assert.ok(chunk.startsWith('```js'))
+    assert.ok(chunk.trimEnd().endsWith('```'))
+  }
+})
+
+test('chunkText numbering prefix converges', () => {
+  const text = Array.from({ length: 10 }, (_, i) => `第${i}段内容`.repeat(20)).join('\n\n')
+  const chunks = chunkText(text, { maxChars: 100, numbering: 'prefix' })
+  assert.ok(chunks.length >= 2)
+  for (let i = 0; i < chunks.length; i++) {
+    assert.ok(chunks[i]!.startsWith(`（${i + 1}/${chunks.length}）`))
+    assert.ok([...chunks[i]!].length <= 100)
+  }
+})
+
+test('chunkText prefers sentence breaks but always respects maxChars', () => {
+  const text = '第一句。第二句。第三句。'
+  const chunks = chunkText(text, { maxChars: 5 })
+  for (const chunk of chunks) {
+    assert.ok([...chunk].length <= 5)
+  }
+  assert.ok(chunks.length >= 2)
+})
