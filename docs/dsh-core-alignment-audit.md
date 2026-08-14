@@ -1,6 +1,6 @@
 # dsh-channel 设计对齐核对（对照 rc.6 源码）
 
-> 核对对象：`dsh-channel-design.md` §1.1/§1.2 与 `dsh-channel-handoff.md` R1–R10 里
+> 核对对象：`dsh-channel-design.md` §1.1/§1.2 与 R1–R10（原 handoff，已并入 design §6）里
 > **对 dsh 核心 API 的每一条具体断言**。
 > 核对基线：`@deepseek-ai/*@0.1.0-rc.6` 编译类型（`node_modules/@deepseek-ai/*/lib/types/*.d.ts`）
 > + 官方参考文档（master）。
@@ -52,7 +52,7 @@
 
 ---
 
-## 3. `dsh-channel-handoff.md` R1–R10 硬约束核对
+## 3. R1–R10 硬约束核对（原 handoff，已并入 design §6）
 
 | 规则 | 结论 | 说明 |
 |---|---|---|

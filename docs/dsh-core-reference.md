@@ -290,6 +290,30 @@ interface ApprovalRequest {
 （fail-closed）；`'never'` 策略在 dispatch 前就地 `'rejected'`；rogue 非词汇返回值
 归一化为 `'unavailable'`。源码：`dsh-user-approval/lib/types/index.d.ts` 与 `types.d.ts`。
 
+### 5.1 工具属于 agent preset（agent 平面）
+
+Web 部署下**工具不是全局的**，而是按会话由 preset 在 agent 平面挂载。分两层：
+
+- `dsh-base` 全局装载 `tool-*`（TUI 单会话直接用）；`dsh-web-app` 把这些全局工具行
+  **全部 `disabled: true`**，改挂 `dsh-agent-presets`（`default: standard`）。
+- `standard` preset（`config/agent-presets/standard/agent.cordis.yml`）是 **agent-plane
+  组合**：把 `tool-bash`/`tool-fs`/`tool-web`/`tool-subagent`/`tool-ralph`/`tool-workflow`/
+  `plan-mode`/`tool-todo`/`tool-ask-user` 等整套工具 + persona + skills 重新挂进每个会话。
+
+**join 机制**：`dsh-agent-presets` 提供 `mount(agentCtx, id?)` 与 `composeFrom(agentCtx, parentCtx)`，
+**必须在 agent factory 的 `setup(agentCtx)` 里调用**（失败会回滚整个创建）。canonical 调用点
+是 `dsh-host-apiproxy` 的 `composeAgent`：先 `resolve(id)` 拿到 resolved id → 写进
+`meta.agentPreset`（session header，供 resume 重建）→ setup 里 `await presets.mount(agentCtx, resolvedId)`。
+
+**漏 join 的后果**：agent 发布时 `dsh-agent-presets` 打警告——
+
+> `agent … was published without joining an agent preset; its tools, prompt sections, and skill catalog resolve against the empty global layer`
+
+空全局层 ⇒ `request/header.tools` 为空 ⇒ DeepSeek 模型把想调用的工具写成 `<tool_calls>`
+XML 纯文本吐出来。**对本项目（channel）的直接要求**：任何渠道 provider 用
+`ctx.agents.create()` 建 agent 时，都必须 resolve + 记录 + mount preset，才能继承宿主
+默认能力；无 roster（`ctx.get('agentPresets')` 为空）时降级走 host 全局层。
+
 ---
 
 ## 6. 会话日志与 SessionEventMap
@@ -363,7 +387,7 @@ rc.6 的规范 map（本项目会扩展 `MessageSourceMap`）：
 
 ## 8. 与本项目设计的对齐核对
 
-`dsh-channel-design.md` §1.1/§1.2 与 `dsh-channel-handoff.md` R1–R10 的**逐条核对**
+`dsh-channel-design.md` §1.1/§1.2 与 R1–R10（现见 design §6）的**逐条核对**
 （每条附 rc.6 源码行号）见 `dsh-core-alignment-audit.md`。
 
 摘要结论：

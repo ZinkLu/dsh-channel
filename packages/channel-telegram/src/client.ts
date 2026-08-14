@@ -25,6 +25,58 @@ export interface TelegramMessage {
   entities?: TelegramEntity[]
   caption_entities?: TelegramEntity[]
   reply_markup?: TelegramInlineKeyboardMarkup
+  photo?: TelegramPhotoSize[]
+  document?: TelegramDocument
+  video?: TelegramVideo
+  audio?: TelegramAudio
+  voice?: TelegramVoice
+}
+
+export interface TelegramPhotoSize {
+  file_id: string
+  file_unique_id: string
+  width: number
+  height: number
+  file_size?: number
+}
+
+export interface TelegramDocument {
+  file_id: string
+  file_unique_id: string
+  file_name?: string
+  mime_type?: string
+  file_size?: number
+}
+
+export interface TelegramVideo {
+  file_id: string
+  file_unique_id: string
+  width: number
+  height: number
+  mime_type?: string
+  file_size?: number
+}
+
+export interface TelegramAudio {
+  file_id: string
+  file_unique_id: string
+  mime_type?: string
+  file_name?: string
+  file_size?: number
+}
+
+export interface TelegramVoice {
+  file_id: string
+  file_unique_id: string
+  mime_type?: string
+  file_size?: number
+}
+
+export interface TelegramFile {
+  file_id: string
+  file_unique_id: string
+  file_size?: number
+  file_path?: string
 }
 
 export interface TelegramEntity {
@@ -140,6 +192,97 @@ export class TelegramClient {
       parse_mode: opts.parseMode,
       reply_markup: opts.replyMarkup,
     }, opts.signal)
+  }
+
+  async deleteMessage(token: string, chatId: string, messageId: number, signal?: AbortSignal): Promise<boolean> {
+    return this.callApi(token, 'deleteMessage', { chat_id: chatId, message_id: messageId }, signal)
+  }
+
+  /** 取 file_id 对应的文件字节（getFile 拿 file_path → 从 file 端点下载）。 */
+  async getFile(token: string, fileId: string, signal?: AbortSignal): Promise<{ bytes: Uint8Array; filePath: string }> {
+    const file = await this.callApi<TelegramFile>(token, 'getFile', { file_id: fileId }, signal)
+    if (!file.file_path) throw new TelegramApiError(TelegramClient.redactToken('telegram getFile returned no file_path', token))
+    const url = `${this.baseUrl}/file/bot${token}/${file.file_path}`
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(new Error(`telegram download timeout after ${this.timeoutMs}ms`)), this.timeoutMs)
+    timer.unref?.()
+    const onOuterAbort = () => controller.abort(signal?.reason)
+    signal?.addEventListener('abort', onOuterAbort, { once: true })
+    try {
+      const response = await this.fetchImpl(url, { signal: controller.signal })
+      if (!response.ok) throw new TelegramApiError(TelegramClient.redactToken(`telegram download failed: HTTP ${response.status}`, token))
+      const bytes = new Uint8Array(await response.arrayBuffer())
+      return { bytes, filePath: file.file_path }
+    } finally {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onOuterAbort)
+    }
+  }
+
+  /** 上传并发送一张图片（multipart/form-data）。 */
+  async sendPhoto(
+    token: string,
+    chatId: string,
+    photo: Uint8Array,
+    opts: { caption?: string; fileName?: string; signal?: AbortSignal } = {},
+  ): Promise<TelegramMessage> {
+    return this.callApiMultipart<TelegramMessage>(token, 'sendPhoto', chatId, 'photo', photo, opts.fileName ?? 'photo.jpg', 'image/jpeg', opts.caption, opts.signal)
+  }
+
+  /** 上传并发送一个文档（multipart/form-data）。 */
+  async sendDocument(
+    token: string,
+    chatId: string,
+    document: Uint8Array,
+    opts: { caption?: string; fileName?: string; mimeType?: string; signal?: AbortSignal } = {},
+  ): Promise<TelegramMessage> {
+    return this.callApiMultipart<TelegramMessage>(token, 'sendDocument', chatId, 'document', document, opts.fileName ?? 'document.bin', opts.mimeType ?? 'application/octet-stream', opts.caption, opts.signal)
+  }
+
+  private async callApiMultipart<T>(
+    token: string,
+    method: string,
+    chatId: string,
+    field: string,
+    bytes: Uint8Array,
+    fileName: string,
+    mimeType: string,
+    caption: string | undefined,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const url = `${this.baseUrl}/bot${token}/${method}`
+    const form = new FormData()
+    form.set('chat_id', chatId)
+    form.set(field, new Blob([bytes as BlobPart], { type: mimeType }), fileName)
+    if (caption !== undefined && caption !== '') {
+      form.set('caption', caption)
+      form.set('parse_mode', 'HTML')
+    }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(new Error(`telegram api timeout after ${this.timeoutMs}ms`)), this.timeoutMs)
+    timer.unref?.()
+    const onOuterAbort = () => controller.abort(signal?.reason)
+    signal?.addEventListener('abort', onOuterAbort, { once: true })
+
+    try {
+      const response = await this.fetchImpl(url, { method: 'POST', body: form, signal: controller.signal })
+      const payload = (await response.json()) as TelegramResponse<T>
+      if (!payload.ok) {
+        throw new TelegramApiError(
+          TelegramClient.redactToken(`telegram api ${method} failed: ${payload.description ?? 'unknown error'}`, token),
+          payload.description,
+          payload.error_code,
+        )
+      }
+      return payload.result as T
+    } catch (error) {
+      if (error instanceof TelegramApiError) throw error
+      const message = error instanceof Error ? error.message : String(error)
+      throw new TelegramApiError(TelegramClient.redactToken(`telegram api ${method} request failed: ${message}`, token))
+    } finally {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onOuterAbort)
+    }
   }
 
   private async callApi<T>(token: string, method: string, body: unknown, signal?: AbortSignal): Promise<T> {

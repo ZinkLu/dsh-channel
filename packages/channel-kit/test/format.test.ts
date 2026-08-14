@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { renderForTier } from '../src/format.ts'
+import { renderForTier, stripReasoningTags, stripToolCallMarkup } from '../src/format.ts'
 
 test('markdown tier returns source unchanged', () => {
   const md = '**bold** `code` [t](u)'
@@ -42,4 +42,50 @@ test('html tier renders table as pre', () => {
   const html = renderForTier(md, 'html')
   assert.ok(html.includes('<pre>'))
   assert.ok(html.includes('a | b'))
+})
+
+test('stripToolCallMarkup removes a balanced <tool_calls> block', () => {
+  const text = '抱歉，我再看一次：\n<tool_calls>\n<invoke name="Bash">\n<parameter name="command" string="true">date</parameter>\n</invoke>\n</tool_calls>'
+  assert.equal(stripToolCallMarkup(text), '抱歉，我再看一次：')
+})
+
+test('stripToolCallMarkup keeps text before and after the block', () => {
+  const text = 'before\n<tool_calls>\n<invoke name="Bash">\n<parameter name="command">date</parameter>\n</invoke>\n</tool_calls>\nafter'
+  assert.equal(stripToolCallMarkup(text), 'before\n\nafter')
+})
+
+test('stripToolCallMarkup removes adjacent blocks', () => {
+  const text = 'a<tool_calls><invoke name="Bash"><parameter name="command">x</parameter></invoke></tool_calls>b'
+  assert.equal(stripToolCallMarkup(text), 'ab')
+})
+
+test('stripToolCallMarkup removes unbalanced leftover tags', () => {
+  const text = '<tool_calls>\n<invoke name="Bash">\n<parameter name="command">date'
+  assert.equal(stripToolCallMarkup(text), 'date')
+})
+
+test('stripToolCallMarkup is a no-op for ordinary text', () => {
+  const text = '你好，今天是 **周五**，`code` 和 [链接](https://e.com)'
+  assert.equal(stripToolCallMarkup(text), text)
+})
+
+test('stripReasoningTags removes reasoning and thinking blocks', () => {
+  assert.equal(stripReasoningTags('a <reasoning>secret</reasoning> b'), 'a  b')
+  assert.equal(stripReasoningTags('<thinking>t</thinking>x'), 'x')
+})
+
+test('stripReasoningTags removes preamble lines', () => {
+  assert.equal(stripReasoningTags('Reasoning:\n实际输出'), '实际输出')
+  assert.equal(stripReasoningTags('思考：\n实际输出'), '实际输出')
+})
+
+test('stripReasoningTags strict strips inside fences, preserve keeps them', () => {
+  const fenced = '```\n<reasoning>literal</reasoning>\n```'
+  assert.ok(stripReasoningTags(fenced, { mode: 'preserve' }).includes('<reasoning>literal</reasoning>'))
+  assert.ok(!stripReasoningTags(fenced).includes('<reasoning>'))
+})
+
+test('stripReasoningTags is a no-op for ordinary text', () => {
+  const text = '正常回答，含 `code` 和 [链接](https://e.com)'
+  assert.equal(stripReasoningTags(text), text)
 })

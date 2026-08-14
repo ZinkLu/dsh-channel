@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
-import { Channel, ChannelRegistry, type InboundMessage, type OutboundMessage } from '../src/index.ts'
+import { Channel, ChannelRegistry, type InboundMessage, type OutboundMedia, type OutboundMessage } from '../src/index.ts'
 
 class FakeChannel extends Channel {
   readonly id = 'fake'
@@ -72,6 +72,56 @@ test('channel/message is emitted on ingest', () => {
   root.channels.ingest(msg)
   assert.equal(seen.length, 1)
   assert.equal(seen[0]!.messageId, 'm1')
+})
+
+class MediaChannel extends FakeChannel {
+  readonly media: OutboundMedia[] = []
+  get supportsMedia(): boolean {
+    return true
+  }
+  async sendMedia(chatKey: string, media: OutboundMedia): Promise<{ platformMessageId: string }> {
+    this.media.push(media)
+    return { platformMessageId: `media-${this.media.length}` }
+  }
+}
+
+test('ChannelRegistry.deliver sends media via sendMedia when supported', async () => {
+  const root = new Context()
+  new ChannelRegistry(root)
+  const channel = new MediaChannel()
+  root.channels.register(channel)
+
+  const receipt = await root.channels.deliver({
+    channel: 'fake',
+    chatKey: '42',
+    markdown: 'here is a file',
+    deliveryKey: 'k1',
+    media: [{ kind: 'document', filePath: 'out.txt' }],
+  })
+  assert.equal(receipt.status, 'sent')
+  assert.deepEqual(receipt.platformMessageIds, ['msg-1', 'media-1'])
+  assert.deepEqual(channel.sent, ['42:here is a file'])
+  assert.equal(channel.media.length, 1)
+  assert.equal(channel.media[0]!.filePath, 'out.txt')
+})
+
+test('ChannelRegistry.deliver degrades media to a text note when unsupported (no path leak)', async () => {
+  const root = new Context()
+  new ChannelRegistry(root)
+  const channel = new FakeChannel() // supportsMedia=false
+  root.channels.register(channel)
+
+  const receipt = await root.channels.deliver({
+    channel: 'fake',
+    chatKey: '42',
+    markdown: 'here is a file',
+    deliveryKey: 'k1',
+    media: [{ kind: 'document', filePath: '/secret/host/path.txt' }],
+  })
+  assert.equal(receipt.status, 'sent')
+  assert.equal(channel.sent.length, 2)
+  assert.equal(channel.sent[1], '42:⚠️ 无法投递文件附件。')
+  assert.ok(!channel.sent[1]!.includes('/secret/host'))
 })
 
 test('channel/deliver waterfall can suppress and observe', async () => {

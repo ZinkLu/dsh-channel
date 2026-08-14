@@ -1,7 +1,7 @@
 # dsh-channel 设计与技术文档
 
-> 版本：v0.1 草案 · 日期：2026-08-14
-> 上游：[dsh-channel-handoff.md](./dsh-channel-handoff.md)（目标、边界、R1–R10 硬约束、验收标准以该文档为准）
+> 版本：v0.2 草案 · 日期：2026-08-14
+> R1–R10 硬约束与验收标准（A1–A6）已并入 §6/§7；原 `dsh-channel-handoff.md` 已删除，本文档为唯一设计源。
 > 调研基线：deepseek-harness@47f9438、LoserFox/telegram、BiBoyang/dsh-im-bridge、Jesse-njx/dsh-chatnode-wechat、nowledge-mem、NousResearch/hermes-agent、openclaw/openclaw（均为 2026-08-14 主分支快照）
 
 ---
@@ -10,13 +10,16 @@
 
 **`ctx.channels` 是一个照抄 `LlmRuntime` 形状的注册表 core；`Channel` 是照抄 `LlmAdapter` 形状的普通抽象类 seam；六件脏活是不碰 IO 的纯函数库；入站消息以可归并的 `source.kind: 'channel'` 落进 session log，幂等从日志折叠推导；审批是 `approval/request` waterfall 上一个"只答自己 agent、超时必 `next()`、绝不默认放行"的 answerer。**
 
-三包结构与职责边界不变（见 handoff §0）：
+结构是**两个固定公共包 + 每平台一个 provider（开放集）**，职责边界不变：
 
-| 包 | 一句话 | npm 名（建议） |
-|---|---|---|
-| `dsh-channel` | 契约：`declare module` + `abstract class Channel` + `channel/*` 事件 + 消息类型。零实现 | `dsh-channel` |
-| `dsh-channel-kit` | 六件脏活的纯函数 + `ChannelStore` 接口与 JSON 文件实现 | `dsh-channel-kit` |
-| `dsh-channel-telegram` | 第一个 provider，验证抽象 | `dsh-channel-telegram` |
+| 层 | 包 | 一句话 | npm 名（建议） |
+|---|---|---|---|
+| 契约（唯一 core） | `dsh-channel` | 契约：`declare module` + `abstract class Channel` + `channel/*` 事件 + 消息类型。零实现 | `dsh-channel` |
+| 纯函数库（唯一） | `dsh-channel-kit` | 六件脏活的纯函数 + `ChannelStore` 接口与 JSON 文件实现 | `dsh-channel-kit` |
+| provider（第 1…N 个） | `dsh-channel-telegram`（第 1 个） | 每平台一个：实现 `Channel` 能力事实 + `send`，接 kit 全链路 | 各自 npm 名 |
+
+前两层是固定的公共层；provider 是**开放集**——本仓库负责逐平台添加实现（Telegram 是第 1 个，
+Discord / WeChat / Feishu / … 后续新增），每加一个平台只新增一个包，`dsh-channel` / `dsh-channel-kit` 零改动（A5）。
 
 ---
 
@@ -32,11 +35,11 @@
 | 依赖方向 | 跨 dsh 包一律 `peerDependencies`（+ devDeps 供测试），`dependencies` 只留第三方 | `packages/fs/tool-fs/package.json` |
 | 可选依赖降级 | `import type {} from '...'` + `ctx.get('approval')`，缺失→deny，注释写明"historical degrade to deny" | `packages/core/tools/src/index.ts:1678` |
 
-**设计裁定：`Channel` 不继承 `Service`。** handoff R6 的示意代码写了 `extends Service`，但 R5 同时指明"对照 LlmRuntime + 多个 adapter，形状一致"——而 `LlmAdapter` 正是普通抽象类。一个 Service 独占一个 ctx key，多平台并存时没有第二个 key 可占；provider 的生命周期由它自己的插件 fiber 承载，注册项由 `ctx.channels.register()` 返回的 disposer 回收。这与 R1/R5 一致，且少一层 Cordis 代理。
+**设计裁定：`Channel` 不继承 `Service`。** R6 的示意代码写了 `extends Service`，但 R5 同时指明"对照 LlmRuntime + 多个 adapter，形状一致"——而 `LlmAdapter` 正是普通抽象类。一个 Service 独占一个 ctx key，多平台并存时没有第二个 key 可占；provider 的生命周期由它自己的插件 fiber 承载，注册项由 `ctx.channels.register()` 返回的 disposer 回收。这与 R1/R5 一致，且少一层 Cordis 代理。
 
 ### 1.2 待核实 API：已全部核实
 
-| handoff §2 待核实项 | 核实结果 |
+| 待核实项 | 核实结果 |
 |---|---|
 | `ctx.agents` 创建/投递/输出 | `ctx.agents.create({ sessionId, meta: { cwd, agentPreset… }, agentOptions: { provider, model }, setup? })` → `AgentHandle { agent, dispose }`；`ctx.agents.resume({ resumeSessionId, … })` 恢复持久化会话（依赖 `sessionPersistence`）；`ctx.agents.get(id)` 返回裸 `Agent`。投递入站：`agent.followup(msg)`（独立新 turn 并唤醒）/ `agent.steer(msg)`（插话，最近 step 边界消费）/ `agent.inject(msg)`（注入上下文，不唤醒）。输出没有回调 API——**从 `session/event` 流上读** `assistant/message` / `turn/end`。`agent.status`（`idle`/`running`）与 `agent/status` 事件可驱动 typing 指示。 |
 | `session/event` schema | `(session: Session, event: SessionEvent)`，emit 模式、post-commit、fire-and-forget；`SessionEvent = { type, seq, time, data, ignorable? }`。`SessionEventMap` 通过 `declare module '@deepseek-ai/dsh-session/types'` 归并扩展（user-approval 的 `approval/asked`/`approval/decided` 是现成范例）。注意：**裸事件夹在 turn 之外，reload 时视作 crash tail 被丢弃**——想扩展日志事件必须包在开启的 turn 内（见 §4.5 store 的取舍）。 |
@@ -57,7 +60,7 @@
 | format | Markdown→Telegram HTML 子集，失败回退纯文本 | 无 | markdown 规范化 |
 | 服务抽象 | 无 | 无 | **唯一做了服务分层的**：`ctx.wechat` gateway + `wechat/message` 事件 + node 消费层 |
 
-三家各自为战却收敛出同一组文件名——证明六件脏活是问题固有形状（handoff §3 判断成立）。共同缺陷：**没有一家从 session log 推导幂等**（都是自建状态），没有一家表达能力事实（chunk 长度、按钮有无全部硬编码）。chatnode 的 gateway/node 分界与"allowlist 是安全边界、必填无默认"的立场直接采纳。
+三家各自为战却收敛出同一组文件名——证明六件脏活是问题固有形状（§4 判断成立）。共同缺陷：**没有一家从 session log 推导幂等**（都是自建状态），没有一家表达能力事实（chunk 长度、按钮有无全部硬编码）。chatnode 的 gateway/node 分界与"allowlist 是安全边界、必填无默认"的立场直接采纳。
 
 ### 1.4 hermes-agent 与 openclaw：成熟 gateway 的可搬结论
 
@@ -115,7 +118,7 @@ flowchart LR
 - **入站**：平台消息 → provider 去重（store+日志折叠）→ `ctx.channels.ingest()` 发出 `channel/message` → provider 自己（或未来的通用 consumer）经 merge/router → `agent.followup()` → 成为 `user/message`（`source.kind: 'channel'`，携带平台消息 id）落日志。
 - **出站**：`session/event` 上读到 `assistant/message` / `turn/end` → 组装 `OutboundMessage` → `ctx.channels.deliver()` 走 `channel/deliver` waterfall（策略插件在此拦截）→ 落 delivery ledger → `Channel.send()` 分段发送 → 标记 delivered。
 
-**为什么 provider 既发出又消费 `channel/message`？** 事件不是给自己用的——它是策略扩展点（R4：限流、脱敏、审计插件只监听事件就能工作）与未来"通用 consumer 插件"的接缝。v1 里 provider 自己闭环，事件照发；第二平台验证时若出现可共享的 consumer 逻辑，可平移进独立插件而不改契约。
+**为什么 provider 既发出又消费 `channel/message`？** 事件不是给自己用的——它是策略扩展点（R4：限流、脱敏、审计插件只监听事件就能工作）与未来"通用 consumer 插件"的接缝。v1 里 provider 自己闭环，事件照发；下一个平台验证时若出现可共享的 consumer 逻辑，可平移进独立插件而不改契约。
 
 ---
 
@@ -323,13 +326,13 @@ export class ChannelRegistry extends Service {
 }
 ```
 
-peerDeps **收窄版本范围**（dsh 是 developer preview，见 handoff §6 风险）。定义包不依赖 `dsh-session` / `dsh-agent`——契约里只出现自己的类型与 `dsh-llm` 的 source 归并；`grep dsh-channel-telegram` 在本包必须零命中（A2）。
+peerDeps **收窄版本范围**（dsh 是 developer preview，见 §9 风险）。定义包不依赖 `dsh-session` / `dsh-agent`——契约里只出现自己的类型与 `dsh-llm` 的 source 归并；`grep dsh-channel-telegram` 在本包必须零命中（A2）。
 
 ---
 
 ## 4. `dsh-channel-kit` 六件脏活
 
-**总原则**：每个模块是"输入 → 输出、无 IO、无定时器、无全局态"的纯函数；时间以参数传入，定时器与文件系统被隔离在两个明确标注的非纯文件（`store/json-file.ts`、`runtime/timers.ts`）里。kit 不 import cordis——不用 dsh 的人也能拿去接自己的 bot（handoff：文档和模板比功能更重要）。
+**总原则**：每个模块是"输入 → 输出、无 IO、无定时器、无全局态"的纯函数；时间以参数传入，定时器与文件系统被隔离在两个明确标注的非纯文件（`store/json-file.ts`、`runtime/timers.ts`）里。kit 不 import cordis——不用 dsh 的人也能拿去接自己的 bot（文档和模板比功能更重要）。
 
 ### 4.1 chunk —— 长回复怎么切
 
@@ -344,7 +347,7 @@ export function chunkText(markdown: string, opts: ChunkOptions): string[]
 
 算法（合并三家实现的优点）：
 
-1. **按 markdown 块切分**，围栏代码块视为原子（chatnode 的 `splitMarkdownBlocks`）——不切断代码块与链接（handoff §3 硬要求）；
+1. **按 markdown 块切分**，围栏代码块视为原子（chatnode 的 `splitMarkdownBlocks`）——不切断代码块与链接（§4 硬要求）；
 2. 贪心装箱到 `maxChars`（chatnode `packBlocks`）；
 3. 超长的单一原子块退化为硬切，但**代码块硬切时补围栏**（切口处补 ``` 收尾/重开，保持每段可渲染）；
 4. `numbering: 'prefix'` 时套用 im-bridge 的前缀宽度递归收敛（前缀占预算，段数与前缀宽互相影响，5 轮收敛，失败退无前缀）；
@@ -374,7 +377,7 @@ export function mergeReduce(state: MergeState, input: MergeInput, opts: MergeOpt
 - `hasMedia` 的消息**立即 flush 当前缓冲并单独交付**——附件不与文本批合并；
 - `..` 后缀 = 继续等（重置窗口）；`!!` 后缀 = 立即 flush；裸后缀忽略（im-bridge 语义，可配置关闭）；
 - 默认窗口 5s；缓冲以 `\n` join；
-- **agent 思考中插话**：merge 不管——flush 后由消费方按 agent 状态选投递方式：`idle → followup`，`running → steer`（dsh 的 inbox 语义天然回答了 handoff 的这个问号）。
+- **agent 思考中插话**：merge 不管——flush 后由消费方按 agent 状态选投递方式：`idle → followup`，`running → steer`（dsh 的 inbox 语义天然回答了这个问号）。
 
 崩溃恢复：每次 buffer 变化产出快照（消费方写入 store 的 `mergeBuffers`），启动时 `restore` 后当作刚到达重新起窗（im-bridge 方案）。
 
@@ -422,7 +425,7 @@ R2 验收在此闭环：不装 approval 插件时 `approval/request` 事件根�
 
 ### 4.5 store —— 日志推导不了的那一小块
 
-先立规矩（handoff §3："优先从 session log 推导，不要另建状态"）：
+先立规矩（§4："优先从 session log 推导，不要另建状态"）：
 
 | 事实 | 归属 | 理由 |
 |---|---|---|
@@ -599,7 +602,7 @@ HTML 发送失败自动降级纯文本重试一次（LoserFox 的 `safeSend` 双
 | R3 分包 | 消费方/策略插件只 peer `dsh-channel`；provider 名不出现在任何 deps/peerDeps | CI grep（T2） |
 | R4 契约 | §3.1 单一 declare 块；策略插件纯事件可用 | 审计插件示例（T6） |
 | R5 形状 | Registry=Service core，Channel=普通抽象类 seam，对齐 LlmRuntime/LlmAdapter | 代码评审对照 |
-| R6 能力事实 | §3.3 六个 get，保守默认；接口零平台特例方法 | 第二平台不改契约（T7/A5） |
+| R6 能力事实 | §3.3 六个 get，保守默认；接口零平台特例方法 | 每加一个平台不改契约（T7/A5） |
 | R7 日志纪律 | source.messageIds 进 log；幂等=日志折叠+store 兜底；无影子会话状态 | 杀进程重启测试（T4/A4） |
 | R8 waterfall | approval answerer 非自有 agent/超时一律 `next()`；deliver 观察者必须 `next()` | 单测 + 评审 |
 | R9 YAML 装配 | §5.5；凭据走 credentials | 评审 + 配置示例可跑 |
@@ -617,13 +620,13 @@ HTML 发送失败自动降级纯文本重试一次（LoserFox 的 `safeSend` 双
 | T4 | 注入两条消息 → kill -9 → 重启 → `agents.resume` 重建；重放轮询批次断言零重复注入；ledger `attempting` 条目重投带恢复标记 | A4 |
 | T5 | 六模块纯函数单测（chunk 围栏补齐/前缀收敛、merge 三铁律与 `..`/`!!`、router 决定表、approval 编号/超时、store 状态机、format 降级表），不起 dsh | A6 |
 | T6 | 审计插件示例：仅事件监听统计收发条数 | R4 |
-| T7 | **第二平台骨架**（建议 Discord：有按钮 + threads + markdown 档位，与 Telegram 的 html 档形成能力对照；飞书亦可）：实现 `Channel` 六个事实 + `send`，接 kit 全链路，**`dsh-channel`/`dsh-channel-kit` 零改动** | A5 |
+| T7 | **下一个平台骨架**（建议 Discord：有按钮 + threads + markdown 档位，与 Telegram 的 html 档形成能力对照）：实现 `Channel` 能力事实 + `send`，接 kit 全链路，**`dsh-channel`/`dsh-channel-kit` 零改动**——A5 的第一次复现 | A5 |
 
-按 handoff 的忠告，**T7 的接口调用清单在写 Telegram 的第一周就列出**（M3 与 M4 并行推演），不等 M3 结束。
+按 T7 的忠告，**T7 的接口调用清单在写 Telegram 的第一周就列出**（M3 与 M4 并行推演），不等 M3 结束。
 
 ---
 
-## 8. 里程碑（映射 handoff §5）
+## 8. 里程碑（映射 §8）
 
 | 阶段 | 产出 | 出口 |
 |---|---|---|
@@ -631,8 +634,9 @@ HTML 发送失败自动降级纯文本重试一次（LoserFox 的 `safeSend` 双
 | M1 | `dsh-channel`：§3 全部类型 + Registry + 空 provider 装卸测试 | 空实现装载/卸载干净 |
 | M2 | `dsh-channel-kit`：六模块 + T5 全绿 | A6 |
 | M3 | `dsh-channel-telegram` 端到端 + T1/T3/T4 | A1 A3 A4 |
-| M4 | Discord（或飞书）骨架 + T7 | A5 |
+| M4 | 下一个平台（Discord / WeChat / Feishu / …）+ T7；此后**每加一个平台都是 A5 的一次复现**，仓库持续新增 | A5 |
 | M5 | npm 发布 + `dsh-plugin` topic + awesome-dsh-plugin PR + 「接一个新平台」教程（hermes 的 ADDING_A_PLATFORM 是文风范本：必选面一张表、可选面一张表、逐条降级说明） | — |
+| M6 | 媒体（§10）：契约加 `InboundMedia`/`OutboundMedia`/`supportsMedia`/`sendMedia`；Telegram `getFile` 下载 + `sendPhoto`/`sendDocument` 发送 | 图片端到端（入站落日志、出站可达） |
 
 ---
 
@@ -644,8 +648,62 @@ HTML 发送失败自动降级纯文本重试一次（LoserFox 的 `safeSend` 双
 | `channel/deliver` waterfall 的分段位置 | v1：渲染+分段在 provider 侧、waterfall 传整条语义消息（策略插件看到的是完整意图而非碎片）。若策略插件需要逐段拦截，v2 再议——契约不变，只是 innermost 行为细化 |
 | merge 定时器与 Cordis 生命周期 | 定时器在 bridge 的 effect 内创建、dispose 时全清；reducer 纯函数保证测试不需要真实时间 |
 | 群聊语义 | v1 明确 drop；`chatType`/`mentionsBot` 事实已在契约里，开群聊不动 `dsh-channel` |
-| 媒体消息 | v1 只带 `hasMedia` 事实（merge 需要它），内容不处理；v2 评估 `ctx.attachments` 对接 |
+| 媒体消息 | **已纳入计划（§10）**：入站图片经 `ctx.attachments.saveImage` 落日志、其余媒体带 `fileRef` 事实；出站走 `supportsMedia`/`sendMedia` 能力事实 |
 | 出站 ledger 要不要进 session log | 已裁定不进（§4.5）：turn 外裸事件会被 reload 丢弃，且送达状态不是模型可见事实；保持"日志=模型所见，store=平台交接"两个世界的干净分界 |
+
+---
+
+## 10. 媒体能力（接收 + 发送）设计
+
+> 状态：计划（M6）· 动机：图片/文件是高频交互，媒体接收与发送纳入范围。
+
+### 10.1 dsh 原生原料（rc.6 已核实）
+
+- `ContentBlock` 有 `image` 块：`ImageBlock { type:'image', attachment: ImageAttachmentRef }`（`dsh-llm/types.d.ts:54`）。
+- `ctx.attachments` = `AttachmentStore`（`dsh-attachment`）：`saveImage(input) → ImageAttachmentRef`（校验+落库+发引用）、`readImage(ref)`、`validateImage(input)`。
+- **关键边界**：rc.6 的 attachment seam **只收图片**（`saveImage`/`ImageAttachmentRef`），**文档/音频/视频没有一级存储**；且生产适配器声明 text-only 输出，模型侧当前基本不吐 image 块。→ 媒体主要走**入站（用户发图给模型看）+ 出站（渠道/工具发文件给用户）**。
+
+### 10.2 入站接收
+
+```ts
+// InboundMessage 增加（hasMedia 保留，供 merge 决策"带附件不合并"）
+readonly media?: ReadonlyArray<InboundMedia>
+interface InboundMedia {
+  readonly kind: 'image' | 'document' | 'audio' | 'video'
+  /** 平台侧文件引用（provider 定义，如 Telegram file_id）——交接事实，不下载字节 */
+  readonly fileRef: string
+  readonly mimeType?: string
+  readonly fileName?: string
+}
+```
+
+- **图片（模型可见，R7）**：provider 用平台 API（Telegram `getFile`）下载字节 → `ctx.attachments.saveImage(...)` → `ImageAttachmentRef` → 作为 `image` 块放进 `user/message.content`，随日志持久化、`deriveMessages()` 直接投喂模型。
+- **文档/音视频（dsh 无存储）**：只带 `fileRef`+元数据事实；可选"下载到 agent workspace（`meta.cwd`）供 fs 工具读取"，不塞 content 块。
+- merge 的"带附件不合并"铁律已就位（§4.2）；`ctx.attachments` 缺失时图片降级为 `fileRef` 事实（R2 可选依赖）。
+
+### 10.3 出站发送
+
+```ts
+// Channel 抽象类：能力事实 + 可选方法（基类保守默认，照 hermes send_image/send_file 降级）
+get supportsMedia(): boolean { return false }
+async sendMedia(_chatKey: string, _media: OutboundMedia, _opts?: { signal?: AbortSignal }): Promise<{ platformMessageId: string }> {
+  throw new Error(`${this.id} does not support media`)
+}
+
+// OutboundMessage 增加
+readonly media?: readonly OutboundMedia[]
+interface OutboundMedia {
+  readonly kind: 'image' | 'document'
+  /** 图片：ctx.attachments 的引用（不裸传宿主路径，防路径泄漏 + R7） */
+  readonly attachment?: ImageAttachmentRef
+  /** 文档：agent workspace（cwd）内的相对路径；字节由 provider 读取 */
+  readonly filePath?: string
+  readonly caption?: string
+}
+```
+
+- 对齐 hermes：`send_image/send_file` 是**可选 adapter 方法 + 基类降级**（hermes 默认"⚠️ Couldn't deliver…"且**绝不回显宿主路径**）。禁止往 `Channel` 加只有单平台能实现的方法（R6）。
+- Telegram 实现：`supportsMedia = true`；`getFile`（入站下载）+ `sendPhoto`/`sendDocument`（出站）；`filePath` 解析锚定 `meta.cwd`，越界拒绝。
 
 ---
 
@@ -654,3 +712,15 @@ HTML 发送失败自动降级纯文本重试一次（LoserFox 的 `safeSend` 双
 - dsh：`packages/fs/fs`（定义包范式）· `packages/llm/llm`（注册表范式）· `packages/interaction/user-approval`（waterfall answerer 与审计对）· `packages/core/agent`（`AgentRegistry`/`Agent`）· `packages/core/session`（`SessionEventMap`/fork）· `packages/credentials/credentials` · `docs/cordis-tutorial/01–07` · `docs/architecture.md`
 - 参考实现：[LoserFox/telegram](https://github.com/LoserFox/telegram) · [BiBoyang/dsh-im-bridge](https://github.com/BiBoyang/dsh-im-bridge) · [Jesse-njx/dsh-chatnode-wechat](https://github.com/Jesse-njx/dsh-chatnode-wechat) · [nowledge-mem](https://github.com/nowledge-co/nowledge-mem-deepseek-harness)
 - 成熟 gateway：[hermes-agent](https://github.com/NousResearch/hermes-agent)（`gateway/platforms/ADDING_A_PLATFORM.md`、`gateway/delivery_ledger.py`）· [openclaw](https://github.com/openclaw/openclaw)（`src/channels/plugins/types.plugin.ts`、`src/channels/inbound-debounce-policy.ts`、`src/channels/streaming.ts`）
+
+---
+
+## 附录 B：跑偏的五个信号
+
+出现任何一个，停下来重新看 §6（R1–R10）。
+
+1. 为了实现某个功能，需要改 dsh 的代码
+2. 消费方的 `package.json` 里出现了某个具体平台的包名
+3. `Channel` 抽象类上出现了只有一个平台能实现的方法
+4. 插件卸载后还有连接活着，或者重新装载会重复投递
+5. 用内存变量而不是 session log 判断"这条消息处理过没有"

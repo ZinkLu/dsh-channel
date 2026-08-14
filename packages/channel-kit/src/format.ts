@@ -1,5 +1,83 @@
 export type FormatTier = 'plain' | 'markdown' | 'html'
 
+/**
+ * Strip DeepSeek-native tool-call markup that leaked into assistant text.
+ *
+ * A model with no structured tool channel (or an adapter that failed to
+ * parse its native tool-call emission) writes the call out as plain text:
+ *
+ * ```
+ * <tool_calls>
+ * <invoke name="Bash">
+ * <parameter name="command" string="true">date</parameter>
+ * </invoke>
+ * </tool_calls>
+ * ```
+ *
+ * A channel must never surface model tool-call internals to end users, so
+ * this is the last-mile guard: it removes balanced blocks, leftover tags from
+ * a truncated stream, and the blank runs the removal leaves behind.
+ */
+export function stripToolCallMarkup(text: string): string {
+  let result = text
+  // Remove balanced <tool_calls>…</tool_calls> blocks; repeat for adjacent blocks.
+  let previous = ''
+  while (result !== previous) {
+    previous = result
+    result = result.replace(/<tool_calls>[\s\S]*?<\/tool_calls>/g, '')
+  }
+  // Remove unbalanced/leftover tags (a truncated stream can leave these).
+  result = result.replace(/<\/?tool_calls\s*>/g, '')
+  result = result.replace(/<\/?invoke\b[^>]*>/g, '')
+  result = result.replace(/<\/?parameter\b[^>]*>/g, '')
+  // Collapse the blank runs the removal left behind and trim edges.
+  return result.replace(/\n[ \t]*(?:\n[ \t]*){2,}/g, '\n\n').trim()
+}
+
+/**
+ * Strip reasoning/thinking content from *visible* text (openclaw
+ * `stripReasoningTagsFromText` 同款)：剥掉 `<reasoning>`/`<thinking>` 标签块与
+ * "Reasoning:"/"Thinking"/"思考："/"推理：" 前导行。
+ *
+ * `mode:'preserve'` 用占位符保护代码围栏，围栏内标签保留字面量；`strict` 全局剥除。
+ * 与 `stripToolCallMarkup` 一起构成"绝不把模型内部字节泄漏给用户"的最后一道闸。
+ */
+export function stripReasoningTags(text: string, opts: { mode?: 'strict' | 'preserve'; scope?: 'all' | 'leading' } = {}): string {
+  const mode = opts.mode ?? 'strict'
+  const normalized = text.replace(/\r\n?/g, '\n')
+  const stripped = mode === 'preserve' ? stripOutsideFences(normalized) : stripAll(normalized)
+  return stripped.replace(/\n[ \t]*(?:\n[ \t]*){2,}/g, '\n\n').trim()
+}
+
+function stripAll(text: string): string {
+  let result = text
+  let previous = ''
+  while (result !== previous) {
+    previous = result
+    result = result.replace(/<(?:reasoning|thinking)>[\s\S]*?<\/(?:reasoning|thinking)>/gi, '')
+  }
+  result = result.replace(/<\/?(?:reasoning|thinking)\s*>/gi, '')
+  return stripPreambleLines(result)
+}
+
+function stripPreambleLines(text: string): string {
+  return text
+    .split('\n')
+    .filter((line) => !/^\s*(?:Reasoning|Thinking|思考|推理)\s*[:：]\s*$/i.test(line))
+    .join('\n')
+}
+
+function stripOutsideFences(text: string): string {
+  const fences: string[] = []
+  const protectedText = text.replace(/```[\s\S]*?```/g, (fence) => {
+    const index = fences.length
+    fences.push(fence)
+    return `\u0000${index}\u0000`
+  })
+  const stripped = stripAll(protectedText)
+  return stripped.replace(/\u0000(\d+)\u0000/g, (_m, index: string) => fences[Number(index)] ?? '')
+}
+
 export function renderForTier(markdown: string, tier: FormatTier): string {
   if (tier === 'markdown') return markdown
   const normalized = markdown.replace(/\r\n?/g, '\n')

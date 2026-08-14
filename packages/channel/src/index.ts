@@ -1,5 +1,6 @@
 import { Context, Service } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-llm'
+import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -24,6 +25,12 @@ declare module '@deepseek-ai/cordis' {
      * @mode emit
      */
     'channel/status'(channelId: string, status: ChannelStatus, error?: Error): void
+    /**
+     * provider 已把某条呈现帧推给平台（流式草稿/状态行/终态）。
+     * 观察性事件：策略插件在此审计流式/工具流量；不承载路由或拦截决定。
+     * @mode emit
+     */
+    'channel/present'(frame: PresentationFrame): void
   }
 }
 
@@ -43,7 +50,16 @@ declare module '@deepseek-ai/dsh-llm' {
   }
 }
 
-/** 平台无关的入站消息。media 在 v1 只保留占位描述，不下载。 */
+/** 入站媒体事实（交接元数据，不下载字节）。图片经 provider 下载后走 `ctx.attachments.saveImage` 成模型可见块。 */
+export interface InboundMedia {
+  readonly kind: 'image' | 'document' | 'audio' | 'video'
+  /** 平台侧文件引用（provider 定义，如 Telegram file_id / Feishu file_key）——交接事实，不下载字节 */
+  readonly fileRef: string
+  readonly mimeType?: string
+  readonly fileName?: string
+}
+
+/** 平台无关的入站消息。media 只保留占位描述（provider 定义 fileRef），字节由 provider 按需下载。 */
 export interface InboundMessage {
   readonly channel: string // provider id
   readonly chatKey: string // 稳定会话键
@@ -53,10 +69,22 @@ export interface InboundMessage {
   readonly chatType: ChatType // 'direct' | 'group' | 'thread'
   readonly text: string
   readonly timestamp: number // epoch ms
-  /** v1 不处理媒体，但把事实带上，让 merge 知道"不可合并" */
+  /** 是否带媒体：merge 据此"带附件不合并"。 */
   readonly hasMedia: boolean
+  /** 媒体事实（fileRef + 元数据）；hasMedia 的展开。 */
+  readonly media?: readonly InboundMedia[]
   /** 群聊中是否 @ 了机器人（provider 判定；v1 群聊不路由，仅记录） */
   readonly mentionsBot?: boolean
+}
+
+/** 出站媒体（可移植载荷：图片走 attachment 引用，文档走 cwd 相对路径，绝不裸传宿主绝对路径）。 */
+export interface OutboundMedia {
+  readonly kind: 'image' | 'document'
+  /** 图片：ctx.attachments 的引用（不裸传宿主路径，防路径泄漏 + R7）。 */
+  readonly attachment?: ImageAttachmentRef
+  /** 文档：agent workspace（cwd）内的相对路径；字节由 provider 读取并锚定 cwd。 */
+  readonly filePath?: string
+  readonly caption?: string
 }
 
 /** 出站消息：语义内容 + 呈现意图，分段/转义是 provider 的事 */
@@ -67,10 +95,16 @@ export interface OutboundMessage {
   readonly markdown: string
   /** 结构化选项（审批/澄清）；无按钮平台由消费方预先降级为编号文本 */
   readonly choices?: readonly OutboundChoice[]
+  /** 出站媒体（supportsMedia 平台逐条 sendMedia；非支持平台降级为文本提示） */
+  readonly media?: readonly OutboundMedia[]
   /** 幂等键：同 key 的重复 deliver 应被 ledger 挡下 */
   readonly deliveryKey: string
   /** 溯源（审计用）：来自哪个 session 的哪个事件 */
   readonly origin?: { sessionId: string; seq?: number }
+  /** 呈现意图：终态 / 新建草稿 / 编辑草稿 / 状态行。策略插件据此决定是否拦截/改写。 */
+  readonly presentation?: PresentationIntent
+  /** presentation='draft-edit' 时指向的草稿平台消息 id。 */
+  readonly editTarget?: string
 }
 
 export interface OutboundChoice {
@@ -84,6 +118,32 @@ export interface DeliveryReceipt {
   readonly platformMessageIds?: readonly string[]
   readonly error?: string
 }
+
+/** 呈现意图：终态消息 / 新建草稿 / 编辑已有草稿 / 状态行。 */
+export type PresentationIntent = 'final' | 'draft-new' | 'draft-edit' | 'status-line'
+
+/** 呈现上限（openclaw ChannelPresentationCapabilities.limits 的缩小版）。均 undefined=无已知上限。 */
+export interface PresentationLimits {
+  /** 单条消息最多按钮数；超限降级编号文本。 */
+  readonly maxOptions?: number
+  /** 按钮文字上限（码点）；超限截断加 `…`。 */
+  readonly maxLabelLength?: number
+  /** 回调数据（callback_data/value）上限（字节）；如 Telegram=64。 */
+  readonly maxValueBytes?: number
+}
+
+/**
+ * 呈现帧：provider 已把某条呈现事实推给平台（channel/present 事件的 payload）。
+ * 与 OutboundMessage 的区别：OutboundMessage 是"投递请求"（走 deliver waterfall，
+ * 可被策略插件包装/短路），PresentationFrame 是"已发生的呈现事实"（emit，只读）。
+ */
+export type PresentationFrame =
+  | { readonly kind: 'final'; readonly channel: string; readonly chatKey: string; readonly deliveryKey: string; readonly text: string }
+  | { readonly kind: 'draft-new'; readonly channel: string; readonly chatKey: string; readonly draftKey: string; readonly text: string }
+  | { readonly kind: 'draft-edit'; readonly channel: string; readonly chatKey: string; readonly draftKey: string; readonly editTarget: string; readonly text: string }
+  | { readonly kind: 'draft-finalize'; readonly channel: string; readonly chatKey: string; readonly draftKey: string }
+  | { readonly kind: 'draft-discard'; readonly channel: string; readonly chatKey: string; readonly draftKey: string }
+  | { readonly kind: 'status-line'; readonly channel: string; readonly chatKey: string; readonly text: string }
 
 export type ChatType = 'direct' | 'group' | 'thread'
 export type ChannelStatus = 'connecting' | 'connected' | 'disconnected' | 'fatal'
@@ -124,6 +184,34 @@ export abstract class Channel {
     return ['direct']
   }
 
+  // ---- 呈现能力事实：基类保守默认（照抄 FileSystem.sandboxMode 写法）----
+
+  /** 流式档位。'off'=只终态；'progress'=一条可编辑状态草稿+终态；'block'=分块草稿（v2）。
+   *  需要 supportsEdit 才能是非 off；无编辑能力的平台永远 off。 */
+  get streamingMode(): 'off' | 'block' | 'progress' {
+    return 'off'
+  }
+  /** 是否以文本呈现"正在做 X…"状态行（hermes supports_status_text，Slack 类）；textless 平台保持 false。 */
+  get supportsStatusText(): boolean {
+    return false
+  }
+  /** 是否向渠道下放 reasoning/thinking 内容；默认 false（不泄漏思考链）。 */
+  get supportsThinking(): boolean {
+    return false
+  }
+  /** 呈现上限（按钮数/按钮文字/回调数据）。 */
+  get presentationLimits(): PresentationLimits {
+    return {}
+  }
+  /** 是否支持多选选项；false 时多选降级为"逐条单选 + 文本补充"。 */
+  get supportsMultiSelect(): boolean {
+    return false
+  }
+  /** 是否支持发送媒体（图片/文档）。false 时出站媒体降级为"无法投递"文本。 */
+  get supportsMedia(): boolean {
+    return false
+  }
+
   // ---- 必选行为 ----
 
   /**
@@ -143,6 +231,18 @@ export abstract class Channel {
 
   /** typing 指示；默认 no-op */
   async sendTyping(_chatKey: string): Promise<void> {}
+
+  /**
+   * 发送一条媒体（图片/文档）。仅 `supportsMedia` 平台实现；基类抛错（hermes
+   * send_image/send_file 的"可选方法 + 降级"同款——消费方应先查 supportsMedia）。
+   */
+  async sendMedia(
+    _chatKey: string,
+    _media: OutboundMedia,
+    _opts?: { signal?: AbortSignal },
+  ): Promise<{ platformMessageId: string }> {
+    throw new Error(`${this.id} does not support media`)
+  }
 }
 
 /** 把注册表作为服务安装到当前上下文（插件入口）。 */
@@ -196,8 +296,23 @@ export class ChannelRegistry extends Service {
       const channel = this.entries.get(out.channel)
       if (channel === undefined) return { status: 'failed', error: `no channel "${out.channel}"` }
       try {
-        const result = await channel.send(out.chatKey, out.markdown, { choices: out.choices })
-        return { status: 'sent', platformMessageIds: [result.platformMessageId] }
+        const platformMessageIds: string[] = []
+        // 文本（空文本不出站，仅媒体时不发空气泡）。
+        if (out.markdown !== '') {
+          const result = await channel.send(out.chatKey, out.markdown, { choices: out.choices })
+          platformMessageIds.push(result.platformMessageId)
+        }
+        // 媒体：supportsMedia 平台走 sendMedia；否则降级为"无法投递"文本（hermes 教训：绝不回显宿主路径）。
+        for (const media of out.media ?? []) {
+          if (channel.supportsMedia) {
+            const result = await channel.sendMedia(out.chatKey, media)
+            platformMessageIds.push(result.platformMessageId)
+          } else {
+            const result = await channel.send(out.chatKey, mediaUnsupportedText(media.kind))
+            platformMessageIds.push(result.platformMessageId)
+          }
+        }
+        return { status: 'sent', platformMessageIds }
       } catch (error) {
         return { status: 'failed', error: error instanceof Error ? error.message : String(error) }
       }
@@ -206,6 +321,10 @@ export class ChannelRegistry extends Service {
 }
 
 export default ChannelRegistry
+
+function mediaUnsupportedText(kind: 'image' | 'document'): string {
+  return kind === 'image' ? '⚠️ 无法投递图片附件。' : '⚠️ 无法投递文件附件。'
+}
 
 function assertInboundMessage(msg: InboundMessage): void {
   if (!msg.channel) throw new Error('InboundMessage.channel must be a non-empty string')

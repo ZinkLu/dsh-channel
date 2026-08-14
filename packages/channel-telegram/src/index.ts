@@ -1,8 +1,10 @@
 import Schema from '@deepseek-ai/schemastery'
 import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
+import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
+import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { createJsonFileStore } from 'dsh-channel-kit'
 import { TelegramChannel } from './channel.js'
 import { TelegramClient } from './client.js'
@@ -45,11 +47,27 @@ export function resolveStatePath(config: TelegramConfig): string {
 export function apply(ctx: Context, config: TelegramConfig) {
   const store = createJsonFileStore(resolveStatePath(config))
   const client = new TelegramClient()
+  const cwd = config.cwd ?? process.cwd()
   const channel = new TelegramChannel({
     client,
     resolveToken: async () => {
       const resolved = await ctx.credentials.resolve(credentialRef('TELEGRAM_BOT_TOKEN'))
       return resolved?.value
+    },
+    readImage: async (ref: ImageAttachmentRef) => {
+      const attachments = ctx.get('attachments') as { readImage(ref: ImageAttachmentRef): Promise<{ data: Uint8Array }> } | undefined
+      if (attachments === undefined) throw new Error('attachments service is not available')
+      const stored = await attachments.readImage(ref)
+      return stored.data
+    },
+    readFile: async (filePath: string) => {
+      const abs = resolve(cwd, filePath)
+      const rel = relative(resolve(cwd), abs)
+      if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+        throw new Error(`filePath escapes workspace: ${filePath}`)
+      }
+      const bytes = new Uint8Array(await readFile(abs))
+      return { bytes, name: basename(filePath) }
     },
   })
 

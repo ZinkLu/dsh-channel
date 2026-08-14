@@ -5,13 +5,10 @@ import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-user-approval'
 import type {} from '@deepseek-ai/dsh-system-prompt'
-import type { ImageAttachmentRef, ImageMediaType } from '@deepseek-ai/dsh-attachment'
-import type { InboundMedia, InboundMessage, OutboundMessage, PresentationFrame } from 'dsh-channel'
+import type { InboundMessage, OutboundMessage } from 'dsh-channel'
 import {
   chunkText,
-  createMemoryStore,
   emptyMergeState,
-  emptyStreamState,
   mergeReduce,
   parseApprovalReply,
   parsePromptReply,
@@ -20,7 +17,6 @@ import {
   renderForTier,
   renderPrompt,
   route,
-  streamReduce,
   stripReasoningTags,
   stripToolCallMarkup,
   type ChannelStore,
@@ -30,29 +26,20 @@ import {
   type PendingPrompt,
   type PromptOptions,
   type RouteDecision,
-  type StreamCaps,
-  type StreamFrame,
-  type StreamInput,
-  type StreamState,
 } from 'dsh-channel-kit'
-import type { TelegramChannel } from './channel.js'
-import type { TelegramCallbackQuery, TelegramClient, TelegramMessage, TelegramPhotoSize } from './client.js'
-import { hasMedia, messageText, senderName, toChatKey } from './client.js'
+import type { FeishuChannel } from './channel.js'
+import type { FeishuCredentials, FeishuEventV2, FeishuMessageEvent } from './client.js'
+import { FeishuClient, FeishuWsClient, chatTypeOf, hasMedia, mediaFacts, messageText, senderId } from './client.js'
 
-export interface TelegramBridgeConfig {
-  allowedUserIds: number[]
+export interface FeishuBridgeConfig {
+  allowedUserIds: string[]
   provider: string
   model?: string
   cwd?: string
   agentPreset?: string
-  pollingTimeoutSec: number
   mergeWindowSec: number
   approvalTimeoutSec: number
-}
-
-interface MergeBuffered {
-  state: MergeState
-  messageIds: string[]
+  domain?: 'feishu' | 'lark'
 }
 
 interface ApprovalEntry extends PendingApproval {
@@ -60,13 +47,11 @@ interface ApprovalEntry extends PendingApproval {
   chatKey: string
   timer?: NodeJS.Timeout
   resolve?: (outcome: 'allowed-once' | 'rejected' | 'deferred') => void
-  messageId?: number
 }
 
 interface PromptEntry extends PendingPrompt {
   chatKey: string
   timer?: NodeJS.Timeout
-  messageId?: number
 }
 
 interface AgentPresetJoin {
@@ -105,17 +90,13 @@ interface AskUserQuestionAnswerLike {
   answers: Array<{ id: string; selected: string[]; custom?: string }>
 }
 
-/** dsh-attachment 的最小鸭子类型（可选依赖，缺失时图片降级为 fileRef 事实）。 */
-interface AttachmentsLike {
-  saveImage(input: { data: Uint8Array; mediaType: string; name?: string }): Promise<ImageAttachmentRef>
-}
-
-export class TelegramBridge {
+export class FeishuBridge {
   private readonly ctx: Context
-  private readonly config: TelegramBridgeConfig
+  private readonly config: FeishuBridgeConfig
   private readonly store: ChannelStore
-  private readonly channel: TelegramChannel
-  private readonly client: TelegramClient
+  private readonly channel: FeishuChannel
+  private readonly client: FeishuClient
+  private readonly wsClient: FeishuWsClient
 
   private readonly mergeStates = new Map<string, MergeState>()
   private readonly mergeMessageIds = new Map<string, string[]>()
@@ -125,24 +106,23 @@ export class TelegramBridge {
   private readonly ownedHandles = new Map<string, AgentHandle>()
   private readonly pendingApprovals = new Map<number, ApprovalEntry>()
   private readonly pendingPrompts = new Map<number, PromptEntry>()
-  private readonly lastTypingAt = new Map<string, number>()
-  private readonly streamStates = new Map<string, StreamState>()
-  private readonly streamTimers = new Map<string, NodeJS.Timeout>()
-  private readonly draftMessageIds = new Map<string, number>()
-  private readonly toolCallNames = new Map<string, string>()
   private readonly disposers: Array<() => void> = []
 
   private promptSeq = 0
-  private pollAbort: AbortController | null = null
-  private pollPromise: Promise<void> | null = null
   private started = false
 
-  constructor(ctx: Context, config: TelegramBridgeConfig, store: ChannelStore, channel: TelegramChannel, client: TelegramClient) {
+  constructor(ctx: Context, config: FeishuBridgeConfig, store: ChannelStore, channel: FeishuChannel, client: FeishuClient) {
     this.ctx = ctx
     this.config = config
     this.store = store
     this.channel = channel
     this.client = client
+    this.wsClient = new FeishuWsClient({
+      domain: config.domain,
+      resolveCredentials: () => this.resolveCredentials(),
+      onEvent: (event) => void this.handleEvent(event),
+      onStatus: (status, error) => this.ctx.emit('channel/status', 'feishu', status, error),
+    })
   }
 
   async start(): Promise<void> {
@@ -154,21 +134,16 @@ export class TelegramBridge {
     }))
     this.disposers.push(this.ctx.on('approval/request', async (req, next) => this.onApprovalRequest(req, next)))
 
-    this.ctx.emit('channel/status', 'telegram', 'connecting')
+    this.ctx.emit('channel/status', 'feishu', 'connecting')
     await this.restore()
-    this.startPolling()
+    await this.wsClient.start()
   }
 
   async stop(): Promise<void> {
     if (!this.started) return
     this.started = false
 
-    this.pollAbort?.abort()
-    if (this.pollPromise) {
-      await this.pollPromise.catch(() => {})
-      this.pollPromise = null
-    }
-    this.pollAbort = null
+    await this.wsClient.stop()
 
     for (const disposer of this.disposers.splice(0)) {
       try {
@@ -180,11 +155,6 @@ export class TelegramBridge {
 
     for (const timer of this.mergeTimers.values()) clearTimeout(timer)
     this.mergeTimers.clear()
-    for (const timer of this.streamTimers.values()) clearTimeout(timer)
-    this.streamTimers.clear()
-    this.streamStates.clear()
-    this.draftMessageIds.clear()
-    this.toolCallNames.clear()
     for (const entry of this.pendingApprovals.values()) {
       if (entry.timer) clearTimeout(entry.timer)
       entry.resolve?.('deferred')
@@ -211,7 +181,6 @@ export class TelegramBridge {
   // ---- 启动恢复 ----
 
   private async restore(): Promise<void> {
-    // merge 窗口内未交付的缓冲：恢复后当作刚到达重新起窗。
     const now = Date.now()
     const buffers = this.store.mergeBuffers()
     for (const [chatKey, buffer] of Object.entries(buffers)) {
@@ -220,7 +189,6 @@ export class TelegramBridge {
       this.armMergeTimer(chatKey, now + this.config.mergeWindowSec * 1000)
     }
 
-    // 绑定恢复：chatKey → sessionId。
     for (const [chatKey, sessionId] of Object.entries(this.store.bindings())) {
       this.sessionChatKeys.set(sessionId, chatKey)
       try {
@@ -241,7 +209,7 @@ export class TelegramBridge {
       for (const event of agent.session.events) {
         if (event.type !== 'user/message') continue
         const source = event.data.source as { kind?: string; channel?: string; messageIds?: readonly string[] } | undefined
-        if (source?.kind !== 'channel' || source.channel !== 'telegram') continue
+        if (source?.kind !== 'channel' || source.channel !== 'feishu') continue
         for (const messageId of source.messageIds ?? []) {
           this.store.markInbound(messageId)
         }
@@ -277,127 +245,85 @@ export class TelegramBridge {
     }
   }
 
-  // ---- 轮询 ----
+  // ---- 凭据 ----
 
-  private startPolling(): void {
-    this.pollAbort = new AbortController()
-    this.pollPromise = this.pollLoop(this.pollAbort.signal)
+  private async resolveCredentials(): Promise<FeishuCredentials | undefined> {
+    const appId = await this.ctx.credentials.resolve(credentialRef('FEISHU_APP_ID'))
+    const appSecret = await this.ctx.credentials.resolve(credentialRef('FEISHU_APP_SECRET'))
+    if (!appId?.value || !appSecret?.value) return undefined
+    return { appId: appId.value, appSecret: appSecret.value }
   }
 
-  private async pollLoop(signal: AbortSignal): Promise<void> {
-    let offset = 0
-    let backoff = 1000
-    let first = true
+  // ---- 入站 ----
 
-    while (!signal.aborted) {
-      try {
-        const token = await this.resolveToken()
-        if (!token) {
-          throw new Error('TELEGRAM_BOT_TOKEN is not configured')
-        }
-        const updates = await this.client.getUpdates(token, {
-          offset: offset === 0 ? undefined : offset,
-          timeoutSec: this.config.pollingTimeoutSec,
-          allowedUpdates: ['message', 'callback_query'],
-          signal,
-        })
+  /**
+   * 入站事件统一入口：长连接 client 内部调用；也可由宿主在 webhook 模式下直接喂入。
+   * 只处理 `im.message.receive_v1` 文本事件；其余事件类型静默忽略。
+   */
+  async handleEvent(event: FeishuEventV2): Promise<void> {
+    if (event.header?.event_type !== 'im.message.receive_v1' || event.event === undefined) return
+    const messageEvent: FeishuMessageEvent = event.event
 
-        if (first) {
-          first = false
-          this.ctx.emit('channel/status', 'telegram', 'connected')
-        }
+    const message = messageEvent.message
+    const chatKey = message?.chat_id ?? ''
+    const sender = senderId(messageEvent)
+    if (!chatKey || !sender) return
 
-        for (const update of updates) {
-          if (signal.aborted) return
-          await this.processUpdate(update)
-          offset = Math.max(offset, update.update_id + 1)
-        }
-        backoff = 1000
-      } catch (error) {
-        if (signal.aborted) return
-        this.ctx.emit('channel/status', 'telegram', 'disconnected', error instanceof Error ? error : new Error(String(error)))
-        await sleepWithAbort(backoff + Math.random() * 500, signal)
-        backoff = Math.min(15_000, backoff * 2)
-      }
-    }
-  }
+    const chatType = chatTypeOf(messageEvent)
+    const messageId = message?.message_id ?? ''
 
-  private async resolveToken(): Promise<string | undefined> {
-    const resolved = await this.ctx.credentials.resolve(credentialRef('TELEGRAM_BOT_TOKEN'))
-    return resolved?.value
-  }
-
-  private async processUpdate(update: { update_id: number; message?: TelegramMessage; callback_query?: TelegramCallbackQuery }): Promise<void> {
-    if (update.callback_query) {
-      await this.processCallbackQuery(update.callback_query)
-      return
-    }
-    if (update.message) {
-      await this.processMessage(update.message)
-    }
-  }
-
-  private async processMessage(message: TelegramMessage): Promise<void> {
-    const chat = message.chat
-    const chatKey = toChatKey(chat)
-    const senderId = message.from ? String(message.from.id) : ''
-    if (message.from?.is_bot) return
-
-    if (chat.type !== 'private') {
-      // v1 群聊不路由，但事实照发（策略插件审计可用）。
-      this.ingest(chatKey, senderId, message, chat.type === 'supergroup' || chat.type === 'group' ? 'group' : 'direct')
+    // 群聊 v1 不路由，但事实照发。
+    if (chatType !== 'direct') {
+      this.ingest(messageEvent, chatKey, 'group')
       return
     }
 
-    const allowed = this.config.allowedUserIds.includes(Number(senderId))
+    const allowed = this.config.allowedUserIds.includes(sender)
     if (!allowed) {
       await this.sendLocal(chatKey, '⚠️ 你没有权限使用本机器人。')
       return
     }
 
-    const messageId = String(message.message_id)
-    if (this.store.seenInbound(messageId)) return
+    if (messageId && this.store.seenInbound(messageId)) return
 
-    // 审批/提问应答优先于 merge/router，且必须立即处理（openclaw 控制命令铁律）。
+    // 审批/提问应答优先于 merge/router（openclaw 控制命令铁律）。
+    const text = messageText(messageEvent)
     const activePending = [...this.pendingApprovals.values()]
-    const approvalReply = parseApprovalReply({ text: messageText(message) }, activePending)
+    const approvalReply = parseApprovalReply({ text }, activePending)
     if (approvalReply.kind === 'answer') {
       this.resolveApproval(approvalReply.num, approvalReply.outcome)
-      this.store.markInbound(messageId)
+      if (messageId) this.store.markInbound(messageId)
       return
     }
-    const promptReply = parsePromptReply({ text: messageText(message) }, [...this.pendingPrompts.values()])
+    const promptReply = parsePromptReply({ text }, [...this.pendingPrompts.values()])
     if (promptReply.kind === 'answer') {
       this.resolvePrompt(promptReply.num, promptReply.answer)
-      this.store.markInbound(messageId)
+      if (messageId) this.store.markInbound(messageId)
       return
     }
 
-    const text = messageText(message)
     const isCommand = text.trim().startsWith('/')
 
-    this.ingest(chatKey, senderId, message, 'direct')
+    this.ingest(messageEvent, chatKey, 'direct')
 
     if (isCommand) {
       await this.flushBuffered(chatKey)
       await this.handleCommand(text.trim(), chatKey)
-      this.store.markInbound(messageId)
+      if (messageId) this.store.markInbound(messageId)
       return
     }
 
-    if (hasMedia(message)) {
+    if (hasMedia(messageEvent)) {
       await this.flushBuffered(chatKey)
-      // 图片下载 → saveImage → 模型可见 image 块；其余媒体只带 fileRef 事实（不下载）。
-      const images = await this.downloadInboundImages(message)
-      if (text.trim() !== '' || images.length > 0) {
-        await this.dispatchText(chatKey, text, [messageId], senderId, images)
+      if (text.trim() !== '') {
+        await this.dispatchText(chatKey, text, [messageId].filter(Boolean), sender)
       }
-      this.store.markInbound(messageId)
+      if (messageId) this.store.markInbound(messageId)
       return
     }
 
     if (text.trim() === '') {
-      this.store.markInbound(messageId)
+      if (messageId) this.store.markInbound(messageId)
       return
     }
 
@@ -408,50 +334,29 @@ export class TelegramBridge {
       { windowMs: this.config.mergeWindowSec * 1000 },
     )
     this.mergeStates.set(chatKey, result.state)
-    this.mergeMessageIds.set(chatKey, [...(this.mergeMessageIds.get(chatKey) ?? []), messageId])
-    this.mergeSenderIds.set(chatKey, senderId)
+    this.mergeMessageIds.set(chatKey, [...(this.mergeMessageIds.get(chatKey) ?? []), ...(messageId ? [messageId] : [])])
+    this.mergeSenderIds.set(chatKey, sender)
     this.store.setMergeBuffer(chatKey, result.state.buffer)
 
     await this.handleMergeEffects(chatKey, result.state, result.effects)
-    this.store.markInbound(messageId)
+    if (messageId) this.store.markInbound(messageId)
   }
 
-  private ingest(chatKey: string, senderId: string, message: TelegramMessage, chatType: 'direct' | 'group'): void {
-    const media = mediaFacts(message)
+  private ingest(messageEvent: FeishuMessageEvent, chatKey: string, chatType: 'direct' | 'group'): void {
+    const message = messageEvent.message
     const inbound: InboundMessage = {
-      channel: 'telegram',
+      channel: 'feishu',
       chatKey,
-      senderId,
-      senderName: senderName(message.from),
-      messageId: String(message.message_id),
+      senderId: senderId(messageEvent),
+      messageId: message?.message_id ?? '',
       chatType,
-      text: messageText(message),
-      timestamp: message.date * 1000,
-      hasMedia: hasMedia(message),
-      media,
-      mentionsBot: false,
+      text: messageText(messageEvent),
+      timestamp: message?.create_time ? Number(message.create_time) : Date.now(),
+      hasMedia: hasMedia(messageEvent),
+      media: mediaFacts(messageEvent),
+      mentionsBot: (message?.mentions?.length ?? 0) > 0,
     }
     this.ctx.channels.ingest(inbound)
-  }
-
-  /** 下载入站图片并落 `ctx.attachments.saveImage`（R7 模型可见）；缺失/失败降级为 fileRef 事实。 */
-  private async downloadInboundImages(message: TelegramMessage): Promise<ImageAttachmentRef[]> {
-    const photo = largestPhoto(message.photo)
-    if (!photo) return []
-    const attachments = this.ctx.get('attachments') as AttachmentsLike | undefined
-    if (!attachments) return []
-
-    try {
-      const token = await this.requireToken()
-      const { bytes } = await this.client.getFile(token, photo.file_id)
-      const mediaType = sniffImageMediaType(bytes)
-      if (!mediaType) return []
-      const ref = await attachments.saveImage({ data: bytes, mediaType, name: `telegram-${photo.file_id}` })
-      return [ref]
-    } catch {
-      // 下载/入库失败不阻塞文本；图片降级为 fileRef 事实（ingest 已带出）。
-      return []
-    }
   }
 
   private async flushBuffered(chatKey: string): Promise<void> {
@@ -459,13 +364,13 @@ export class TelegramBridge {
     if (!state || state.buffer.length === 0) return
     const text = state.buffer.join('\n')
     const ids = this.mergeMessageIds.get(chatKey) ?? []
-    const senderId = this.mergeSenderIds.get(chatKey) ?? '0'
+    const sender = this.mergeSenderIds.get(chatKey) ?? ''
     this.mergeStates.set(chatKey, emptyMergeState)
     this.mergeMessageIds.set(chatKey, [])
     this.mergeSenderIds.delete(chatKey)
     this.store.setMergeBuffer(chatKey, [])
     this.clearMergeTimer(chatKey)
-    await this.dispatchText(chatKey, text, ids, senderId)
+    await this.dispatchText(chatKey, text, ids, sender)
   }
 
   private async handleMergeEffects(chatKey: string, state: MergeState, effects: MergeEffect[]): Promise<void> {
@@ -476,13 +381,13 @@ export class TelegramBridge {
         await this.sendLocal(chatKey, '收到，处理中…')
       } else if (effect.kind === 'flush') {
         const ids = this.mergeMessageIds.get(chatKey) ?? []
-        const senderId = this.mergeSenderIds.get(chatKey) ?? '0'
+        const sender = this.mergeSenderIds.get(chatKey) ?? ''
         this.mergeMessageIds.set(chatKey, [])
         this.mergeSenderIds.delete(chatKey)
         this.mergeStates.set(chatKey, emptyMergeState)
         this.store.setMergeBuffer(chatKey, [])
         this.clearMergeTimer(chatKey)
-        await this.dispatchText(chatKey, effect.text, ids, senderId)
+        await this.dispatchText(chatKey, effect.text, ids, sender)
       }
     }
   }
@@ -518,14 +423,14 @@ export class TelegramBridge {
 
   private routeContext() {
     return {
-      channel: 'telegram',
+      channel: 'feishu',
       boundSessions: this.store.bindings(),
       liveSessionIds: this.ctx.agents.list().map((agent) => agent.id),
     }
   }
 
-  private async dispatchText(chatKey: string, text: string, messageIds: string[], senderId = '0', images: readonly ImageAttachmentRef[] = []): Promise<void> {
-    const decision = route(
+  private async dispatchText(chatKey: string, text: string, messageIds: string[], senderId = ''): Promise<void> {
+    const decision: RouteDecision = route(
       { chatKey, text, chatType: 'direct' },
       this.routeContext(),
       { isApprovalReply: (value) => parseApprovalReply({ text: value }, [...this.pendingApprovals.values()]).kind === 'answer' },
@@ -544,15 +449,11 @@ export class TelegramBridge {
       return
     }
 
-    const content: Array<{ type: 'text'; text: string } | { type: 'image'; attachment: ImageAttachmentRef }> = []
-    if (text !== '') content.push({ type: 'text', text })
-    for (const attachment of images) content.push({ type: 'image', attachment })
-
     const message: UserMessage = createUserMessage({
-      content,
+      content: [{ type: 'text', text }],
       source: {
         kind: 'channel' as const,
-        channel: 'telegram',
+        channel: 'feishu',
         chatKey,
         senderId,
         messageIds: [...messageIds],
@@ -577,7 +478,6 @@ export class TelegramBridge {
       ...(this.config.model !== undefined ? { model: this.config.model } : {}),
     }
 
-    // 工具是 preset（agent 平面）的职责：join 宿主默认 preset，保留原装能力。
     const preset = await this.resolveAgentPreset()
     const setup = (agentCtx: Context) => this.setupAgent(agentCtx, preset.mount)
 
@@ -594,8 +494,6 @@ export class TelegramBridge {
       const handle = await this.ctx.agents.create({
         sessionId: SessionId(sessionId),
         meta: {
-          // cwd 必须给到：persona 的 {{cwd}} 变量、fs 工作区、会话 workspace key 都靠它。
-          // 缺省沿用 process.cwd()（启动 dsh 的目录），与 Web 会话同一工作区。
           cwd: this.config.cwd ?? process.cwd(),
           ...(preset.presetId !== undefined ? { agentPreset: preset.presetId } : {}),
         },
@@ -607,11 +505,6 @@ export class TelegramBridge {
     }
   }
 
-  /**
-   * 解析 agent 要 join 的 preset：显式 `config.agentPreset` 优先，否则用宿主的
-   * 默认 preset（`dsh-agent-presets` 的 `defaultId`）。无 preset roster 时返回空
-   * —— agent 走 host 全局层（TUI 单会话 / 无 roster 部署）。
-   */
   private async resolveAgentPreset(): Promise<AgentPresetJoin> {
     const presets = this.ctx.get('agentPresets') as AgentPresetsLike | undefined
     if (presets === undefined) return {}
@@ -626,10 +519,10 @@ export class TelegramBridge {
     try {
       const systemPrompt = agentCtx.get('systemPrompt')
       systemPrompt?.section({
-        name: 'dsh-channel-telegram',
+        name: 'dsh-channel-feishu',
         order: 120,
         text: promptHint({
-          id: 'telegram',
+          id: 'feishu',
           formatTier: this.channel.formatTier,
           maxMessageChars: this.channel.maxMessageChars,
           supportsChoices: this.channel.supportsChoices,
@@ -639,18 +532,11 @@ export class TelegramBridge {
       // systemPrompt 是可选依赖，缺失/异常都不阻塞 agent 创建。
     }
     this.registerUserQuestionsProvider(agentCtx)
-    // join preset 必须在 agent factory 的 setup 里完成；失败会回滚整个创建。
     if (mount !== undefined) {
       await mount(agentCtx)
     }
   }
 
-  /**
-   * 在 agent 作用域注册 user-questions provider（dsh 的"选项 A/B" seam）。
-   * 鸭子类型 + ctx.get：`dsh-user-questions` 不在 inject、缺失时优雅跳过——
-   * 该 agent 的提问走别的 provider 或 fail-closed（NO_PROVIDER），收发不受影响（R2/A3）。
-   * registerProvider 是单槽；DUPLICATE_PROVIDER 时静默降级。
-   */
   private registerUserQuestionsProvider(agentCtx: Context): void {
     const userQuestions = agentCtx.get('userQuestions') as UserQuestionsLike | undefined
     if (userQuestions === undefined) return
@@ -691,12 +577,12 @@ export class TelegramBridge {
 
     const entry: PromptEntry = {
       num,
-      requestId: `channel-telegram:${Date.now()}:${num}`,
+      requestId: `channel-feishu:${Date.now()}:${num}`,
       question: question.question,
       detail: question.detail,
       options,
       multiSelect: question.multiSelect ?? false,
-      allowFreeText: true, // 自由文本始终可用（hermes clarify 的 "Other" / openclaw 的 isOther:true）。
+      allowFreeText: true,
       intent: question.intent,
       expiresAt: Date.now() + this.config.approvalTimeoutSec * 1000,
       resolve: (selected, custom) => settle(selected, custom),
@@ -723,7 +609,7 @@ export class TelegramBridge {
       },
       this.promptCaps(),
     )
-    void this.sendPromptRendered(chatKey, num, rendered, entry).catch(() => {})
+    void this.sendPromptRendered(chatKey, rendered).catch(() => {})
 
     entry.timer = setTimeout(() => {
       this.pendingPrompts.delete(num)
@@ -744,19 +630,14 @@ export class TelegramBridge {
 
   private async sendPromptRendered(
     chatKey: string,
-    _num: number,
     rendered: { kind: 'choices'; text: string; choices: ReadonlyArray<{ id: string; label: string }> } | { kind: 'text'; text: string },
-    entry: PromptEntry,
   ): Promise<void> {
-    const deliveryKey = `prompt:${entry.requestId}`
     const out: OutboundMessage =
       rendered.kind === 'choices'
-        ? { channel: 'telegram', chatKey, markdown: rendered.text, choices: rendered.choices.map((c) => ({ id: c.id, label: c.label })), deliveryKey }
-        : { channel: 'telegram', chatKey, markdown: rendered.text, deliveryKey }
+        ? { channel: 'feishu', chatKey, markdown: rendered.text, choices: rendered.choices.map((c) => ({ id: c.id, label: c.label })), deliveryKey: `prompt:${chatKey}:${Date.now()}` }
+        : { channel: 'feishu', chatKey, markdown: rendered.text, deliveryKey: `prompt:${chatKey}:${Date.now()}` }
     try {
-      const receipt = await this.ctx.channels.deliver(out)
-      const platformId = receipt.platformMessageIds?.[0]
-      if (platformId) entry.messageId = Number(platformId)
+      await this.ctx.channels.deliver(out)
     } catch {
       // 提示发送失败：answerer 超时后 fail-closed（空回答），绝不默认放行。
     }
@@ -768,124 +649,15 @@ export class TelegramBridge {
     const chatKey = this.sessionChatKeys.get(session.id)
     if (!chatKey) return
 
-    if (event.type === 'turn/start') {
-      void this.onTurnStart(chatKey).catch(() => {})
-      this.feedStream(session.id, chatKey, { kind: 'turn-start' })
-    } else if (event.type === 'assistant/message') {
+    if (event.type === 'assistant/message') {
       const text = assistantMessageText(event.data.message)
       if (text !== '') {
-        this.feedStream(session.id, chatKey, { kind: 'assistant-message', text }, { seq: event.seq })
+        void this.sendOutbound(chatKey, text, `${session.id}:${event.seq}`, { origin: { sessionId: session.id, seq: event.seq } }).catch(() => {})
       }
-    } else if (event.type === 'tool/call') {
-      this.toolCallNames.set(String(event.data.callId), event.data.name)
-      this.feedStream(session.id, chatKey, { kind: 'tool-call', callId: String(event.data.callId), name: event.data.name, arguments: event.data.arguments })
-    } else if (event.type === 'tool/result') {
-      const callId = String(event.data.message.content[0].toolCallId)
-      const name = this.toolCallNames.get(callId) ?? 'tool'
-      this.toolCallNames.delete(callId)
-      this.feedStream(session.id, chatKey, { kind: 'tool-result', callId, name, ok: event.data.error === undefined, summary: event.data.error?.name })
     } else if (event.type === 'turn/end' && event.data.reason.kind !== 'completed') {
       const label = turnEndLabel(event.data.reason.kind)
       void this.sendLocal(chatKey, `⏹ 本轮结束：${label}`).catch(() => {})
-      this.feedStream(session.id, chatKey, { kind: 'turn-end', reason: event.data.reason.kind })
     }
-  }
-
-  // ---- 流式呈现（streamReduce 帧执行器）----
-
-  private streamCaps(): StreamCaps {
-    return {
-      streamingMode: this.channel.streamingMode,
-      supportsEdit: this.channel.supportsEdit,
-      supportsStatusText: this.channel.supportsStatusText,
-      supportsThinking: this.channel.supportsThinking,
-    }
-  }
-
-  private feedStream(sessionId: string, chatKey: string, input: StreamInput, deliveryCtx?: { seq?: number }): void {
-    if (input.kind !== 'tick') this.clearStreamTimer(sessionId)
-    const state = this.streamStates.get(sessionId) ?? emptyStreamState
-    const result = streamReduce(state, input, this.streamCaps(), Date.now())
-    this.streamStates.set(sessionId, result.state)
-    for (const frame of result.frames) this.executeStreamFrame(sessionId, chatKey, frame, deliveryCtx)
-  }
-
-  private executeStreamFrame(sessionId: string, chatKey: string, frame: StreamFrame, deliveryCtx?: { seq?: number }): void {
-    switch (frame.kind) {
-      case 'noop':
-        return
-      case 'final': {
-        const seq = deliveryCtx?.seq
-        const deliveryKey = seq !== undefined ? `${sessionId}:${seq}` : `stream:${sessionId}:${Date.now()}`
-        void this.sendOutbound(chatKey, frame.text, deliveryKey, { origin: { sessionId, seq } }).catch(() => {})
-        return
-      }
-      case 'draft':
-        void this.showDraft(chatKey, sessionId, frame.text).catch(() => {})
-        return
-      case 'draft-finalize':
-        void this.finalizeDraft(chatKey, sessionId).catch(() => {})
-        return
-      case 'arm-timer':
-        this.armStreamTimer(sessionId, chatKey, frame.at)
-        return
-    }
-  }
-
-  private async showDraft(chatKey: string, sessionId: string, text: string): Promise<void> {
-    const token = await this.requireToken()
-    const html = renderForTier(text, 'html')
-    const existing = this.draftMessageIds.get(sessionId)
-    const draftKey = `draft:${sessionId}`
-    if (existing === undefined) {
-      const sent = await this.client.sendMessage(token, chatKey, html, { parseMode: 'HTML' })
-      this.draftMessageIds.set(sessionId, sent.message_id)
-      this.ctx.emit('channel/present', { kind: 'draft-new', channel: 'telegram', chatKey, draftKey, text } satisfies PresentationFrame)
-    } else {
-      await this.client.editMessageText(token, chatKey, existing, html, { parseMode: 'HTML' })
-      this.ctx.emit('channel/present', { kind: 'draft-edit', channel: 'telegram', chatKey, draftKey, editTarget: String(existing), text } satisfies PresentationFrame)
-    }
-  }
-
-  private async finalizeDraft(chatKey: string, sessionId: string): Promise<void> {
-    const existing = this.draftMessageIds.get(sessionId)
-    if (existing === undefined) return
-    this.draftMessageIds.delete(sessionId)
-    try {
-      const token = await this.requireToken()
-      await this.client.deleteMessage(token, chatKey, existing)
-    } catch {
-      // 草稿删除 best-effort；最终答复已单独发送。
-    }
-    this.ctx.emit('channel/present', { kind: 'draft-finalize', channel: 'telegram', chatKey, draftKey: `draft:${sessionId}` } satisfies PresentationFrame)
-  }
-
-  private armStreamTimer(sessionId: string, chatKey: string, at: number): void {
-    this.clearStreamTimer(sessionId)
-    const delay = Math.max(0, at - Date.now())
-    const timer = setTimeout(() => {
-      this.streamTimers.delete(sessionId)
-      this.feedStream(sessionId, chatKey, { kind: 'tick' })
-    }, delay)
-    timer.unref?.()
-    this.streamTimers.set(sessionId, timer)
-  }
-
-  private clearStreamTimer(sessionId: string): void {
-    const timer = this.streamTimers.get(sessionId)
-    if (timer !== undefined) {
-      clearTimeout(timer)
-      this.streamTimers.delete(sessionId)
-    }
-  }
-
-  private async onTurnStart(chatKey: string): Promise<void> {
-    if (!this.channel.supportsTyping) return
-    const now = Date.now()
-    const last = this.lastTypingAt.get(chatKey) ?? 0
-    if (now - last < 5000) return
-    this.lastTypingAt.set(chatKey, now)
-    await this.channel.sendTyping(chatKey)
   }
 
   private async sendOutbound(
@@ -894,9 +666,9 @@ export class TelegramBridge {
     deliveryKey: string,
     opts: { origin?: OutboundMessage['origin']; recover?: 'pending' | 'attempting' | 'failed' } = {},
   ): Promise<void> {
-    const html = renderForTier(markdown, 'html')
+    const plain = renderForTier(markdown, 'plain')
     const maxChars = this.channel.maxMessageChars ?? 4096
-    const chunks = chunkText(html, { maxChars, countBy: 'utf16' })
+    const chunks = chunkText(plain, { maxChars })
 
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i]!
@@ -906,7 +678,7 @@ export class TelegramBridge {
       }
       this.store.markAttempting(key)
       const receipt = await this.ctx.channels.deliver({
-        channel: 'telegram',
+        channel: 'feishu',
         chatKey,
         markdown: chunk,
         deliveryKey: key,
@@ -918,28 +690,26 @@ export class TelegramBridge {
         this.store.markDelivered(key, [])
       } else {
         this.store.markFailed(key, receipt.error ?? 'delivery failed')
-        // 某段失败 → 后续段停发（防乱序）。
         return
       }
       if (i < chunks.length - 1) {
-        await sleepWithAbort(1000, this.pollAbort?.signal)
-        if (this.pollAbort?.signal.aborted) return
+        await sleep(1000)
       }
     }
   }
 
   private async sendLocal(chatKey: string, markdown: string): Promise<void> {
-    const html = renderForTier(markdown, 'html')
+    const plain = renderForTier(markdown, 'plain')
     const maxChars = this.channel.maxMessageChars ?? 4096
-    const chunks = chunkText(html, { maxChars, countBy: 'utf16' })
+    const chunks = chunkText(plain, { maxChars })
     for (let i = 0; i < chunks.length; i++) {
       await this.ctx.channels.deliver({
-        channel: 'telegram',
+        channel: 'feishu',
         chatKey,
         markdown: chunks[i]!,
         deliveryKey: `local:${chatKey}:${Date.now()}:${i}`,
       })
-      if (i < chunks.length - 1) await sleepWithAbort(1000, this.pollAbort?.signal)
+      if (i < chunks.length - 1) await sleep(1000)
     }
   }
 
@@ -955,7 +725,7 @@ export class TelegramBridge {
       return
     }
     if (command === 'new') {
-      const sessionId = `channel:telegram:${chatKey}:${Date.now()}`
+      const sessionId = `channel:feishu:${chatKey}:${Date.now()}`
       this.store.setBinding(chatKey, sessionId)
       this.sessionChatKeys.set(sessionId, chatKey)
       await this.sendLocal(chatKey, `✅ 已创建新会话：${sessionId}`)
@@ -973,7 +743,7 @@ export class TelegramBridge {
     }
     if (command === 'status') {
       const binding = this.store.bindings()[chatKey]
-      const sessionId = binding ?? `channel:telegram:${chatKey}`
+      const sessionId = binding ?? `channel:feishu:${chatKey}`
       const agent = this.ctx.agents.get(SessionId(sessionId))
       await this.sendLocal(chatKey, agent ? `会话 ${sessionId} 状态：${agent.status}` : `会话 ${sessionId} 未在运行。`)
       return
@@ -990,7 +760,7 @@ export class TelegramBridge {
     const num = ++this.promptSeq
     const entry: ApprovalEntry = {
       num,
-      requestId: `channel-telegram:${Date.now()}:${num}`,
+      requestId: `channel-feishu:${Date.now()}:${num}`,
       toolName: req.toolName,
       expiresAt: Date.now() + this.config.approvalTimeoutSec * 1000,
       agentId: req.agent.id,
@@ -1035,74 +805,15 @@ export class TelegramBridge {
       { toolName: req.toolName, reason: req.reason, num: entry.num },
       { supportsChoices: this.channel.supportsChoices },
     )
-    const deliveryKey = `approval:${entry.requestId}`
     const out: OutboundMessage =
       rendered.kind === 'choices'
-        ? { channel: 'telegram', chatKey: entry.chatKey, markdown: rendered.text, choices: rendered.choices, deliveryKey }
-        : { channel: 'telegram', chatKey: entry.chatKey, markdown: rendered.text, deliveryKey }
+        ? { channel: 'feishu', chatKey: entry.chatKey, markdown: rendered.text, choices: rendered.choices, deliveryKey: `approval:${entry.requestId}` }
+        : { channel: 'feishu', chatKey: entry.chatKey, markdown: rendered.text, deliveryKey: `approval:${entry.requestId}` }
 
     try {
-      const receipt = await this.ctx.channels.deliver(out)
-      const platformId = receipt.platformMessageIds?.[0]
-      if (platformId) entry.messageId = Number(platformId)
+      await this.ctx.channels.deliver(out)
     } catch {
       // 审批提示发送失败时，answerer 超时后 next()；绝不默认放行。
-    }
-  }
-
-  private async processCallbackQuery(callbackQuery: TelegramCallbackQuery): Promise<void> {
-    try {
-      await this.client.answerCallbackQuery(await this.requireToken(), callbackQuery.id)
-    } catch {
-      // 转圈消除失败不阻塞后续。
-    }
-
-    const data = callbackQuery.data ?? ''
-    const apprMatch = /^appr:(\d+):([01])$/.exec(data)
-    if (apprMatch) {
-      const num = Number(apprMatch[1])
-      const outcome = apprMatch[2] === '1' ? ('allowed-once' as const) : ('rejected' as const)
-
-      const chatKey = callbackQuery.message ? toChatKey(callbackQuery.message.chat) : undefined
-      const messageId = callbackQuery.message?.message_id
-
-      this.resolveApproval(num, outcome)
-
-      if (chatKey && messageId !== undefined) {
-        try {
-          const token = await this.requireToken()
-          await this.client.editMessageText(
-            token,
-            chatKey,
-            messageId,
-            outcome === 'allowed-once' ? '✅ 已批准' : '⛔ 已拒绝',
-            { parseMode: 'HTML' },
-          )
-        } catch {
-          // 编辑失败不阻塞审批结果。
-        }
-      }
-      return
-    }
-
-    const promptMatch = /^prompt:(\d+):(\d+)$/.exec(data)
-    if (promptMatch) {
-      const reply = parsePromptReply({ choiceId: data }, [...this.pendingPrompts.values()])
-      if (reply.kind === 'answer') {
-        this.resolvePrompt(reply.num, reply.answer)
-        const chatKey = callbackQuery.message ? toChatKey(callbackQuery.message.chat) : undefined
-        const messageId = callbackQuery.message?.message_id
-        if (chatKey && messageId !== undefined) {
-          try {
-            const token = await this.requireToken()
-            const chosen = reply.answer.selected.join(', ') || reply.answer.custom || ''
-            await this.client.editMessageText(token, chatKey, messageId, `✅ 已选择：${chosen}`, { parseMode: 'HTML' })
-          } catch {
-            // 编辑失败不阻塞应答。
-          }
-        }
-      }
-      return
     }
   }
 
@@ -1121,37 +832,6 @@ export class TelegramBridge {
     if (entry.timer) clearTimeout(entry.timer)
     entry.resolve(answer.selected, answer.custom)
   }
-
-  private async requireToken(): Promise<string> {
-    const token = await this.resolveToken()
-    if (!token) throw new Error('TELEGRAM_BOT_TOKEN is not configured')
-    return token
-  }
-}
-
-function mediaFacts(message: TelegramMessage): InboundMedia[] {
-  const facts: InboundMedia[] = []
-  const photo = largestPhoto(message.photo)
-  if (photo) facts.push({ kind: 'image', fileRef: photo.file_id, mimeType: 'image/jpeg' })
-  if (message.document) facts.push({ kind: 'document', fileRef: message.document.file_id, mimeType: message.document.mime_type, fileName: message.document.file_name })
-  if (message.video) facts.push({ kind: 'video', fileRef: message.video.file_id, mimeType: message.video.mime_type })
-  if (message.audio) facts.push({ kind: 'audio', fileRef: message.audio.file_id, mimeType: message.audio.mime_type, fileName: message.audio.file_name })
-  if (message.voice) facts.push({ kind: 'audio', fileRef: message.voice.file_id, mimeType: message.voice.mime_type })
-  return facts
-}
-
-function largestPhoto(photo: readonly TelegramPhotoSize[] | undefined): TelegramPhotoSize | undefined {
-  if (!photo || photo.length === 0) return undefined
-  return photo.reduce((a, b) => ((b.file_size ?? 0) > (a.file_size ?? 0) ? b : a))
-}
-
-/** 从字节嗅探图片媒体类型（saveImage 需要精确声明，按魔数判定）。 */
-function sniffImageMediaType(bytes: Uint8Array): ImageMediaType | undefined {
-  if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return 'image/png'
-  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg'
-  if (bytes.length >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return 'image/webp'
-  if (bytes.length >= 6 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38 && (bytes[4] === 0x37 || bytes[4] === 0x39)) return 'image/gif'
-  return undefined
 }
 
 function splitDeliveryKey(key: string): { sessionId?: string; seq?: number } {
@@ -1190,26 +870,17 @@ function turnEndLabel(kind: string): string {
   }
 }
 
-function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) return Promise.resolve()
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort)
-      resolve()
-    }, ms)
-    timer.unref?.()
-    const onAbort = () => {
-      clearTimeout(timer)
-      reject(new Error('aborted'))
-    }
-    signal?.addEventListener('abort', onAbort, { once: true })
-  })
-}
-
 function hashText(text: string): string {
   let hash = 5381
   for (let i = 0; i < text.length; i++) {
     hash = ((hash << 5) + hash) ^ text.charCodeAt(i)
   }
   return (hash >>> 0).toString(16)
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms)
+    timer.unref?.()
+  })
 }

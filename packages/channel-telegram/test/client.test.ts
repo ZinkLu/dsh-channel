@@ -52,3 +52,70 @@ test('TelegramChannel.send falls back to plain text when HTML fails', async () =
   assert.equal(sends[0], '<b>hello</b>')
   assert.equal(sends[1], '**hello**')
 })
+
+test('TelegramClient.getFile downloads bytes via file endpoint', async () => {
+  const urls: string[] = []
+  const client = new TelegramClient({
+    baseUrl: 'https://example.test',
+    fetch: (async (url: string | URL | Request) => {
+      const u = String(url)
+      urls.push(u)
+      if (u.includes('/getFile')) {
+        return new Response(JSON.stringify({ ok: true, result: { file_id: 'f1', file_path: 'photos/1.jpg' } }), { status: 200 })
+      }
+      return new Response(new Uint8Array([0xff, 0xd8, 0xff]), { status: 200 })
+    }) as typeof fetch,
+  })
+
+  const { bytes, filePath } = await client.getFile('tok', 'f1')
+  assert.equal(filePath, 'photos/1.jpg')
+  assert.deepEqual([...bytes], [0xff, 0xd8, 0xff])
+  assert.equal(urls[1], 'https://example.test/file/bottok/photos/1.jpg')
+})
+
+test('TelegramClient.sendPhoto posts multipart form', async () => {
+  let body: unknown
+  const client = new TelegramClient({
+    baseUrl: 'https://example.test',
+    fetch: (async (url: string | URL | Request, init?: RequestInit) => {
+      assert.ok(String(url).endsWith('/sendPhoto'))
+      body = init?.body
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 9 } }), { status: 200 })
+    }) as typeof fetch,
+  })
+
+  const sent = await client.sendPhoto('tok', '42', new Uint8Array([1, 2, 3]), { caption: 'hi' })
+  assert.equal(sent.message_id, 9)
+  assert.ok(body instanceof FormData)
+})
+
+test('TelegramChannel.sendMedia sends image via readImage and document via readFile', async () => {
+  const sends: Array<{ kind: string; bytes: number[]; caption?: string }> = []
+  const client = {
+    async sendPhoto(_token: string, _chatId: string, bytes: Uint8Array, opts?: { caption?: string }): Promise<{ message_id: number }> {
+      sends.push({ kind: 'photo', bytes: [...bytes], caption: opts?.caption })
+      return { message_id: 1 }
+    },
+    async sendDocument(_token: string, _chatId: string, bytes: Uint8Array, opts?: { caption?: string; fileName?: string }): Promise<{ message_id: number }> {
+      sends.push({ kind: 'document', bytes: [...bytes], caption: opts?.caption })
+      return { message_id: 2 }
+    },
+  } as any
+
+  const channel = new TelegramChannel({
+    client,
+    resolveToken: async () => 'tok',
+    readImage: async () => new Uint8Array([1, 2, 3]),
+    readFile: async (p: string) => ({ bytes: new Uint8Array([4, 5, 6]), name: p }),
+  })
+
+  const img = await channel.sendMedia('42', { kind: 'image', attachment: {} as any, caption: 'pic' })
+  assert.equal(img.platformMessageId, '1')
+  assert.equal(sends[0]!.kind, 'photo')
+  assert.deepEqual(sends[0]!.bytes, [1, 2, 3])
+
+  const doc = await channel.sendMedia('42', { kind: 'document', filePath: 'out.txt' })
+  assert.equal(doc.platformMessageId, '2')
+  assert.equal(sends[1]!.kind, 'document')
+  assert.deepEqual(sends[1]!.bytes, [4, 5, 6])
+})

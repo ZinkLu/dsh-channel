@@ -10,5 +10,9 @@
         allowedUserIds: [5002186681]
         provider: deepseek-official
         model: deepseek-v4-flash
-        cwd: !!js process.env.HOME + '/agent-workspace'
+        # cwd 不设 = 沿用宿主 process.cwd()（你启动 dsh 的项目目录），
+        # 与 Web 会话同一工作区；别像旧示例那样指到一个全新的 ~/agent-workspace 空目录。
+        # agentPreset 不设 = 自动 join 宿主默认 preset（dsh-agent-presets 的 defaultId，
+        # 标准 web 部署是 `standard`），保留原装的工具/人设/技能全套能力。
+        # 仅当想给 Telegram 单独一套工具时才显式覆盖：agentPreset: minimal
 # token 不在此文件：dsh credentials set TELEGRAM_BOT_TOKEN 或环境变量 TELEGRAM_BOT_TOKEN。
