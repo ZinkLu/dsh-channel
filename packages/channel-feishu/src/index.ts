@@ -12,9 +12,9 @@ export const name = 'dsh-channel-feishu'
 export const inject = ['channels', 'agents', 'credentials'] as const
 
 export interface FeishuConfig {
-  /** 允许使用机器人的飞书用户 open_id（ou_ 开头）。必填、无宽松默认。 */
+  /** Feishu user open_ids (starting with ou_) allowed to use the bot. Required, no permissive default. */
   allowedUserIds: string[]
-  /** 飞书 / Lark 域；默认 feishu，Lark 国际版设 lark。 */
+  /** Feishu / Lark domain; defaults to feishu, set lark for Lark international. */
   domain?: 'feishu' | 'lark'
   provider: string
   model?: string

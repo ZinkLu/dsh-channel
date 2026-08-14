@@ -1,9 +1,10 @@
 /**
- * 工具调用/结果 → 一行"人话"。
+ * Tool call/result → a single line of "human-readable" text.
  *
- * 对齐 openclaw 的 `tool-display.ts`：`resolveToolDisplay` 把 name+args 拆成
- * `{emoji,label,detail}`，shell 族（bash/exec/shell/pwsh 或参数带 command）把命令
- * 作为整行；`formatToolLine` / `formatToolResultLine` 出最终文本，永远截断 + 脱敏。
+ * Aligned with openclaw's `tool-display.ts`: `resolveToolDisplay` splits name+args into
+ * `{emoji,label,detail}`; the shell family (bash/exec/shell/pwsh, or arguments with a
+ * `command`) puts the command on its own line; `formatToolLine` / `formatToolResultLine`
+ * produce the final text, always truncated + redacted.
  */
 
 const TOOL_META: Record<string, { emoji: string; label: string }> = {
@@ -32,15 +33,15 @@ export interface ToolDisplay {
 }
 
 export interface ToolLineOptions {
-  /** 'compact'=短摘要；'verbose'=展开参数。 */
+  /** 'compact' = short summary; 'verbose' = expanded arguments. */
   detailMode: 'compact' | 'verbose'
-  /** shell 命令是否整行输出；默认 'status'（只出语义摘要）。 */
+  /** Whether to output the shell command as the whole line; default 'status' (semantic summary only). */
   commandText?: 'status' | 'raw'
-  /** 详情上限（码点）；默认 40。 */
+  /** Detail cap (code points); default 40. */
   maxDetailChars?: number
 }
 
-/** 把工具名 + 原始参数 JSON 字符串解析成呈现模型。argsJson 解析失败时 detail 缺省。 */
+/** Parse a tool name + raw arguments JSON string into a display model. When argsJson fails to parse, detail is omitted. */
 export function resolveToolDisplay(name: string, argsJson?: string): ToolDisplay {
   const key = name.toLowerCase()
   const meta = TOOL_META[key]
@@ -51,7 +52,7 @@ export function resolveToolDisplay(name: string, argsJson?: string): ToolDisplay
   }
 }
 
-/** 工具调用行：`"🛠️ Bash: cmd"`（shell 且 raw 时 `"🛠️ cmd"` 整行）。 */
+/** Tool call line: `"🛠️ Bash: cmd"` (for shell with raw, `"🛠️ cmd"` as the whole line). */
 export function formatToolLine(display: ToolDisplay, opts: ToolLineOptions): string {
   const maxDetailChars = opts.maxDetailChars ?? 40
   const detail = truncate(display.detail ?? '', maxDetailChars)
@@ -62,7 +63,7 @@ export function formatToolLine(display: ToolDisplay, opts: ToolLineOptions): str
   return `${display.emoji} ${display.label}: ${detail}`
 }
 
-/** 工具结果行：`"✅ Bash · 0.4s"` / `"⛔ Bash · 出错了"`。 */
+/** Tool result line: `"✅ Bash · 0.4s"` / `"⛔ Bash · errored"`. */
 export function formatToolResultLine(name: string, opts: { ok: boolean; durationMs?: number; summary?: string }): string {
   const display = resolveToolDisplay(name)
   const mark = opts.ok ? '✅' : '⛔'

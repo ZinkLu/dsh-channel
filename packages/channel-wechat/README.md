@@ -1,14 +1,16 @@
 # dsh-channel-wechat
 
-`dsh-channel` 的微信（WeChat / 微信 / weixin）provider，走腾讯 **iLink Bot API**
-（hermes `weixin` adapter 同款）：长轮询入站、markdown 透传、编号文本审批、delivery ledger。
+WeChat (WeChat / weixin) provider for `dsh-channel`, using Tencent's **iLink Bot API**
+(same as the hermes `weixin` adapter): long-polling inbound, markdown pass-through, numbered-text
+approval, and delivery ledger.
 
-> 与 Telegram provider 的区别只有两点：**transport**（`getupdates` 长轮询，无 webhook/公网地址）
-> 与**能力事实**（`formatTier: 'markdown'`、`supportsEdit: false`、`supportsChoices: false`、
-> `supportsTyping: true`）。merge / route / approval / prompt / ledger 全部复用 `dsh-channel-kit`，
-> `dsh-channel` 与 `dsh-channel-kit` **零改动**——这正是 A5「第二平台骨架」要证明的。
+> It differs from the Telegram provider in only two ways: **transport** (`getupdates` long polling,
+> no webhook/public address) and **capability facts** (`formatTier: 'markdown'`,
+> `supportsEdit: false`, `supportsChoices: false`, `supportsTyping: true`).
+> merge / route / approval / prompt / ledger all reuse `dsh-channel-kit`; `dsh-channel` and
+> `dsh-channel-kit` need **zero changes** — exactly what A5 "the second-platform skeleton" sets out to prove.
 
-## 插件入口
+## Plugin entry point
 
 ```ts
 export const name = 'dsh-channel-wechat'
@@ -17,50 +19,51 @@ export const Config = Schema.object({ ... })
 export function apply(ctx, config) { ... }
 ```
 
-## 配置
+## Configuration
 
-| 字段 | 必填 | 默认 | 说明 |
+| Field | Required | Default | Description |
 |---|---|---|---|
-| `allowedUserIds` | ✅ | 无 | 允许使用机器人的微信 user id（iLink 侧 `from_user_id`） |
-| `accountId` | 否 | 凭据 `WECHAT_ACCOUNT_ID` | iLink bot 账号 id（自消息回环过滤用） |
-| `provider` | 否 | `deepseek-official` | agent 模型 provider |
-| `model` | 否 | 无 | agent 模型 id |
-| `cwd` | 否 | 宿主 `process.cwd()` | agent 工作目录 |
-| `agentPreset` | 否 | 宿主默认 preset | agent preset id |
-| `pollingTimeoutSec` | 否 | `30` | iLink 长轮询超时 |
-| `mergeWindowSec` | 否 | `5` | 连发合并窗口 |
-| `approvalTimeoutSec` | 否 | `120` | 审批超时 |
-| `statePath` | 否 | `$DSH_HOME/channel-wechat/state.json` | 状态文件路径 |
+| `allowedUserIds` | ✅ | None | WeChat user ids allowed to use the bot (iLink-side `from_user_id`) |
+| `accountId` | No | credential `WECHAT_ACCOUNT_ID` | iLink bot account id (used for self-message loopback filtering) |
+| `provider` | No | `deepseek-official` | agent model provider |
+| `model` | No | None | agent model id |
+| `cwd` | No | host `process.cwd()` | agent working directory |
+| `agentPreset` | No | host default preset | agent preset id |
+| `pollingTimeoutSec` | No | `30` | iLink long-polling timeout |
+| `mergeWindowSec` | No | `5` | rapid-fire merge window |
+| `approvalTimeoutSec` | No | `120` | approval timeout |
+| `statePath` | No | `$DSH_HOME/channel-wechat/state.json` | state file path |
 
-## 装配示例
+## Wiring example
 
-见 `cordis.patch.yml`。凭据不落配置文件：
+See `cordis.patch.yml`. Credentials never land in the config file:
 
 ```bash
 dsh credentials set WECHAT_TOKEN '...'        # iLink bot token
-dsh credentials set WECHAT_ACCOUNT_ID '...'   # 可选：iLink bot 账号 id
+dsh credentials set WECHAT_ACCOUNT_ID '...'   # optional: iLink bot account id
 ```
 
-## 能力事实（与 Telegram 的对照）
+## Capability facts (compared with Telegram)
 
-| 事实 | Telegram | WeChat |
+| Fact | Telegram | WeChat |
 |---|---|---|
-| `formatTier` | `html` | `markdown`（微信客户端渲染 markdown，原样透传） |
+| `formatTier` | `html` | `markdown` (the WeChat client renders markdown, passed through unchanged) |
 | `maxMessageChars` | `4096` | `2000` |
-| `supportsChoices` | `true`（inline keyboard） | `false`（审批/提问降级编号文本） |
-| `supportsEdit` | `true` | `false`（微信不能编辑已发消息） |
-| `supportsTyping` | `true` | `true`（iLink `sendtyping`，拿不到 ticket 时静默 no-op） |
-| `streamingMode` | `progress` | `off`（无编辑能力 → 只终态投递） |
+| `supportsChoices` | `true` (inline keyboard) | `false` (approval/prompt degrades to numbered text) |
+| `supportsEdit` | `true` | `false` (WeChat cannot edit sent messages) |
+| `supportsTyping` | `true` | `true` (iLink `sendtyping`; silent no-op when the ticket is unavailable) |
+| `streamingMode` | `progress` | `off` (no editing ability → final-only delivery) |
 
-## 工具供给
+## Tool provisioning
 
-与 Telegram 一致：渠道是 seam、不注册工具，创建 agent 时**自动 join 宿主默认 preset**
-（`dsh-agent-presets`），`agentPreset` 可显式覆盖。详见 `dsh-channel-telegram` README。
+Same as Telegram: the channel is a seam and registers no tools; when creating an agent it
+**automatically joins the host default preset** (`dsh-agent-presets`), and `agentPreset` can
+override it explicitly. See the `dsh-channel-telegram` README for details.
 
-## 安全
+## Security
 
-- `WECHAT_TOKEN` / `WECHAT_ACCOUNT_ID` 只走 `ctx.credentials.resolve`，不落配置文件。
-- allowlist 必填、无宽松默认。
-- 审批 answerer 只答自己 agent；超时/非自己 agent 一律 `next()`，绝不默认放行。
-- 自消息回环过滤：`from_user_id === accountId` 或 `msg_type === 2`（bot 消息）直接丢弃。
-- v1 不处理媒体：带媒体的消息只保留 `hasMedia` 事实（不下载、不解密 CDN），群聊 drop。
+- `WECHAT_TOKEN` / `WECHAT_ACCOUNT_ID` go only through `ctx.credentials.resolve` and never land in the config file.
+- The allowlist is required with no lenient default.
+- The approval answerer answers only for its own agent; on timeout or for a non-own agent it always calls `next()`, never allowing by default.
+- Self-message loopback filter: `from_user_id === accountId` or `msg_type === 2` (bot message) is dropped outright.
+- v1 does not handle media: messages with media keep only the `hasMedia` fact (no download, no CDN decryption); group chats are dropped.

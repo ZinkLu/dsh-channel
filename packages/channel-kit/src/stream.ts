@@ -1,10 +1,12 @@
 /**
- * 流式呈现 reducer：把 session 事件投影折叠成"呈现帧"。
+ * Streaming presentation reducer: fold session events into "presentation frames".
  *
- * 纯函数（定时器在外面，照 merge.ts）：`streamReduce(state, input, caps, now)` 返回
- * 新状态 + 帧。帧是呈现意图（final/draft/draft-finalize/arm-timer），由桥接层执行。
- * 门控照 openclaw：progress 模式首次工具事件只排 1500ms 定时器，定时器触发才建草稿，
- * 快回答零噪音。block（文本分块编辑）v1 退化为终态投递。
+ * Pure function (timers live outside, as in merge.ts): `streamReduce(state, input, caps, now)`
+ * returns new state + frames. Frames are presentation intents (final/draft/draft-finalize/
+ * arm-timer), executed by the bridge layer. Gating follows openclaw: in progress mode the
+ * first tool event only arms a 1500ms timer, and the draft is created only when the timer
+ * fires, so quick answers produce zero noise. block (text-chunk editing) v1 degrades to
+ * terminal-state delivery.
  */
 import { formatToolLine, formatToolResultLine, resolveToolDisplay } from './tool-display.js'
 
@@ -59,7 +61,7 @@ export function streamReduce(state: StreamState, input: StreamInput, caps: Strea
 
 function resolveMode(caps: StreamCaps): 'off' | 'progress' {
   if (caps.streamingMode === 'off') return 'off'
-  if (caps.streamingMode === 'block') return 'off' // 文本分块流式 v2；v1 退化终态。
+  if (caps.streamingMode === 'block') return 'off' // text-chunk streaming v2; v1 degrades to terminal state.
   if (!caps.supportsEdit && !caps.supportsStatusText) return 'off'
   return 'progress'
 }

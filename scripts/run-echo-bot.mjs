@@ -1,6 +1,6 @@
-// 最小可运行示例：加载 dsh-channel + dsh-agent + dsh-credentials-local + dsh-channel-telegram。
-// 当前为 echo agent（无 LLM）：普通消息原样回复，用于验证 Telegram 收发链路。
-// 真实 agent 接入只需在 dsh harness 中安装本插件并配置模型。
+// Minimal runnable example: load dsh-channel + dsh-agent + dsh-credentials-local + dsh-channel-telegram.
+// Currently an echo agent (no LLM): replies to ordinary messages verbatim, used to verify the Telegram send/receive path.
+// To plug in a real agent, just install this plugin in the dsh harness and configure a model.
 import { Context } from '@deepseek-ai/cordis'
 import { apply as channelApply } from 'dsh-channel'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
@@ -23,14 +23,14 @@ if (!token) {
 
 const root = new Context()
 
-// 1. 注册表 core：ctx.channels
+// 1. Registry core: ctx.channels
 await root.plugin(channelApply)
-// 2. 服务：ctx.agents（此处仅注册表，无真实 agent loop）
+// 2. Service: ctx.agents (registry only here, no real agent loop)
 await root.plugin(AgentRegistry)
-// 3. 服务：ctx.credentials（local provider 读取 process.env / $DSH_HOME/.credentials.yaml）
+// 3. Service: ctx.credentials (local provider reads process.env / $DSH_HOME/.credentials.yaml)
 await root.plugin(LocalCredentialProvider, { dshHome: DSH_HOME, watch: true, debounceMs: 100 })
 
-// 4. 注入一个 echo agent factory，用于端到端验证收发链路。
+// 4. Inject an echo agent factory to verify the send/receive path end to end.
 let seq = 0
 root.agents.setFactory({
   async createAgent(_ownerCtx, options) {
@@ -52,7 +52,7 @@ root.agents.setFactory({
 
 function scheduleEcho(agent, message) {
   const text = message.content?.map((block) => block.text ?? '').join('\n') ?? ''
-  const reply = `[echo 模式] 你说：${text}\n\n（未配置 DEEPSEEK_API_KEY，接入真实 agent 后此处为模型回复）`
+  const reply = `[echo mode] You said: ${text}\n\n(No DEEPSEEK_API_KEY configured; after a real agent is plugged in, this becomes the model reply)`
   setTimeout(() => {
     const baseSeq = ++seq
     root.emit('session/event', { id: agent.id, events: [] }, {
@@ -76,7 +76,7 @@ function scheduleEcho(agent, message) {
   }, 200)
 }
 
-// 5. 加载 Telegram provider。
+// 5. Load the Telegram provider.
 const config = {
   allowedUserIds: [USER_ID],
   provider: 'echo',
@@ -91,7 +91,7 @@ await root.plugin({ name: 'dsh-channel-telegram', inject: telegramInject, Config
 console.log(`[echo-bot] started. DSH_HOME=${DSH_HOME} user_id=${USER_ID}`)
 console.log('[echo-bot] Telegram bot is polling. Send /help or any message to t.me/dsh_channel_bot')
 
-// 优雅退出。
+// Graceful shutdown.
 process.once('SIGINT', async () => {
   console.log('[echo-bot] stopping...')
   await root.fiber.dispose()

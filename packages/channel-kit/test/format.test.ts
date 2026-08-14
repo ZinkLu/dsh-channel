@@ -45,8 +45,8 @@ test('html tier renders table as pre', () => {
 })
 
 test('stripToolCallMarkup removes a balanced <tool_calls> block', () => {
-  const text = '抱歉，我再看一次：\n<tool_calls>\n<invoke name="Bash">\n<parameter name="command" string="true">date</parameter>\n</invoke>\n</tool_calls>'
-  assert.equal(stripToolCallMarkup(text), '抱歉，我再看一次：')
+  const text = 'Sorry, let me check again:\n<tool_calls>\n<invoke name="Bash">\n<parameter name="command" string="true">date</parameter>\n</invoke>\n</tool_calls>'
+  assert.equal(stripToolCallMarkup(text), 'Sorry, let me check again:')
 })
 
 test('stripToolCallMarkup keeps text before and after the block', () => {
@@ -65,7 +65,7 @@ test('stripToolCallMarkup removes unbalanced leftover tags', () => {
 })
 
 test('stripToolCallMarkup is a no-op for ordinary text', () => {
-  const text = '你好，今天是 **周五**，`code` 和 [链接](https://e.com)'
+  const text = 'Hello, today is **Friday**, `code` and [link](https://e.com)'
   assert.equal(stripToolCallMarkup(text), text)
 })
 
@@ -75,8 +75,8 @@ test('stripReasoningTags removes reasoning and thinking blocks', () => {
 })
 
 test('stripReasoningTags removes preamble lines', () => {
-  assert.equal(stripReasoningTags('Reasoning:\n实际输出'), '实际输出')
-  assert.equal(stripReasoningTags('思考：\n实际输出'), '实际输出')
+  assert.equal(stripReasoningTags('Reasoning:\nactual output'), 'actual output')
+  assert.equal(stripReasoningTags('Thinking:\nactual output'), 'actual output')
 })
 
 test('stripReasoningTags strict strips inside fences, preserve keeps them', () => {
@@ -86,6 +86,6 @@ test('stripReasoningTags strict strips inside fences, preserve keeps them', () =
 })
 
 test('stripReasoningTags is a no-op for ordinary text', () => {
-  const text = '正常回答，含 `code` 和 [链接](https://e.com)'
+  const text = 'A normal answer with `code` and [link](https://e.com)'
   assert.equal(stripReasoningTags(text), text)
 })

@@ -1,13 +1,13 @@
 # dsh-channel-telegram
 
-第一个 `dsh-channel` provider：Telegram 长轮询、HTML 渲染、inline-keyboard 审批、delivery ledger、媒体收发。
+The first `dsh-channel` provider: Telegram long polling, HTML rendering, inline-keyboard approval, delivery ledger, media send/receive.
 
-> 媒体能力（design §10）：`supportsMedia = true`。入站图片经 `getFile` 下载 →
-> `ctx.attachments.saveImage` → 模型可见 image 块（随 `user/message` 落日志）；其余媒体只带
-> `fileRef` 事实。出站走 `sendMedia` → `sendPhoto`/`sendDocument`（`attachment` 引用或
-> `cwd` 相对路径，越界拒绝）。
+> Media capabilities (design §10): `supportsMedia = true`. Inbound images are downloaded via
+> `getFile` → `ctx.attachments.saveImage` → a model-visible image block (logged with the
+> `user/message`); other media only carry `fileRef` facts. Outbound goes through `sendMedia` →
+> `sendPhoto`/`sendDocument` (an `attachment` reference or a `cwd`-relative path; path escapes are rejected).
 
-## 插件入口
+## Plugin entry point
 
 ```ts
 export const name = 'dsh-channel-telegram'
@@ -16,41 +16,43 @@ export const Config = Schema.object({ ... })
 export function apply(ctx, config) { ... }
 ```
 
-dsh loader 会按模块命名导出识别 `apply` / `inject` / `Config`（本包**没有** default export）。
+The dsh loader recognizes `apply` / `inject` / `Config` from the module's named exports (this package has **no** default export).
 
-## 配置
+## Configuration
 
-| 字段 | 必填 | 默认 | 说明 |
+| Field | Required | Default | Description |
 |---|---|---|---|
-| `allowedUserIds` | ✅ | 无 | 允许使用 bot 的 Telegram user id |
-| `provider` | 否 | `deepseek-official` | agent 模型 provider |
-| `model` | 否 | 无 | agent 模型 id |
-| `cwd` | 否 | 宿主 `process.cwd()` | agent 工作目录（不设则与 Web 会话同工作区） |
-| `agentPreset` | 否 | 宿主默认 preset | agent preset id；不设则 join `dsh-agent-presets` 的默认 preset（标准部署为 `standard`） |
-| `pollingTimeoutSec` | 否 | `30` | Telegram 长轮询超时 |
-| `mergeWindowSec` | 否 | `5` | 连发合并窗口 |
-| `approvalTimeoutSec` | 否 | `120` | 审批超时 |
-| `statePath` | 否 | `$DSH_HOME/channel-telegram/state.json` | 状态文件路径 |
+| `allowedUserIds` | ✅ | none | Telegram user ids allowed to use the bot |
+| `provider` | no | `deepseek-official` | agent model provider |
+| `model` | no | none | agent model id |
+| `cwd` | no | host `process.cwd()` | agent working directory (unset = same workspace as Web sessions) |
+| `agentPreset` | no | host default preset | agent preset id; unset = join `dsh-agent-presets`'s default preset (`standard` for a standard deployment) |
+| `pollingTimeoutSec` | no | `30` | Telegram long-polling timeout |
+| `mergeWindowSec` | no | `5` | burst merge window |
+| `approvalTimeoutSec` | no | `120` | approval timeout |
+| `statePath` | no | `$DSH_HOME/channel-telegram/state.json` | state file path |
 
-## 装配示例
+## Wiring example
 
-见 `cordis.patch.yml`。
+See `cordis.patch.yml`.
 
-## 工具供给（重要）
+## Tool provisioning (important)
 
-渠道是 seam，不是工具提供者，**自己不注册工具**；但它会在创建 agent 的 `setup` 里
-**自动 join 宿主的 agent preset**（`dsh-agent-presets`）：
+The channel is a seam, not a tool provider — it **does not register tools itself**; but during
+agent creation's `setup` it **auto-joins the host agent preset** (`dsh-agent-presets`):
 
-- 未设 `agentPreset` → join 宿主默认 preset（标准 web 部署是 `standard`），
-  agent 得到与 Web 会话**完全一致**的工具/人设/技能全套能力。
-- 设了 `agentPreset` → join 指定的 preset（例如 `minimal` / `code` / 你自己写的）。
+- `agentPreset` unset → join the host default preset (`standard` for a standard web
+  deployment); the agent gets the **exact same** tool/persona/skills capabilities as Web sessions.
+- `agentPreset` set → join the specified preset (e.g. `minimal` / `code` / one you wrote).
 
-因此**不要再为了"给工具"而手写 tool 插件或空掉 preset**：那会让 agent 的请求里没有
-`tools`，DeepSeek 模型会把它想调用的工具写成 `<tool_calls>` XML 纯文本吐出来。出站链路
-另有一道防线 `stripToolCallMarkup` 会把漏出的标记剥掉，但正确姿势是让 preset join 生效。
+So **don't hand-write a tool plugin or empty out the preset just to "give tools"**: that leaves
+no `tools` in the agent's request, and the DeepSeek model would emit the tools it wants to call
+as `<tool_calls>` XML plain text. The outbound path has another line of defense —
+`stripToolCallMarkup` — that strips leaked markup, but the correct approach is to make the
+preset join take effect.
 
-## 安全
+## Security
 
-- Bot token 只通过 `ctx.credentials.resolve(credentialRef('TELEGRAM_BOT_TOKEN'))` 读取，不落配置文件。
-- allowlist 必填、无宽松默认。
-- 审批 answerer 只答自己 agent；超时/非自己 agent 一律 `next()`，绝不默认放行。
+- The bot token is read only via `ctx.credentials.resolve(credentialRef('TELEGRAM_BOT_TOKEN'))` and never written to a config file.
+- The allowlist is required with no permissive default.
+- The approval answerer only answers for its own agent; on timeout or for a non-owned agent it always calls `next()`, never defaulting to allowing.

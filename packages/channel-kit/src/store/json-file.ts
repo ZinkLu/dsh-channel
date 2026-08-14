@@ -68,8 +68,9 @@ function normalizeDeliveries(record: unknown): Record<string, DeliveryRecord> {
 }
 
 /**
- * JSON 文件实现：tmp+rename 原子写，500ms 防抖。
- * 包内唯一碰文件系统的文件；接口保持纯数据操作 + 显式 flush。
+ * JSON file implementation: tmp+rename atomic writes, 500ms debounce.
+ * The only file in the package that touches the filesystem; the interface stays pure
+ * data operations + explicit flush.
  */
 export function createJsonFileStore(path: string): ChannelStore {
   const seenLimit = 1000
@@ -100,7 +101,7 @@ export function createJsonFileStore(path: string): ChannelStore {
       writeTimer = undefined
       void flush()
     }, WRITE_DEBOUNCE_MS)
-    // 不让计时器拖住 Node 进程退出。
+    // Don't let the timer keep the Node process alive on exit.
     writeTimer.unref?.()
   }
 
@@ -119,9 +120,9 @@ export function createJsonFileStore(path: string): ChannelStore {
       for (const [k, v] of Object.entries(data.bindings)) bindings.set(k, v)
       for (const [k, v] of Object.entries(data.deliveries)) deliveries.set(k, { ...v })
     } catch (error) {
-      // 文件不存在或损坏都不阻塞渠道：ledger/seen 从头开始，日志折叠兜底。
+      // A missing or corrupt file must not block the channel: ledger/seen start from scratch, with log folding as the fallback.
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-        // 损坏文件改名为 .bak，避免每次启动都失败。
+        // Rename the corrupt file to .bak so not every startup fails.
         try { renameSync(path, `${path}.bak`) } catch { /* noop */ }
       }
     }

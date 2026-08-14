@@ -74,13 +74,13 @@ interface AgentPresetJoin {
   mount?: (agentCtx: Context) => Promise<void>
 }
 
-/** dsh-agent-presets 的最小鸭子类型（可选依赖，不 import 包）。 */
+/** Minimal duck type for dsh-agent-presets (optional dependency, not imported as a package). */
 interface AgentPresetsLike {
   resolve: (id?: string) => Promise<{ id: string }>
   mount: (agentCtx: Context, id?: string) => Promise<unknown>
 }
 
-/** dsh-user-questions 的最小鸭子类型（可选依赖，不 import 包）。 */
+/** Minimal duck type for dsh-user-questions (optional dependency, not imported as a package). */
 interface UserQuestionsLike {
   registerProvider(provider: UserQuestionProviderLike): () => void
 }
@@ -105,7 +105,7 @@ interface AskUserQuestionAnswerLike {
   answers: Array<{ id: string; selected: string[]; custom?: string }>
 }
 
-/** dsh-attachment 的最小鸭子类型（可选依赖，缺失时图片降级为 fileRef 事实）。 */
+/** Minimal duck type for dsh-attachment (optional dependency; when missing, images degrade to fileRef facts). */
 interface AttachmentsLike {
   saveImage(input: { data: Uint8Array; mediaType: string; name?: string }): Promise<ImageAttachmentRef>
 }
@@ -174,7 +174,7 @@ export class TelegramBridge {
       try {
         disposer()
       } catch {
-        // 忽略 listener disposer 错误。
+        // Ignore listener disposer errors.
       }
     }
 
@@ -200,7 +200,7 @@ export class TelegramBridge {
       try {
         await handle.dispose()
       } catch {
-        // agent 可能已被其他 fiber 释放。
+        // The agent may already have been released by another fiber.
       }
       this.ownedHandles.delete(sessionId)
     }
@@ -208,10 +208,10 @@ export class TelegramBridge {
     await this.store.flush()
   }
 
-  // ---- 启动恢复 ----
+  // ---- Startup restore ----
 
   private async restore(): Promise<void> {
-    // merge 窗口内未交付的缓冲：恢复后当作刚到达重新起窗。
+    // Undelivered merge-window buffers: after restore, treat them as just arrived and restart the window.
     const now = Date.now()
     const buffers = this.store.mergeBuffers()
     for (const [chatKey, buffer] of Object.entries(buffers)) {
@@ -220,13 +220,13 @@ export class TelegramBridge {
       this.armMergeTimer(chatKey, now + this.config.mergeWindowSec * 1000)
     }
 
-    // 绑定恢复：chatKey → sessionId。
+    // Restore bindings: chatKey → sessionId.
     for (const [chatKey, sessionId] of Object.entries(this.store.bindings())) {
       this.sessionChatKeys.set(sessionId, chatKey)
       try {
         await this.ensureAgent(sessionId, chatKey, false)
       } catch {
-        // 恢复失败不阻塞渠道启动；首条消息会再试 create。
+        // A failed restore does not block channel startup; the first message retries create.
       }
     }
 
@@ -268,7 +268,7 @@ export class TelegramBridge {
         this.store.markFailed(item.key, `recovery: empty assistant message ${item.key}`)
         continue
       }
-      const marker = item.state === 'pending' ? '' : '（恢复重发，可能重复）\n'
+      const marker = item.state === 'pending' ? '' : '(resumed resend, may duplicate)\n'
       try {
         await this.sendOutbound(item.chatKey, marker + text, item.key, { origin: { sessionId, seq }, recover: item.state })
       } catch (error) {
@@ -277,7 +277,7 @@ export class TelegramBridge {
     }
   }
 
-  // ---- 轮询 ----
+  // ---- Polling ----
 
   private startPolling(): void {
     this.pollAbort = new AbortController()
@@ -344,21 +344,21 @@ export class TelegramBridge {
     if (message.from?.is_bot) return
 
     if (chat.type !== 'private') {
-      // v1 群聊不路由，但事实照发（策略插件审计可用）。
+      // v1 group chats are not routed, but facts are still ingested (usable for policy-plugin auditing).
       this.ingest(chatKey, senderId, message, chat.type === 'supergroup' || chat.type === 'group' ? 'group' : 'direct')
       return
     }
 
     const allowed = this.config.allowedUserIds.includes(Number(senderId))
     if (!allowed) {
-      await this.sendLocal(chatKey, '⚠️ 你没有权限使用本机器人。')
+      await this.sendLocal(chatKey, '⚠️ You are not authorized to use this bot.')
       return
     }
 
     const messageId = String(message.message_id)
     if (this.store.seenInbound(messageId)) return
 
-    // 审批/提问应答优先于 merge/router，且必须立即处理（openclaw 控制命令铁律）。
+    // Approval/prompt replies take priority over merge/router and must be handled immediately (openclaw control-command iron rule).
     const activePending = [...this.pendingApprovals.values()]
     const approvalReply = parseApprovalReply({ text: messageText(message) }, activePending)
     if (approvalReply.kind === 'answer') {
@@ -387,7 +387,7 @@ export class TelegramBridge {
 
     if (hasMedia(message)) {
       await this.flushBuffered(chatKey)
-      // 图片下载 → saveImage → 模型可见 image 块；其余媒体只带 fileRef 事实（不下载）。
+      // Download images → saveImage → model-visible image block; other media only carry fileRef facts (not downloaded).
       const images = await this.downloadInboundImages(message)
       if (text.trim() !== '' || images.length > 0) {
         await this.dispatchText(chatKey, text, [messageId], senderId, images)
@@ -434,7 +434,7 @@ export class TelegramBridge {
     this.ctx.channels.ingest(inbound)
   }
 
-  /** 下载入站图片并落 `ctx.attachments.saveImage`（R7 模型可见）；缺失/失败降级为 fileRef 事实。 */
+  /** Download inbound images and store via `ctx.attachments.saveImage` (visible to the R7 model); missing/failure degrades to fileRef facts. */
   private async downloadInboundImages(message: TelegramMessage): Promise<ImageAttachmentRef[]> {
     const photo = largestPhoto(message.photo)
     if (!photo) return []
@@ -449,7 +449,7 @@ export class TelegramBridge {
       const ref = await attachments.saveImage({ data: bytes, mediaType, name: `telegram-${photo.file_id}` })
       return [ref]
     } catch {
-      // 下载/入库失败不阻塞文本；图片降级为 fileRef 事实（ingest 已带出）。
+      // A download/store failure does not block the text; the image degrades to a fileRef fact (already emitted by ingest).
       return []
     }
   }
@@ -473,7 +473,7 @@ export class TelegramBridge {
       if (effect.kind === 'armTimer') {
         this.armMergeTimer(chatKey, effect.at)
       } else if (effect.kind === 'ack-long') {
-        await this.sendLocal(chatKey, '收到，处理中…')
+        await this.sendLocal(chatKey, 'Received, working on it…')
       } else if (effect.kind === 'flush') {
         const ids = this.mergeMessageIds.get(chatKey) ?? []
         const senderId = this.mergeSenderIds.get(chatKey) ?? '0'
@@ -514,7 +514,7 @@ export class TelegramBridge {
     await this.handleMergeEffects(chatKey, result.state, result.effects)
   }
 
-  // ---- 路由与投递 ----
+  // ---- Routing and delivery ----
 
   private routeContext() {
     return {
@@ -540,7 +540,7 @@ export class TelegramBridge {
 
     const agent = await this.ensureAgent(decision.sessionId, chatKey, decision.create)
     if (!agent) {
-      await this.sendLocal(chatKey, '⚠️ 无法创建或恢复会话。')
+      await this.sendLocal(chatKey, '⚠️ Unable to create or resume session.')
       return
     }
 
@@ -577,7 +577,7 @@ export class TelegramBridge {
       ...(this.config.model !== undefined ? { model: this.config.model } : {}),
     }
 
-    // 工具是 preset（agent 平面）的职责：join 宿主默认 preset，保留原装能力。
+    // Tools are the preset's (agent-plane) responsibility: join the host default preset and keep the stock capabilities.
     const preset = await this.resolveAgentPreset()
     const setup = (agentCtx: Context) => this.setupAgent(agentCtx, preset.mount)
 
@@ -594,8 +594,8 @@ export class TelegramBridge {
       const handle = await this.ctx.agents.create({
         sessionId: SessionId(sessionId),
         meta: {
-          // cwd 必须给到：persona 的 {{cwd}} 变量、fs 工作区、会话 workspace key 都靠它。
-          // 缺省沿用 process.cwd()（启动 dsh 的目录），与 Web 会话同一工作区。
+          // cwd must be provided: the persona's {{cwd}} variable, the fs workspace, and the session workspace key all depend on it.
+          // By default it uses process.cwd() (the directory where dsh was started), the same workspace as Web sessions.
           cwd: this.config.cwd ?? process.cwd(),
           ...(preset.presetId !== undefined ? { agentPreset: preset.presetId } : {}),
         },
@@ -608,9 +608,10 @@ export class TelegramBridge {
   }
 
   /**
-   * 解析 agent 要 join 的 preset：显式 `config.agentPreset` 优先，否则用宿主的
-   * 默认 preset（`dsh-agent-presets` 的 `defaultId`）。无 preset roster 时返回空
-   * —— agent 走 host 全局层（TUI 单会话 / 无 roster 部署）。
+   * Resolve the preset the agent should join: an explicit `config.agentPreset` wins,
+   * otherwise the host default preset (`dsh-agent-presets`'s `defaultId`) is used.
+   * With no preset roster, return empty — the agent goes through the host global
+   * layer (TUI single session / no-roster deployment).
    */
   private async resolveAgentPreset(): Promise<AgentPresetJoin> {
     const presets = this.ctx.get('agentPresets') as AgentPresetsLike | undefined
@@ -636,20 +637,21 @@ export class TelegramBridge {
         }),
       })
     } catch {
-      // systemPrompt 是可选依赖，缺失/异常都不阻塞 agent 创建。
+      // systemPrompt is an optional dependency; a missing/broken one does not block agent creation.
     }
     this.registerUserQuestionsProvider(agentCtx)
-    // join preset 必须在 agent factory 的 setup 里完成；失败会回滚整个创建。
+    // Joining the preset must happen inside the agent factory's setup; failure rolls back the whole creation.
     if (mount !== undefined) {
       await mount(agentCtx)
     }
   }
 
   /**
-   * 在 agent 作用域注册 user-questions provider（dsh 的"选项 A/B" seam）。
-   * 鸭子类型 + ctx.get：`dsh-user-questions` 不在 inject、缺失时优雅跳过——
-   * 该 agent 的提问走别的 provider 或 fail-closed（NO_PROVIDER），收发不受影响（R2/A3）。
-   * registerProvider 是单槽；DUPLICATE_PROVIDER 时静默降级。
+   * Register the user-questions provider in the agent scope (dsh's "options A/B" seam).
+   * Duck typing + ctx.get: `dsh-user-questions` is not in inject; when missing, skip
+   * gracefully — that agent's questions go through another provider or fail-closed
+   * (NO_PROVIDER), and messaging is unaffected (R2/A3).
+   * registerProvider is a single slot; degrade silently on DUPLICATE_PROVIDER.
    */
   private registerUserQuestionsProvider(agentCtx: Context): void {
     const userQuestions = agentCtx.get('userQuestions') as UserQuestionsLike | undefined
@@ -657,7 +659,7 @@ export class TelegramBridge {
     try {
       userQuestions.registerProvider({ ask: (request) => this.askUserQuestions(request) })
     } catch {
-      // 单槽冲突：本作用域已有 provider，不抢、不阻塞 agent 创建。
+      // Single-slot conflict: this scope already has a provider; don't grab it, and don't block agent creation.
     }
   }
 
@@ -696,7 +698,7 @@ export class TelegramBridge {
       detail: question.detail,
       options,
       multiSelect: question.multiSelect ?? false,
-      allowFreeText: true, // 自由文本始终可用（hermes clarify 的 "Other" / openclaw 的 isOther:true）。
+      allowFreeText: true, // Free text is always available (hermes clarify's "Other" / openclaw's isOther:true).
       intent: question.intent,
       expiresAt: Date.now() + this.config.approvalTimeoutSec * 1000,
       resolve: (selected, custom) => settle(selected, custom),
@@ -758,11 +760,11 @@ export class TelegramBridge {
       const platformId = receipt.platformMessageIds?.[0]
       if (platformId) entry.messageId = Number(platformId)
     } catch {
-      // 提示发送失败：answerer 超时后 fail-closed（空回答），绝不默认放行。
+      // Prompt send failed: the answerer fails closed after timeout (empty answer); never default to allowing.
     }
   }
 
-  // ---- 出站 ----
+  // ---- Outbound ----
 
   private onSessionEvent(session: Session, event: SessionEvent): void {
     const chatKey = this.sessionChatKeys.get(session.id)
@@ -786,12 +788,12 @@ export class TelegramBridge {
       this.feedStream(session.id, chatKey, { kind: 'tool-result', callId, name, ok: event.data.error === undefined, summary: event.data.error?.name })
     } else if (event.type === 'turn/end' && event.data.reason.kind !== 'completed') {
       const label = turnEndLabel(event.data.reason.kind)
-      void this.sendLocal(chatKey, `⏹ 本轮结束：${label}`).catch(() => {})
+      void this.sendLocal(chatKey, `⏹ Turn ended: ${label}`).catch(() => {})
       this.feedStream(session.id, chatKey, { kind: 'turn-end', reason: event.data.reason.kind })
     }
   }
 
-  // ---- 流式呈现（streamReduce 帧执行器）----
+  // ---- Streaming presentation (streamReduce frame executor) ----
 
   private streamCaps(): StreamCaps {
     return {
@@ -855,7 +857,7 @@ export class TelegramBridge {
       const token = await this.requireToken()
       await this.client.deleteMessage(token, chatKey, existing)
     } catch {
-      // 草稿删除 best-effort；最终答复已单独发送。
+      // Draft deletion is best-effort; the final answer is already sent separately.
     }
     this.ctx.emit('channel/present', { kind: 'draft-finalize', channel: 'telegram', chatKey, draftKey: `draft:${sessionId}` } satisfies PresentationFrame)
   }
@@ -918,7 +920,7 @@ export class TelegramBridge {
         this.store.markDelivered(key, [])
       } else {
         this.store.markFailed(key, receipt.error ?? 'delivery failed')
-        // 某段失败 → 后续段停发（防乱序）。
+        // A chunk failure stops sending later chunks (prevents reordering).
         return
       }
       if (i < chunks.length - 1) {
@@ -943,7 +945,7 @@ export class TelegramBridge {
     }
   }
 
-  // ---- 命令 ----
+  // ---- Commands ----
 
   private async handleCommand(commandText: string, chatKey: string): Promise<void> {
     const match = /^\/([^\s@]+)\s*(.*)$/.exec(commandText)
@@ -951,37 +953,37 @@ export class TelegramBridge {
     const args = (match?.[2] ?? '').trim()
 
     if (command === 'start' || command === 'help') {
-      await this.sendLocal(chatKey, '可用命令：\n/start - 开始使用\n/new - 新建会话\n/status - 会话状态\n/bind <sessionId> - 绑定会话\n/help - 帮助')
+      await this.sendLocal(chatKey, 'Available commands:\n/start - Get started\n/new - New session\n/status - Session status\n/bind <sessionId> - Bind session\n/help - Help')
       return
     }
     if (command === 'new') {
       const sessionId = `channel:telegram:${chatKey}:${Date.now()}`
       this.store.setBinding(chatKey, sessionId)
       this.sessionChatKeys.set(sessionId, chatKey)
-      await this.sendLocal(chatKey, `✅ 已创建新会话：${sessionId}`)
+      await this.sendLocal(chatKey, `✅ Created new session: ${sessionId}`)
       return
     }
     if (command === 'bind') {
       if (!args) {
-        await this.sendLocal(chatKey, '用法：/bind <sessionId>')
+        await this.sendLocal(chatKey, 'Usage: /bind <sessionId>')
         return
       }
       this.store.setBinding(chatKey, args)
       this.sessionChatKeys.set(args, chatKey)
-      await this.sendLocal(chatKey, `✅ 已绑定会话：${args}`)
+      await this.sendLocal(chatKey, `✅ Bound to session: ${args}`)
       return
     }
     if (command === 'status') {
       const binding = this.store.bindings()[chatKey]
       const sessionId = binding ?? `channel:telegram:${chatKey}`
       const agent = this.ctx.agents.get(SessionId(sessionId))
-      await this.sendLocal(chatKey, agent ? `会话 ${sessionId} 状态：${agent.status}` : `会话 ${sessionId} 未在运行。`)
+      await this.sendLocal(chatKey, agent ? `Session ${sessionId} status: ${agent.status}` : `Session ${sessionId} is not running.`)
       return
     }
-    await this.sendLocal(chatKey, `未知命令：${command}，使用 /help 查看帮助。`)
+    await this.sendLocal(chatKey, `Unknown command: ${command}. Use /help for help.`)
   }
 
-  // ---- 审批 ----
+  // ---- Approval ----
 
   private onApprovalRequest = async (req: import('@deepseek-ai/dsh-user-approval').ApprovalRequest, next: () => Promise<import('@deepseek-ai/dsh-user-approval').ApprovalOutcome>): Promise<import('@deepseek-ai/dsh-user-approval').ApprovalOutcome> => {
     const chatKey = this.sessionChatKeys.get(req.agent.id)
@@ -1046,7 +1048,7 @@ export class TelegramBridge {
       const platformId = receipt.platformMessageIds?.[0]
       if (platformId) entry.messageId = Number(platformId)
     } catch {
-      // 审批提示发送失败时，answerer 超时后 next()；绝不默认放行。
+      // When the approval prompt fails to send, the answerer calls next() after timeout; never default to allowing.
     }
   }
 
@@ -1054,7 +1056,7 @@ export class TelegramBridge {
     try {
       await this.client.answerCallbackQuery(await this.requireToken(), callbackQuery.id)
     } catch {
-      // 转圈消除失败不阻塞后续。
+      // Failing to clear the spinner does not block what follows.
     }
 
     const data = callbackQuery.data ?? ''
@@ -1075,11 +1077,11 @@ export class TelegramBridge {
             token,
             chatKey,
             messageId,
-            outcome === 'allowed-once' ? '✅ 已批准' : '⛔ 已拒绝',
+            outcome === 'allowed-once' ? '✅ Approved' : '⛔ Denied',
             { parseMode: 'HTML' },
           )
         } catch {
-          // 编辑失败不阻塞审批结果。
+          // A failed edit does not block the approval outcome.
         }
       }
       return
@@ -1096,9 +1098,9 @@ export class TelegramBridge {
           try {
             const token = await this.requireToken()
             const chosen = reply.answer.selected.join(', ') || reply.answer.custom || ''
-            await this.client.editMessageText(token, chatKey, messageId, `✅ 已选择：${chosen}`, { parseMode: 'HTML' })
+            await this.client.editMessageText(token, chatKey, messageId, `✅ Selected: ${chosen}`, { parseMode: 'HTML' })
           } catch {
-            // 编辑失败不阻塞应答。
+            // A failed edit does not block the reply.
           }
         }
       }
@@ -1145,7 +1147,7 @@ function largestPhoto(photo: readonly TelegramPhotoSize[] | undefined): Telegram
   return photo.reduce((a, b) => ((b.file_size ?? 0) > (a.file_size ?? 0) ? b : a))
 }
 
-/** 从字节嗅探图片媒体类型（saveImage 需要精确声明，按魔数判定）。 */
+/** Sniff the image media type from bytes (saveImage needs an exact declaration; detect by magic number). */
 function sniffImageMediaType(bytes: Uint8Array): ImageMediaType | undefined {
   if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return 'image/png'
   if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg'
@@ -1176,15 +1178,15 @@ function assistantMessageText(message: unknown): string {
 function turnEndLabel(kind: string): string {
   switch (kind) {
     case 'aborted':
-      return '已中止'
+      return 'Aborted'
     case 'blocked':
-      return '已阻塞'
+      return 'Blocked'
     case 'error':
-      return '出错'
+      return 'Error'
     case 'max-tokens':
-      return '达到 token 上限'
+      return 'Max tokens'
     case 'interrupted':
-      return '已中断'
+      return 'Interrupted'
     default:
       return kind
   }

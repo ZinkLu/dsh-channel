@@ -1,11 +1,12 @@
 import { decodeFrame, encodeFrame } from './proto.js'
 
 /**
- * 飞书 / Lark Open API client + 长连接（WebSocket）入站客户端。
+ * Feishu / Lark Open API client + long-connection (WebSocket) inbound client.
  *
- * 发送走 HTTP（tenant_access_token 鉴权），入站走**长连接模式**（`callback/ws/endpoint`
- * 拿到 wss 地址后建立持久连接），因此与 Telegram/WeChat 一样**无需公网地址、无需 webhook**。
- * 参考：openclaw feishu 插件（`@larksuiteoapi/node-sdk`）/ mimiclaw feishu_bot.c。
+ * Sending goes over HTTP (authenticated with tenant_access_token), while inbound uses
+ * **long-connection mode** (fetch the wss address from `callback/ws/endpoint`, then open a
+ * persistent connection), so like Telegram/WeChat it needs **no public address and no webhook**.
+ * Reference: the openclaw Feishu plugin (`@larksuiteoapi/node-sdk`) / mimiclaw feishu_bot.c.
  */
 
 export type FeishuDomain = 'feishu' | 'lark'
@@ -19,7 +20,7 @@ export interface FeishuClientOptions {
   domain?: FeishuDomain
   fetch?: typeof fetch
   timeoutMs?: number
-  /** tenant token 缓存失效阈值（秒）；默认提前 300s 续期。 */
+  /** Tenant token cache expiry threshold (seconds); defaults to renewing 300s ahead. */
   tokenRefreshAheadSec?: number
 }
 
@@ -113,7 +114,7 @@ export class FeishuClient {
     return messageId
   }
 
-  /** 回复到指定消息（原消息上下文里的 thread）。 */
+  /** Reply to the given message (the thread in the original message context). */
   async replyMessage(
     token: string,
     messageId: string,
@@ -172,7 +173,7 @@ export class FeishuClient {
   }
 }
 
-// ---- 长连接（WebSocket）----
+// ---- Long connection (WebSocket) ----
 
 export interface FeishuWsEndpoint {
   url: string
@@ -245,7 +246,7 @@ export class FeishuWsClient {
         this.endpoint = await this.fetchEndpoint(credentials)
         this.opts.onStatus?.('connecting')
         await this.connectOnce(this.endpoint)
-        // connectOnce 返回时连接已断开（或 stop）；退避后重连。
+        // When connectOnce returns, the connection has dropped (or stopped); back off and reconnect.
         backoff = 1000
       } catch (error) {
         if (this.stopped) return
@@ -310,7 +311,7 @@ export class FeishuWsClient {
       }
 
       ws.onerror = (error) => {
-        // onclose 会随后触发；这里只记录，不 resolve（避免与 onclose 双 settle）。
+        // onclose fires next; only log here, do not resolve (avoid double-settling with onclose).
         void error
       }
     })
@@ -323,7 +324,7 @@ export class FeishuWsClient {
       try {
         this.ws.send(encodeFrame({ seqId: 0, logId: 0, service: endpoint.serviceId, method: 0, headers: { type: 'ping' }, payload: null }).buffer as ArrayBuffer)
       } catch {
-        // 发送失败由 onclose/onerror 接管。
+        // Send failures are handled by onclose/onerror.
       }
       this.armPing(endpoint)
     }, endpoint.pingIntervalMs)
@@ -340,7 +341,7 @@ export class FeishuWsClient {
 
     const type = frame.headers['type'] ?? ''
     if (frame.method === 0) {
-      // 控制帧：pong（服务端回包）；payload 可能带更新后的 PingInterval，v1 忽略。
+      // Control frame: pong (server reply); the payload may carry an updated PingInterval, which v1 ignores.
       return
     }
     if (type !== 'event' || frame.payload === null) return
@@ -354,7 +355,7 @@ export class FeishuWsClient {
       return
     }
 
-    // ACK：回显 seqId/logId/service/method，负载 `{"code":200}`。
+    // ACK: echo seqId/logId/service/method with payload `{"code":200}`.
     try {
       this.ws?.send(encodeFrame({
         seqId: frame.seqId,
@@ -365,7 +366,7 @@ export class FeishuWsClient {
         payload: new TextEncoder().encode('{"code":200}'),
       }).buffer as ArrayBuffer)
     } catch {
-      // ACK 失败不阻塞事件处理。
+      // ACK failure does not block event handling.
     }
     void payloadText
   }
@@ -393,7 +394,7 @@ function toUint8Array(data: unknown): Uint8Array {
   if (data instanceof ArrayBuffer) return new Uint8Array(data)
   if (ArrayBuffer.isView(data)) return new Uint8Array((data as ArrayBufferView).buffer, (data as ArrayBufferView).byteOffset, (data as ArrayBufferView).byteLength)
   if (typeof data === 'object' && data !== null && 'arrayBuffer' in data) {
-    // Blob 形态：异步拿 arrayBuffer，这里同步拿不到就返回空（v1 不处理）。
+    // Blob form: getting arrayBuffer is async; here we cannot get it synchronously so return empty (v1 does not handle it).
     return new Uint8Array(0)
   }
   return new Uint8Array(0)
@@ -410,7 +411,7 @@ function sleep(ms: number): Promise<void> {
   })
 }
 
-// ---- 事件类型（im.message.receive_v1 v2 schema）----
+// ---- Event types (im.message.receive_v1 v2 schema) ----
 
 export interface FeishuEventV2 {
   schema?: string
@@ -454,7 +455,7 @@ export function senderId(event: FeishuMessageEvent): string {
   return event.sender?.sender_id?.open_id ?? event.sender?.sender_id?.user_id ?? event.sender?.sender_id?.union_id ?? ''
 }
 
-/** 平台无关的媒体事实（与 dsh-channel 的 InboundMedia 同构，客户端不依赖契约包）。 */
+/** Platform-agnostic media facts (isomorphic with dsh-channel's InboundMedia; the client does not depend on the contract package). */
 export interface FeishuMedia {
   kind: 'image' | 'document' | 'audio' | 'video'
   fileRef: string
@@ -462,7 +463,7 @@ export interface FeishuMedia {
   fileName?: string
 }
 
-/** 入站媒体事实（fileRef = file_key/image_key；v1 不下载字节，仅交接）。 */
+/** Inbound media facts (fileRef = file_key/image_key; v1 does not download bytes, only hands them over). */
 export function mediaFacts(event: FeishuMessageEvent): FeishuMedia[] {
   const message = event.message
   if (!message) return []
@@ -484,14 +485,14 @@ export function mediaFacts(event: FeishuMessageEvent): FeishuMedia[] {
   if (type === 'audio' && fileKey) return [{ kind: 'audio', fileRef: fileKey, fileName }]
   if (type === 'file' && fileKey) return [{ kind: 'document', fileRef: fileKey, fileName }]
   if (type === 'media') {
-    // 富媒体卡片可同时带图片与文件。
+    // Rich media cards can carry both an image and a file.
     const facts: FeishuMedia[] = []
     if (imageKey) facts.push({ kind: 'image', fileRef: imageKey })
     if (fileKey) facts.push({ kind: 'document', fileRef: fileKey, fileName })
     return facts
   }
   if (type === 'video' && fileKey) return [{ kind: 'video', fileRef: fileKey, fileName }]
-  // 其余（sticker 等）只给 file_key 事实。
+  // Others (sticker, etc.) only provide the file_key fact.
   if (fileKey) return [{ kind: 'document', fileRef: fileKey, fileName }]
   return []
 }

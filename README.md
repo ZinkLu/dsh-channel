@@ -1,5 +1,161 @@
 # dsh-channel
 
+[English](#english) · [中文](#中文)
+
+---
+
+<a name="english"></a>
+## English
+
+The message-channel common layer for DeepSeek Harness (dsh) plus multiple provider implementations (Telegram / WeChat / Feishu / …, with more added continuously in this repo).
+
+Split into five packages per [dsh-channel-design.md](./dsh-channel-design.md).
+
+For the alignment baseline against dsh's own core/seam, see [docs/dsh-core-reference.md](./docs/dsh-core-reference.md)
+(full ctx seam/core table + core packages + lifecycle + tool pipeline + session log, checked line-by-line
+against the rc.6 source), and [docs/dsh-core-alignment-audit.md](./docs/dsh-core-alignment-audit.md)
+(point-by-point verification of the design doc against the dsh API).
+
+| Package | Directory | Description |
+|---|---|---|
+| `dsh-channel` | `packages/channel` | Contract package: `ctx.channels` registry, `Channel` abstract base class, `channel/*` event vocabulary, `MessageSourceMap.channel` merging |
+| `dsh-channel-kit` | `packages/channel-kit` | Pure-function library for the six grunt-work tasks: chunk / merge / router / approval-render / store / format / promptHint |
+| `dsh-channel-telegram` | `packages/channel-telegram` | First provider: Telegram long polling, HTML rendering, inline-keyboard approval, delivery ledger |
+| `dsh-channel-wechat` | `packages/channel-wechat` | WeChat (iLink Bot API): long polling, markdown pass-through, numbered-text approval |
+| `dsh-channel-feishu` | `packages/channel-feishu` | Feishu / Lark: long-lived (WebSocket) inbound, plain-text rendering, numbered-text approval |
+
+---
+
+### Quick start
+
+```bash
+npm install          # install workspace dependencies
+npm run build -ws    # build all five packages into each package's lib/
+npm run test -ws     # run all tests
+npm run typecheck -ws
+```
+
+You can also operate on a single package:
+
+```bash
+npm run build -w dsh-channel-kit
+npm run test -w dsh-channel-telegram
+npm run test -w dsh-channel-wechat
+npm run test -w dsh-channel-feishu
+```
+
+---
+
+### Wiring the Telegram channel into dsh
+
+1. Make sure the dsh host is configured (the standard `web` profile has everything out of the box, no extra action needed):
+
+   - `ctx.agents` / agent loop (`@deepseek-ai/dsh-agent-loop`)
+   - `ctx.credentials` (`@deepseek-ai/dsh-credentials-local`)
+   - `ctx.llm` and the corresponding model adapter
+   - agent preset (`@deepseek-ai/dsh-agent-presets`): standard web deployments default to `standard`.
+     When the Telegram channel creates an agent it **automatically joins the host's default preset**, so the
+     full tool/persona/skill capability set matches a Web session — no need to configure tools by hand, and
+     don't hand-write a tool plugin just to "give it tools".
+
+2. Install this repo's packages (or use the npm names after publishing; WeChat/Feishu follow the same pattern with
+   `dsh-channel-wechat` / `dsh-channel-feishu` respectively — see each package's `cordis.patch.yml` for wiring):
+
+   ```bash
+   # in your dsh profile
+   pnpm add dsh-channel dsh-channel-kit dsh-channel-telegram
+   ```
+
+3. Merge the contents of `packages/channel-telegram/cordis.patch.yml` into your profile's
+   `cordis.patch.yml` (or use `dsh --patch ./packages/channel-telegram/cordis.patch.yml`):
+
+   ```yaml
+   - insert:
+       - id: channel
+         name: dsh-channel
+   - insert:
+       - id: channel-telegram
+         name: dsh-channel-telegram
+         config:
+           allowedUserIds: [5002186681]   # replace with your Telegram user id
+           provider: deepseek-official
+           model: deepseek-v4-flash
+           # cwd / agentPreset unset: use process.cwd() workspace + host default preset
+   ```
+
+4. Configure the Telegram Bot Token (**don't put it in the config file**):
+
+   ```bash
+   export TELEGRAM_BOT_TOKEN='...'          # process env, takes effect on start
+   # or hot-swap at runtime:
+   dsh credentials set TELEGRAM_BOT_TOKEN '...'
+   ```
+
+   The plugin re-resolves `ctx.credentials.resolve('TELEGRAM_BOT_TOKEN')` before every API call;
+   `dsh-credentials-local` hot-publishes `.credentials.yaml` changes, so swapping the token at runtime
+   needs no restart.
+
+5. Start dsh and send a message to your bot. By default only `direct` private chats are allowed; group chats are dropped in v1.
+
+---
+
+### Local debugging (echo bot, no model)
+
+The repo ships a dev echo bot for verifying the Telegram send/receive path without a full dsh host:
+
+```bash
+npm run build -ws
+TELEGRAM_BOT_TOKEN='...' node scripts/run-echo-bot.mjs
+```
+
+It loads `dsh-channel` + `dsh-agent` + `dsh-credentials-local` + `dsh-channel-telegram`, and substitutes an echo factory for the real agent loop. Ordinary messages are replied with `[echo mode] You said: ...`; local commands (`/help`, `/start`, etc.) work.
+
+---
+
+### Test coverage
+
+| Package | Tests | Coverage |
+|---|---|---|
+| `dsh-channel` | 6 | register/unregister, duplicate-registration rejection, deliver default, waterfall observation and short-circuit, event broadcast |
+| `dsh-channel-kit` | 65 | chunk fence padding/prefix convergence, merge three iron rules and `..`/`!!`, router decision table, approval numbering/timeout, store state machine and JSON file, format three-tier degradation and `<tool_calls>`/reasoning sanitization, prompt-render options/multi-select/free-text, tool-display, stream reducer |
+| `dsh-channel-telegram` | 10 | Telegram API calls and redaction, HTML-failure fallback to plain text, inbound routing/merge/delivery, allowlist, approval answerer timeout `next()`, `<tool_calls>` leak interception, agent preset join, progress draft, user-questions provider |
+| `dsh-channel-wechat` | 5 | iLink getupdates/sendmessage calls and redaction, context_token echo, inbound routing/merge/delivery, allowlist |
+| `dsh-channel-feishu` | 11 | tenant_access_token cache, sendMessage receive_id_type parsing, protobuf frame encode/decode, inbound event routing/delivery, allowlist |
+
+---
+
+### Directory structure
+
+```
+.
+├── packages/
+│   ├── channel/          # dsh-channel (contract)
+│   ├── channel-kit/      # dsh-channel-kit (pure-function library)
+│   ├── channel-telegram/ # dsh-channel-telegram
+│   ├── channel-wechat/   # dsh-channel-wechat (WeChat iLink Bot API)
+│   └── channel-feishu/   # dsh-channel-feishu (Feishu / Lark long-lived connection)
+├── scripts/
+│   └── run-echo-bot.mjs  # local debug echo bot
+├── dsh-channel-design.md
+├── tsconfig.base.json
+└── package.json
+```
+
+---
+
+### Notes
+
+- Media capability (design §10) is implemented in the contract: `InboundMedia`/`OutboundMedia`/`supportsMedia`/`sendMedia`. Telegram `supportsMedia=true` (inbound images `getFile`→`ctx.attachments.saveImage`→model-visible image block; outbound `sendPhoto`/`sendDocument`); WeChat/Feishu `supportsMedia=false`, inbound only carries the `fileRef` fact (no byte download).
+- v1 does not route group chats (`chatType !== 'direct'` is dropped directly).
+- The outbound delivery ledger lives in `state.json`; the in-memory `ChannelStore` implementation is available for tests.
+- Dependency direction: each provider (`dsh-channel-telegram` / `-wechat` / `-feishu`) depends only on `dsh-channel` + `dsh-channel-kit`; policy plugins depend only on `dsh-channel`.
+- Capability differences only go through "capability facts + degradation": Telegram `html`+buttons+progress, WeChat `markdown`+typing+off, Feishu `plain`+off — `dsh-channel`/`dsh-channel-kit` are unchanged (A5 verified).
+
+---
+
+<a name="中文"></a>
+## 中文
+
 DeepSeek Harness (dsh) 的消息渠道公共层与多个 provider 实现（Telegram / 微信 / 飞书 / …，本仓库持续新增）。
 
 按照 [dsh-channel-design.md](./dsh-channel-design.md) 拆为五个包。
@@ -19,7 +175,7 @@ DeepSeek Harness (dsh) 的消息渠道公共层与多个 provider 实现（Teleg
 
 ---
 
-## 快速开始
+### 快速开始
 
 ```bash
 npm install          # 安装 workspace 依赖
@@ -39,7 +195,7 @@ npm run test -w dsh-channel-feishu
 
 ---
 
-## 在 dsh 中装配 Telegram 渠道
+### 在 dsh 中装配 Telegram 渠道
 
 1. 确保 dsh 宿主已配置（标准 `web` profile 天生齐备，无需额外动作）：
 
@@ -91,7 +247,7 @@ npm run test -w dsh-channel-feishu
 
 ---
 
-## 本地调试（echo bot，不接模型）
+### 本地调试（echo bot，不接模型）
 
 仓库自带一个开发用 echo bot，用于不依赖完整 dsh 宿主时验证 Telegram 收发链路：
 
@@ -101,12 +257,12 @@ TELEGRAM_BOT_TOKEN='...' node scripts/run-echo-bot.mjs
 ```
 
 它会加载 `dsh-channel` + `dsh-agent` + `dsh-credentials-local` + `dsh-channel-telegram`，
-并用一个 echo factory 代替真实 agent loop。普通消息会回复 `[echo 模式] 你说：...`，
-本地命令（`/help`、`/start` 等）可用。
+并用一个 echo factory 代替真实 agent loop。普通消息会回复 `[echo mode] You said: ...`
+（即"[echo 模式] 你说：…"），本地命令（`/help`、`/start` 等）可用。
 
 ---
 
-## 测试覆盖
+### 测试覆盖
 
 | 包 | 测试数 | 覆盖点 |
 |---|---|---|
@@ -118,7 +274,7 @@ TELEGRAM_BOT_TOKEN='...' node scripts/run-echo-bot.mjs
 
 ---
 
-## 目录结构
+### 目录结构
 
 ```
 .
@@ -137,7 +293,7 @@ TELEGRAM_BOT_TOKEN='...' node scripts/run-echo-bot.mjs
 
 ---
 
-## 注意事项
+### 注意事项
 
 - 媒体能力（design §10）已落地契约：`InboundMedia`/`OutboundMedia`/`supportsMedia`/`sendMedia`。Telegram `supportsMedia=true`（入站图片 `getFile`→`ctx.attachments.saveImage`→模型可见 image 块；出站 `sendPhoto`/`sendDocument`）；WeChat/Feishu `supportsMedia=false`，入站只带 `fileRef` 事实（不下载字节）。
 - v1 不路由群聊（`chatType !== 'direct'` 直接 drop）。

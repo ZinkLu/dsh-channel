@@ -1,19 +1,19 @@
 export interface RouteContext {
   readonly channel: string
-  readonly boundSessions: Readonly<Record<string, string>> // chatKey → sessionId（store.bindings）
-  readonly liveSessionIds: readonly string[] // ctx.agents.list() 投影
+  readonly boundSessions: Readonly<Record<string, string>> // chatKey → sessionId (store.bindings)
+  readonly liveSessionIds: readonly string[] // projection of ctx.agents.list()
 }
 
 export type RouteDecision =
-  | { kind: 'command'; command: string; args: string } // /开头，本地处理
-  | { kind: 'approval-reply'; raw: string } // 交给 approval-render.parse
-  | { kind: 'route'; sessionId: string; create: boolean } // 投递目标
+  | { kind: 'command'; command: string; args: string } // starts with /, handled locally
+  | { kind: 'approval-reply'; raw: string } // handed to approval-render.parse
+  | { kind: 'route'; sessionId: string; create: boolean } // delivery target
   | { kind: 'drop'; reason: 'group-unsupported' | 'empty' }
 
 export interface RouterOptions {
-  /** 判定"看起来像审批应答"的谓词；由消费方注入 pending 上下文，避免裸数字误判。 */
+  /** Predicate deciding "this looks like an approval reply"; injected by the consumer with pending context to avoid misjudging bare numbers. */
   isApprovalReply?: (text: string) => boolean
-  /** sessionId 前缀；默认 'channel'。 */
+  /** sessionId prefix; default 'channel'. */
   sessionIdPrefix?: string
 }
 
@@ -27,7 +27,7 @@ export function route(
 
   if (text === '') return { kind: 'drop', reason: 'empty' }
 
-  // v1 群聊不路由（chatnode 立场：iLink 群语义不清 + 提示注入面大）。
+  // v1 does not route group chats (chatnode's stance: iLink group semantics are unclear + large prompt-injection surface).
   if (msg.chatType !== 'direct') {
     return { kind: 'drop', reason: 'group-unsupported' }
   }
@@ -48,7 +48,7 @@ export function route(
     return { kind: 'route', sessionId: bound, create: false }
   }
 
-  // 默认策略：每 chat 一会话，sessionId 约定 channel:<channelId>:<chatKey>。
+  // Default policy: one session per chat, with the sessionId convention channel:<channelId>:<chatKey>.
   const sessionId = `${prefix}:${ctx.channel}:${msg.chatKey}`
   return { kind: 'route', sessionId, create: true }
 }

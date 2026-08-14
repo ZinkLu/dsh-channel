@@ -6,21 +6,21 @@ export interface PromptHintChannel {
 }
 
 export function promptHint(channel: PromptHintChannel): string {
-  const parts: string[] = [`你正通过 ${channel.id} 与用户对话`]
+  const parts: string[] = [`You are talking to the user via ${channel.id}`]
 
   if (channel.formatTier === 'html') {
-    parts.push('支持有限 HTML 富文本（<b>、<i>、<code>、<pre>、<a>）')
+    parts.push('Supports limited HTML rich text (<b>, <i>, <code>, <pre>, <a>)')
   } else if (channel.formatTier === 'markdown') {
-    parts.push('支持 Markdown 富文本')
+    parts.push('Supports Markdown rich text')
   } else {
-    parts.push('纯文本渠道，不要输出 Markdown 语法')
+    parts.push('Plain-text channel; do not output Markdown syntax')
   }
 
   if (channel.maxMessageChars !== undefined) {
-    parts.push(`单条消息上限 ${channel.maxMessageChars} 字符`)
+    parts.push(`Max ${channel.maxMessageChars} chars per message`)
   }
 
-  parts.push(channel.supportsChoices ? '支持按钮' : '不支持按钮，结构化选项会降级为编号文本')
+  parts.push(channel.supportsChoices ? 'Supports buttons' : 'No buttons; structured choices degrade to numbered text')
 
-  return `${parts.join('；')}。避免输出宽表格；长代码将被分段。`
+  return `${parts.join('; ')}. Avoid wide tables; long code will be chunked.`
 }

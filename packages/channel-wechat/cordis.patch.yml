@@ -1,5 +1,5 @@
-# dsh-channel-wechat 装配示例（微信 iLink Bot API）。
-# 注意：若宿主 harness 已加载 dsh-channel（注册表核心）或已由 bundle 自动加载，删除下面第一条 insert 即可。
+# dsh-channel-wechat wiring example (WeChat iLink Bot API).
+# Note: if the host harness already loads dsh-channel (registry core) or it is auto-loaded by the bundle, delete the first insert below.
 - insert:
     - id: channel
       name: dsh-channel
@@ -7,9 +7,9 @@
     - id: channel-wechat
       name: dsh-channel-wechat
       config:
-        allowedUserIds: []           # 微信侧 user id（iLink bot 收到私聊后从日志读 from_user_id 再填）
+        allowedUserIds: []           # WeChat-side user id (after the iLink bot receives a DM, read from_user_id from the log and fill it in)
         provider: deepseek-official
         model: deepseek-v4-flash
-        # accountId 建议走凭据：dsh credentials set WECHAT_ACCOUNT_ID ...
-        # token 不在此文件：dsh credentials set WECHAT_TOKEN 或环境变量 WECHAT_TOKEN。
-        # cwd / agentPreset 不设 = 沿用宿主 process.cwd() + 宿主默认 preset。
+        # accountId is recommended to go through credentials: dsh credentials set WECHAT_ACCOUNT_ID ...
+        # token is not in this file: dsh credentials set WECHAT_TOKEN or the WECHAT_TOKEN environment variable.
+        # cwd / agentPreset unset = inherit the host process.cwd() + host default preset.

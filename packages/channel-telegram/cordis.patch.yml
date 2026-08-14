@@ -1,5 +1,5 @@
-# dsh-channel-telegram 装配示例（已按你的 user_id 配置）。
-# 注意：若宿主 harness 已加载 dsh-channel（注册表核心）或已由 bundle 自动加载，删除下面第一条 insert 即可。
+# dsh-channel-telegram wiring example (already configured with your user_id).
+# Note: if the host harness already loads dsh-channel (registry core) or it is auto-loaded by a bundle, delete the first insert below.
 - insert:
     - id: channel
       name: dsh-channel
@@ -10,9 +10,9 @@
         allowedUserIds: [5002186681]
         provider: deepseek-official
         model: deepseek-v4-flash
-        # cwd 不设 = 沿用宿主 process.cwd()（你启动 dsh 的项目目录），
-        # 与 Web 会话同一工作区；别像旧示例那样指到一个全新的 ~/agent-workspace 空目录。
-        # agentPreset 不设 = 自动 join 宿主默认 preset（dsh-agent-presets 的 defaultId，
-        # 标准 web 部署是 `standard`），保留原装的工具/人设/技能全套能力。
-        # 仅当想给 Telegram 单独一套工具时才显式覆盖：agentPreset: minimal
-# token 不在此文件：dsh credentials set TELEGRAM_BOT_TOKEN 或环境变量 TELEGRAM_BOT_TOKEN。
+        # cwd unset = use the host process.cwd() (the project directory where you start dsh),
+        # the same workspace as Web sessions; don't point at a fresh empty ~/agent-workspace directory like the old example did.
+        # agentPreset unset = auto-join the host default preset (dsh-agent-presets's defaultId,
+        # `standard` for a standard web deployment), keeping the full stock tool/persona/skills capabilities.
+        # Only override explicitly when you want a separate tool set for Telegram: agentPreset: minimal
+# The token is not in this file: use dsh credentials set TELEGRAM_BOT_TOKEN or the TELEGRAM_BOT_TOKEN environment variable.

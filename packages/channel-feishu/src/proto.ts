@@ -1,7 +1,8 @@
 /**
- * 飞书长连接（WebSocket）帧的 protobuf 信封编解码。
+ * Protobuf envelope encode/decode for Feishu long-connection (WebSocket) frames.
  *
- * 飞书长连接模式在 `wss://…` 上收发二进制帧，帧格式是一个极小的 protobuf：
+ * Feishu long-connection mode sends and receives binary frames over `wss://…`; the frame
+ * format is a minimal protobuf:
  *
  *   message Frame {
  *     uint64 seq_id  = 1;   // varint
@@ -9,12 +10,13 @@
  *     int32  service = 3;   // varint
  *     int32  method  = 4;   // varint
  *     repeated Header headers = 5;   // Header { 1:string key; 2:string value }
- *     bytes  payload = 8;   // 事件 JSON / ack JSON / pong 配置 JSON
+ *     bytes  payload = 8;   // event JSON / ack JSON / pong config JSON
  *   }
  *
- * 这里只实现这个信封所需的 varint + length-delimited 两种 wire type，不引第三方
- * protobuf 库（保持 provider 零运行时依赖，与 Telegram/WeChat 的 fetch seam 一致）。
- * 参考：openclaw 社区 feishu 插件 / mimiclaw feishu_bot.c 的 frame 解析。
+ * Only the two wire types this envelope needs — varint and length-delimited — are implemented,
+ * without pulling in a third-party protobuf library (keeping the provider dependency-free at
+ * runtime, consistent with the Telegram/WeChat fetch seam).
+ * Reference: the openclaw community Feishu plugin / mimiclaw feishu_bot.c frame parsing.
  */
 
 export interface FeishuWsFrame {
@@ -22,9 +24,9 @@ export interface FeishuWsFrame {
   logId: number
   service: number
   method: number
-  /** header 键值对（`type`: `event` | `pong` | `ping` 等）。 */
+  /** Header key-value pairs (`type`: `event` | `pong` | `ping`, etc.). */
   headers: Record<string, string>
-  /** 事件/ack/pong 的 JSON 负载（字节）。 */
+  /** JSON payload (bytes) of the event/ack/pong. */
   payload: Uint8Array | null
 }
 
@@ -83,7 +85,7 @@ export function decodeFrame(buf: Uint8Array): FeishuWsFrame {
         frame.payload = bytes
       }
     } else {
-      // 跳过未知 wire type（0=varint、1=64bit、2=bytes、5=32bit）。
+      // Skip unknown wire types (0=varint, 1=64bit, 2=bytes, 5=32bit).
       if (wireType === 0) {
         pos = readVarint(view, pos).pos
       } else if (wireType === 1) {
@@ -114,7 +116,7 @@ function decodeHeader(buf: Uint8Array): { key: string; value: string } | null {
     const field = Math.floor(tag.value / 8)
     const wireType = tag.value % 8
     if (wireType !== WIRE_BYTES) {
-      // 跳过未知 wire type。
+      // Skip unknown wire types.
       if (wireType === 0) pos = readVarint(view, pos).pos
       else if (wireType === 1) pos += 8
       else if (wireType === 5) pos += 4
@@ -147,9 +149,9 @@ function writeBytesField(out: number[], field: number, bytes: Uint8Array | numbe
 
 function writeVarint(out: number[], value: number): void {
   let v = value >>> 0
-  // 支持到 2^53 的 varint（JS 安全整数范围）。
+  // Support varints up to 2^53 (JS safe-integer range).
   if (value > 0xffffffff || value < 0) {
-    // 大数走 bigint 慢路径；frame 的 service/method/seq 都是小整数。
+    // Large numbers take the slow bigint path; a frame's service/method/seq are all small integers.
     let big = BigInt(value)
     while (big > 0x7fn) {
       out.push(Number((big & 0x7fn) | 0x80n))

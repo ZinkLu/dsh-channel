@@ -3,12 +3,12 @@ import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import type { TelegramClient } from './client.js'
 
 export interface TelegramChannelOptions {
-  /** 每次发送时重新解析 token；禁止跨操作缓存。 */
+  /** Re-resolve the token on every send; caching across operations is forbidden. */
   resolveToken: () => Promise<string | undefined>
   client: TelegramClient
-  /** 图片 attachment → 字节（桥接层接 ctx.attachments.readImage）。 */
+  /** Image attachment → bytes (the bridge layer wires ctx.attachments.readImage). */
   readImage?: (ref: ImageAttachmentRef) => Promise<Uint8Array>
-  /** 文档 filePath（cwd 相对路径）→ 字节 + 文件名（桥接层锚定 meta.cwd 并做越界校验）。 */
+  /** Document filePath (cwd-relative) → bytes + filename (the bridge layer anchors meta.cwd and validates against path escapes). */
   readFile?: (filePath: string) => Promise<{ bytes: Uint8Array; name: string }>
 }
 
@@ -113,7 +113,7 @@ export class TelegramChannel extends Channel {
           }
         : undefined
 
-    // HTML 发送失败自动降级纯文本重试一次。
+    // On HTML send failure, automatically degrade to plain text and retry once.
     try {
       const sent = await this.opts.client.sendMessage(token, chatKey, text, { parseMode: 'HTML', replyMarkup, signal: opts?.signal })
       return { platformMessageId: String(sent.message_id) }
@@ -130,7 +130,7 @@ export class TelegramChannel extends Channel {
     try {
       await this.opts.client.sendChatAction(token, chatKey, 'typing')
     } catch {
-      // typing 是装饰性动作，失败不影响主流程。
+      // typing is a decorative action; a failure does not affect the main flow.
     }
   }
 }

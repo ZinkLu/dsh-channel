@@ -8,26 +8,26 @@ declare module '@deepseek-ai/cordis' {
   }
   interface Events {
     /**
-     * 一条归一化的入站消息已被某 provider 接收（去重后）。
-     * 观察性事件：策略插件在此做审计/统计；不承载路由决定。
+     * A normalized inbound message has been received by a provider (after deduplication).
+     * Observational event: policy plugins do auditing/statistics here; it carries no routing decision.
      * @mode emit
      */
     'channel/message'(msg: InboundMessage): void
     /**
-     * 一次出站投递。策略插件可包装（改写文本、限流延迟）或
-     * 短路（返回 suppressed receipt 拦下消息）；纯观察者必须调 next()。
-     * innermost 默认值 = 注册表定位 Channel 并调用其 send。
+     * One outbound delivery. Policy plugins may wrap (rewrite text, throttle/delay) or
+     * short-circuit (return a suppressed receipt to block the message); pure observers must call next().
+     * The innermost default = the registry locates the Channel and calls its send.
      * @mode waterfall
      */
     'channel/deliver'(out: OutboundMessage, next: () => Promise<DeliveryReceipt>): Promise<DeliveryReceipt>
     /**
-     * provider 连接状态变化（connecting/connected/disconnected/fatal）。
+     * provider connection status changes (connecting/connected/disconnected/fatal).
      * @mode emit
      */
     'channel/status'(channelId: string, status: ChannelStatus, error?: Error): void
     /**
-     * provider 已把某条呈现帧推给平台（流式草稿/状态行/终态）。
-     * 观察性事件：策略插件在此审计流式/工具流量；不承载路由或拦截决定。
+     * A provider has pushed a presentation frame to the platform (streaming draft/status line/final).
+     * Observational event: policy plugins audit streaming/tool traffic here; it carries no routing or interception decision.
      * @mode emit
      */
     'channel/present'(frame: PresentationFrame): void
@@ -38,72 +38,72 @@ declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
     channel: {
       kind: 'channel'
-      /** provider id，如 'telegram' */
+      /** provider id, e.g. 'telegram' */
       channel: string
-      /** 平台会话键（私聊=chat id，群=chat id；含义由 provider 定义，稳定即可） */
+      /** Platform session key (DM = chat id, group = chat id; semantics defined by the provider, just needs to be stable) */
       chatKey: string
-      /** 发送者平台 id */
+      /** Sender platform id */
       senderId: string
-      /** 组成这条 user/message 的平台消息 id（merge 合并后可多条） */
+      /** Platform message ids composing this user/message (can be multiple after a merge) */
       messageIds: string[]
     }
   }
 }
 
-/** 入站媒体事实（交接元数据，不下载字节）。图片经 provider 下载后走 `ctx.attachments.saveImage` 成模型可见块。 */
+/** Inbound media fact (handoff metadata, no bytes downloaded). After the provider downloads an image it goes through ctx.attachments.saveImage into a model-visible block. */
 export interface InboundMedia {
   readonly kind: 'image' | 'document' | 'audio' | 'video'
-  /** 平台侧文件引用（provider 定义，如 Telegram file_id / Feishu file_key）——交接事实，不下载字节 */
+  /** Platform-side file reference (provider-defined, e.g. Telegram file_id / Feishu file_key) — a handoff fact, no bytes downloaded */
   readonly fileRef: string
   readonly mimeType?: string
   readonly fileName?: string
 }
 
-/** 平台无关的入站消息。media 只保留占位描述（provider 定义 fileRef），字节由 provider 按需下载。 */
+/** Platform-agnostic inbound message. media keeps only placeholder descriptions (provider-defined fileRef); bytes are downloaded by the provider on demand. */
 export interface InboundMessage {
   readonly channel: string // provider id
-  readonly chatKey: string // 稳定会话键
+  readonly chatKey: string // stable session key
   readonly senderId: string
   readonly senderName?: string
-  readonly messageId: string // 平台消息 id（去重键）
+  readonly messageId: string // platform message id (dedupe key)
   readonly chatType: ChatType // 'direct' | 'group' | 'thread'
   readonly text: string
   readonly timestamp: number // epoch ms
-  /** 是否带媒体：merge 据此"带附件不合并"。 */
+  /** Whether it carries media: merge uses this to "not merge when there's an attachment". */
   readonly hasMedia: boolean
-  /** 媒体事实（fileRef + 元数据）；hasMedia 的展开。 */
+  /** Media facts (fileRef + metadata); the expansion of hasMedia. */
   readonly media?: readonly InboundMedia[]
-  /** 群聊中是否 @ 了机器人（provider 判定；v1 群聊不路由，仅记录） */
+  /** Whether the bot was @-mentioned in a group chat (provider-determined; v1 group chats are not routed, only recorded) */
   readonly mentionsBot?: boolean
 }
 
-/** 出站媒体（可移植载荷：图片走 attachment 引用，文档走 cwd 相对路径，绝不裸传宿主绝对路径）。 */
+/** Outbound media (portable payload: images use an attachment reference, documents use a cwd-relative path; never pass a raw host absolute path). */
 export interface OutboundMedia {
   readonly kind: 'image' | 'document'
-  /** 图片：ctx.attachments 的引用（不裸传宿主路径，防路径泄漏 + R7）。 */
+  /** Image: a ctx.attachments reference (no raw host path, preventing path leaks + R7). */
   readonly attachment?: ImageAttachmentRef
-  /** 文档：agent workspace（cwd）内的相对路径；字节由 provider 读取并锚定 cwd。 */
+  /** Document: a relative path inside the agent workspace (cwd); bytes are read by the provider and anchored to cwd. */
   readonly filePath?: string
   readonly caption?: string
 }
 
-/** 出站消息：语义内容 + 呈现意图，分段/转义是 provider 的事 */
+/** Outbound message: semantic content + presentation intent; splitting/escaping is the provider's concern */
 export interface OutboundMessage {
   readonly channel: string
   readonly chatKey: string
-  /** markdown 源文本；provider 按自身 formatTier 降级渲染 */
+  /** markdown source text; the provider renders it degraded according to its own formatTier */
   readonly markdown: string
-  /** 结构化选项（审批/澄清）；无按钮平台由消费方预先降级为编号文本 */
+  /** Structured choices (approval/clarification); on buttonless platforms the consumer degrades them to numbered text up front */
   readonly choices?: readonly OutboundChoice[]
-  /** 出站媒体（supportsMedia 平台逐条 sendMedia；非支持平台降级为文本提示） */
+  /** Outbound media (supportsMedia platforms sendMedia item-by-item; unsupported platforms degrade to a text note) */
   readonly media?: readonly OutboundMedia[]
-  /** 幂等键：同 key 的重复 deliver 应被 ledger 挡下 */
+  /** Idempotency key: a duplicate deliver with the same key should be blocked by the ledger */
   readonly deliveryKey: string
-  /** 溯源（审计用）：来自哪个 session 的哪个事件 */
+  /** Provenance (for auditing): from which session and which event */
   readonly origin?: { sessionId: string; seq?: number }
-  /** 呈现意图：终态 / 新建草稿 / 编辑草稿 / 状态行。策略插件据此决定是否拦截/改写。 */
+  /** Presentation intent: final / new draft / edit draft / status line. Policy plugins decide whether to intercept/rewrite based on this. */
   readonly presentation?: PresentationIntent
-  /** presentation='draft-edit' 时指向的草稿平台消息 id。 */
+  /** The draft's platform message id when presentation='draft-edit'. */
   readonly editTarget?: string
 }
 
@@ -114,28 +114,30 @@ export interface OutboundChoice {
 
 export interface DeliveryReceipt {
   readonly status: 'sent' | 'suppressed' | 'failed'
-  /** 平台侧消息 id（分段则为多条） */
+  /** Platform-side message id (multiple when split) */
   readonly platformMessageIds?: readonly string[]
   readonly error?: string
 }
 
-/** 呈现意图：终态消息 / 新建草稿 / 编辑已有草稿 / 状态行。 */
+/** Presentation intent: final message / new draft / edit existing draft / status line. */
 export type PresentationIntent = 'final' | 'draft-new' | 'draft-edit' | 'status-line'
 
-/** 呈现上限（openclaw ChannelPresentationCapabilities.limits 的缩小版）。均 undefined=无已知上限。 */
+/** Presentation limits (a reduced version of openclaw ChannelPresentationCapabilities.limits). All undefined = no known limit. */
 export interface PresentationLimits {
-  /** 单条消息最多按钮数；超限降级编号文本。 */
+  /** Maximum buttons per message; beyond this, degrade to numbered text. */
   readonly maxOptions?: number
-  /** 按钮文字上限（码点）；超限截断加 `…`。 */
+  /** Button text limit (code points); truncate with … when exceeded. */
   readonly maxLabelLength?: number
-  /** 回调数据（callback_data/value）上限（字节）；如 Telegram=64。 */
+  /** Callback data (callback_data/value) limit (bytes); e.g. Telegram=64. */
   readonly maxValueBytes?: number
 }
 
 /**
- * 呈现帧：provider 已把某条呈现事实推给平台（channel/present 事件的 payload）。
- * 与 OutboundMessage 的区别：OutboundMessage 是"投递请求"（走 deliver waterfall，
- * 可被策略插件包装/短路），PresentationFrame 是"已发生的呈现事实"（emit，只读）。
+ * Presentation frame: a provider has pushed a presentation fact to the platform
+ * (the payload of the channel/present event).
+ * Difference from OutboundMessage: OutboundMessage is a "delivery request" (goes
+ * through the deliver waterfall and can be wrapped/short-circuited by policy plugins),
+ * while PresentationFrame is a "presentation fact that already happened" (emit, read-only).
  */
 export type PresentationFrame =
   | { readonly kind: 'final'; readonly channel: string; readonly chatKey: string; readonly deliveryKey: string; readonly text: string }
@@ -149,74 +151,76 @@ export type ChatType = 'direct' | 'group' | 'thread'
 export type ChannelStatus = 'connecting' | 'connected' | 'disconnected' | 'fatal'
 
 /**
- * 平台 provider 的抽象基类。普通抽象类而非 Service（对齐 LlmAdapter）：
- * 生命周期由 provider 插件自己的 fiber 承载，注册经 ctx.channels.register()。
- * 必选面故意极小；能力差异一律走"能力事实 + 降级"。
+ * Abstract base class for platform providers. A plain abstract class rather than a
+ * Service (aligned with LlmAdapter): the lifecycle is carried by the provider plugin's
+ * own fiber, and registration goes through ctx.channels.register().
+ * The required surface is deliberately minimal; capability differences always go
+ * through "capability facts + degradation".
  */
 export abstract class Channel {
-  /** 稳定 provider id（'telegram'、'discord'…），注册表键 */
+  /** Stable provider id ('telegram', 'discord', …), the registry key */
   abstract readonly id: string
 
-  // ---- 能力事实：基类保守默认，实现覆盖 ----
+  // ---- capability facts: conservative base defaults, overridden by implementations ----
 
-  /** 单条消息最大字符数；undefined = 无已知上限 */
+  /** Maximum characters per message; undefined = no known limit */
   get maxMessageChars(): number | undefined {
     return undefined
   }
-  /** 富文本档位：消费方据此选择 format 降级路径 */
+  /** Rich-text tier: the consumer picks a format degradation path based on this */
   get formatTier(): 'plain' | 'markdown' | 'html' {
     return 'plain'
   }
-  /** 是否支持结构化选项（按钮/卡片）；false 时审批降级为编号回复 */
+  /** Whether structured choices (buttons/cards) are supported; when false, approval degrades to a numbered reply */
   get supportsChoices(): boolean {
     return false
   }
-  /** 是否支持编辑已发消息（草稿式流式的前提，v2） */
+  /** Whether editing already-sent messages is supported (prerequisite for draft-style streaming, v2) */
   get supportsEdit(): boolean {
     return false
   }
-  /** 是否支持 typing 指示 */
+  /** Whether typing indicators are supported */
   get supportsTyping(): boolean {
     return false
   }
-  /** 支持的会话形态 */
+  /** Supported session shapes */
   get chatTypes(): readonly ChatType[] {
     return ['direct']
   }
 
-  // ---- 呈现能力事实：基类保守默认（照抄 FileSystem.sandboxMode 写法）----
+  // ---- presentation capability facts: conservative base defaults (mirrors the FileSystem.sandboxMode pattern) ----
 
-  /** 流式档位。'off'=只终态；'progress'=一条可编辑状态草稿+终态；'block'=分块草稿（v2）。
-   *  需要 supportsEdit 才能是非 off；无编辑能力的平台永远 off。 */
+  /** Streaming tier. 'off' = final only; 'progress' = one editable status draft + final; 'block' = chunked draft (v2).
+   *  Requires supportsEdit to be anything other than off; platforms without editing stay off forever. */
   get streamingMode(): 'off' | 'block' | 'progress' {
     return 'off'
   }
-  /** 是否以文本呈现"正在做 X…"状态行（hermes supports_status_text，Slack 类）；textless 平台保持 false。 */
+  /** Whether to present a "doing X…" status line as text (hermes supports_status_text, Slack-like); textless platforms stay false. */
   get supportsStatusText(): boolean {
     return false
   }
-  /** 是否向渠道下放 reasoning/thinking 内容；默认 false（不泄漏思考链）。 */
+  /** Whether to hand reasoning/thinking content down to the channel; default false (don't leak the chain of thought). */
   get supportsThinking(): boolean {
     return false
   }
-  /** 呈现上限（按钮数/按钮文字/回调数据）。 */
+  /** Presentation limits (button count/button text/callback data). */
   get presentationLimits(): PresentationLimits {
     return {}
   }
-  /** 是否支持多选选项；false 时多选降级为"逐条单选 + 文本补充"。 */
+  /** Whether multi-select choices are supported; when false, multi-select degrades to "single-select one-by-one + a text supplement". */
   get supportsMultiSelect(): boolean {
     return false
   }
-  /** 是否支持发送媒体（图片/文档）。false 时出站媒体降级为"无法投递"文本。 */
+  /** Whether sending media (images/documents) is supported. When false, outbound media degrades to a "could not deliver" text. */
   get supportsMedia(): boolean {
     return false
   }
 
-  // ---- 必选行为 ----
+  // ---- required behavior ----
 
   /**
-   * 发送一段已按平台约束渲染好的文本（可选附带 choices）。
-   * 分段由调用方完成；实现只负责单条上行与错误报告。
+   * Send a piece of text already rendered against platform constraints (optionally with choices).
+   * Splitting is the caller's job; the implementation only handles a single send and error reporting.
    */
   abstract send(
     chatKey: string,
@@ -227,14 +231,15 @@ export abstract class Channel {
     },
   ): Promise<{ platformMessageId: string }>
 
-  // ---- 可选行为：默认无害降级 ----
+  // ---- optional behavior: harmless defaults by degradation ----
 
-  /** typing 指示；默认 no-op */
+  /** typing indicator; no-op by default */
   async sendTyping(_chatKey: string): Promise<void> {}
 
   /**
-   * 发送一条媒体（图片/文档）。仅 `supportsMedia` 平台实现；基类抛错（hermes
-   * send_image/send_file 的"可选方法 + 降级"同款——消费方应先查 supportsMedia）。
+   * Send one piece of media (image/document). Implemented only by supportsMedia
+   * platforms; the base class throws (the same "optional method + degradation" as hermes
+   * send_image/send_file — consumers should check supportsMedia first).
    */
   async sendMedia(
     _chatKey: string,
@@ -245,7 +250,7 @@ export abstract class Channel {
   }
 }
 
-/** 把注册表作为服务安装到当前上下文（插件入口）。 */
+/** Install the registry as a service on the current context (plugin entry point). */
 export function apply(ctx: Context): void {
   new ChannelRegistry(ctx)
 }
@@ -258,8 +263,8 @@ export class ChannelRegistry extends Service {
   }
 
   /**
-   * 注册一个 provider。重复 id 抛错。经 ctx.effect 返回 disposer：
-   * provider 卸载时注册自动回收。
+   * Register a provider. A duplicate id throws. Returns a disposer via ctx.effect:
+   * the registration is automatically reclaimed when the provider unloads.
    */
   register(channel: Channel): () => void {
     return this.ctx.effect(() => {
@@ -281,15 +286,16 @@ export class ChannelRegistry extends Service {
     return [...this.entries.values()]
   }
 
-  /** provider 收到去重后的入站消息时调用：归一化断言 + 广播 */
+  /** Called when a provider receives a deduplicated inbound message: normalization assertion + broadcast */
   ingest(msg: InboundMessage): void {
     assertInboundMessage(msg)
     this.ctx.emit('channel/message', msg)
   }
 
   /**
-   * 出站统一入口：走 channel/deliver waterfall，innermost 默认值定位
-   * provider 并 send。策略插件（限流/脱敏/审计）在 waterfall 上包装或短路。
+   * Unified outbound entry point: goes through the channel/deliver waterfall; the
+   * innermost default locates the provider and sends. Policy plugins
+   * (rate-limiting/redaction/auditing) wrap or short-circuit on the waterfall.
    */
   async deliver(out: OutboundMessage): Promise<DeliveryReceipt> {
     return this.ctx.waterfall('channel/deliver', out, async (): Promise<DeliveryReceipt> => {
@@ -297,12 +303,12 @@ export class ChannelRegistry extends Service {
       if (channel === undefined) return { status: 'failed', error: `no channel "${out.channel}"` }
       try {
         const platformMessageIds: string[] = []
-        // 文本（空文本不出站，仅媒体时不发空气泡）。
+        // text (empty text is not sent out; when media-only, don't send an empty bubble).
         if (out.markdown !== '') {
           const result = await channel.send(out.chatKey, out.markdown, { choices: out.choices })
           platformMessageIds.push(result.platformMessageId)
         }
-        // 媒体：supportsMedia 平台走 sendMedia；否则降级为"无法投递"文本（hermes 教训：绝不回显宿主路径）。
+        // media: supportsMedia platforms go through sendMedia; otherwise degrade to a "could not deliver" text (hermes lesson: never echo the host path back).
         for (const media of out.media ?? []) {
           if (channel.supportsMedia) {
             const result = await channel.sendMedia(out.chatKey, media)
@@ -323,7 +329,7 @@ export class ChannelRegistry extends Service {
 export default ChannelRegistry
 
 function mediaUnsupportedText(kind: 'image' | 'document'): string {
-  return kind === 'image' ? '⚠️ 无法投递图片附件。' : '⚠️ 无法投递文件附件。'
+  return kind === 'image' ? '⚠️ Could not deliver the image attachment.' : '⚠️ Could not deliver the file attachment.'
 }
 
 function assertInboundMessage(msg: InboundMessage): void {

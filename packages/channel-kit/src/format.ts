@@ -35,12 +35,13 @@ export function stripToolCallMarkup(text: string): string {
 }
 
 /**
- * Strip reasoning/thinking content from *visible* text (openclaw
- * `stripReasoningTagsFromText` 同款)：剥掉 `<reasoning>`/`<thinking>` 标签块与
- * "Reasoning:"/"Thinking"/"思考："/"推理：" 前导行。
+ * Strip reasoning/thinking content from *visible* text (same as openclaw's
+ * `stripReasoningTagsFromText`): remove `<reasoning>`/`<thinking>` tag blocks and
+ * `Reasoning:`/`Thinking:` preamble lines.
  *
- * `mode:'preserve'` 用占位符保护代码围栏，围栏内标签保留字面量；`strict` 全局剥除。
- * 与 `stripToolCallMarkup` 一起构成"绝不把模型内部字节泄漏给用户"的最后一道闸。
+ * `mode:'preserve'` protects code fences with placeholders so tags inside fences stay
+ * literal; `strict` strips everywhere. Together with `stripToolCallMarkup` this is the
+ * last gate that "never leaks model-internal bytes to the user".
  */
 export function stripReasoningTags(text: string, opts: { mode?: 'strict' | 'preserve'; scope?: 'all' | 'leading' } = {}): string {
   const mode = opts.mode ?? 'strict'
@@ -63,7 +64,7 @@ function stripAll(text: string): string {
 function stripPreambleLines(text: string): string {
   return text
     .split('\n')
-    .filter((line) => !/^\s*(?:Reasoning|Thinking|思考|推理)\s*[:：]\s*$/i.test(line))
+    .filter((line) => !/^\s*(?:Reasoning|Thinking)\s*[:：]\s*$/i.test(line))
     .join('\n')
 }
 
@@ -98,7 +99,7 @@ function renderPlain(markdown: string): string {
     const trimmed = line.trim()
 
     if (trimmed.startsWith('```')) {
-      // 保留围栏行原文（用户可辨）
+      // Keep the fence lines as-is (so the user can recognize them)
       out.push(line)
       i++
       while (i < lines.length && !lines[i]!.trim().startsWith('```')) {
@@ -150,7 +151,7 @@ function renderHtml(markdown: string): string {
         const inner = block.slice(1, -1).join('\n')
         out.push(`<pre>${escapeHtml(inner)}</pre>`)
       } else {
-        // 不平衡围栏：保持字面量（残缺 <pre> 会被 Telegram 整条拒收）。
+        // Unbalanced fence: keep it literal (a broken <pre> gets the whole message rejected by Telegram).
         out.push(...block.map((item) => escapeHtml(item)))
       }
       continue
@@ -173,7 +174,7 @@ function renderHtml(markdown: string): string {
 function isTableBlock(lines: readonly string[], start: number): boolean {
   if (start >= lines.length) return false
   if (!lines[start]!.includes('|')) return false
-  // 表头后必须紧跟 |---| 分隔行
+  // The header must be followed immediately by a |---| separator row
   if (start + 1 >= lines.length) return false
   const sep = lines[start + 1]!
   return sep.includes('|') && /^\s*\|?[\s:|-]+\|?[\s:|-]*$/.test(sep) && /---/.test(sep)
@@ -190,7 +191,7 @@ function collectTableBlock(lines: readonly string[], start: number): string[] {
 }
 
 function renderTableAligned(block: readonly string[]): string[] {
-  // 去掉分隔行，按列对齐。
+  // Drop the separator row and align columns.
   const rows = block
     .filter((_, index) => index !== 1)
     .map((line) =>
@@ -212,7 +213,7 @@ function renderTableAligned(block: readonly string[]): string[] {
 }
 
 function renderPlainInline(line: string): string {
-  // 行内代码去反引号；粗体去星号；链接 t (u)。
+  // Inline code loses backticks; bold loses asterisks; links become t (u).
   let text = line
   text = text.replace(/`([^`]*)`/g, '$1')
   text = text.replace(/\*\*([^*]+)\*\*/g, '$1')
@@ -222,7 +223,7 @@ function renderPlainInline(line: string): string {
 }
 
 function renderHtmlInline(line: string): string {
-  // 先统一 HTML 转义，再用占位符保护行内代码，避免 bold/链接处理破坏 code 内容。
+  // Escape HTML first, then protect inline code with placeholders so bold/link handling cannot corrupt code contents.
   const escaped = escapeHtml(line)
   const codeSpans: string[] = []
   const withCodeProtected = escaped.replace(/`([^`]*)`/g, (_, code: string) => {
@@ -236,7 +237,7 @@ function renderHtmlInline(line: string): string {
   text = text.replace(/__([^_]+)__/g, '<b>$1</b>')
   text = text.replace(/\[([^\]]*)\]\(([^)]+)\)/g, '<a href="$2">$1</a>')
 
-  // 还原行内代码。
+  // Restore inline code.
   text = text.replace(/\u0000(\d+)\u0000/g, (_, index: string) => `<code>${codeSpans[Number(index)] ?? ''}</code>`)
 
   return text

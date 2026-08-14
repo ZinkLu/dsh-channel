@@ -2,9 +2,9 @@ import { Channel, type ChatType, type OutboundChoice } from 'dsh-channel'
 import type { WeixinClient } from './client.js'
 
 export interface WeChatChannelOptions {
-  /** 每次发送时重新解析 token；禁止跨操作缓存。 */
+  /** Resolve the token on every send; caching across operations is forbidden. */
   resolveToken: () => Promise<string | undefined>
-  /** typing ticket 解析（sendtyping 需要）；拿不到就静默降级为 no-op。 */
+  /** Resolves the typing ticket (required by sendtyping); when unavailable, silently degrade to a no-op. */
   resolveTypingTicket?: (chatKey: string) => Promise<string | undefined>
   client: WeixinClient
 }
@@ -18,19 +18,19 @@ export class WeChatChannel extends Channel {
     this.opts = opts
   }
 
-  // WeChat iLink 单条文本上限（hermes weixin MAX_MESSAGE_LENGTH=2000）。
+  // WeChat iLink per-message text limit (hermes weixin MAX_MESSAGE_LENGTH=2000).
   get maxMessageChars(): number | undefined {
     return 2000
   }
-  // WeChat 客户端能渲染 markdown（围栏代码块/标题/表格），故原样透传，不做降级。
+  // The WeChat client can render markdown (fenced code blocks / headings / tables), so pass it through unchanged without degrading.
   get formatTier(): 'plain' | 'markdown' | 'html' {
     return 'markdown'
   }
-  // iLink 文本消息没有内联按钮，审批/提问一律走编号文本回退。
+  // iLink text messages have no inline buttons, so approvals/prompts always fall back to numbered text.
   get supportsChoices(): boolean {
     return false
   }
-  // 微信不支持编辑已发消息（hermes SUPPORTS_MESSAGE_EDITING=False）。
+  // WeChat does not support editing sent messages (hermes SUPPORTS_MESSAGE_EDITING=False).
   get supportsEdit(): boolean {
     return false
   }
@@ -73,7 +73,7 @@ export class WeChatChannel extends Channel {
       if (!ticket) return
       await this.opts.client.sendTyping(token, chatKey, ticket, 1)
     } catch {
-      // typing 是装饰性动作，失败不影响主流程。
+      // typing is a decorative action; its failure does not affect the main flow.
     }
   }
 }

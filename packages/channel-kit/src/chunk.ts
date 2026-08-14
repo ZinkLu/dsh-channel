@@ -16,7 +16,7 @@ export function chunkText(markdown: string, opts: ChunkOptions): string[] {
     return chunkWithoutNumbering(markdown, maxChars, countBy)
   }
 
-  // 前缀递归收敛：前缀占预算，段数与前缀宽互相影响；5 轮收敛，失败退无前缀。
+  // Prefix recursion to convergence: the prefix consumes budget, so segment count and prefix width affect each other; converge within 5 rounds, and fall back to no prefix on failure.
   let chunks = chunkWithoutNumbering(markdown, maxChars, countBy)
   for (let round = 0; round < 5; round++) {
     const count = chunks.length
@@ -31,7 +31,7 @@ export function chunkText(markdown: string, opts: ChunkOptions): string[] {
     }
     chunks = next
   }
-  // 无法在 5 轮内稳定：放弃前缀。
+  // If it does not stabilize within 5 rounds: give up the prefix.
   return chunkWithoutNumbering(markdown, maxChars, countBy)
 }
 
@@ -40,7 +40,7 @@ function chunkWithoutNumbering(markdown: string, maxChars: number, countBy: 'cod
   return packBlocks(blocks, maxChars, countBy)
 }
 
-/** 按 markdown 块切分；围栏代码块视为原子（不切断代码块）。 */
+/** Split by markdown blocks; treat fenced code blocks as atomic (never cut a code block). */
 export function splitMarkdownBlocks(markdown: string): string[] {
   const lines = markdown.replace(/\r\n?/g, '\n').split('\n')
   const blocks: string[] = []
@@ -72,9 +72,9 @@ export function splitMarkdownBlocks(markdown: string): string[] {
         }
         i++
       }
-      // 不完整围栏保持字面量（不平衡围栏教训）
+      // Incomplete fences stay literal (the unbalanced-fence lesson)
       if (!closed) {
-        // 未闭合的 fence：当作普通段落继续收集，保持字面量
+        // Unclosed fence: keep collecting as a normal paragraph, preserving it literally
         current.push(...block)
       } else {
         blocks.push(block.join('\n'))
@@ -120,8 +120,9 @@ function packBlocks(blocks: readonly string[], maxChars: number, countBy: 'codep
 }
 
 /**
- * 超长单一原子块退化为硬切。代码块硬切时补围栏：每个切口收尾/重开，
- * 保持每段可渲染。纯文本段内优先在换行 / `。` / `. ` 处断。
+ * An oversized single atomic block degrades to a hard split. When a code block is
+ * hard-split, re-fence it: close/reopen at every cut so each piece stays renderable.
+ * Within plain text, prefer breaking at newlines / `。` / `. `.
  */
 function hardSplit(text: string, maxChars: number, countBy: 'codepoint' | 'utf16'): string[] {
   if (charLen(text, countBy) <= maxChars) return [text]
@@ -157,7 +158,7 @@ function hardSplitCodeBlock(text: string, maxChars: number, countBy: 'codepoint'
 
   for (const line of inner) {
     const lineLen = charLen(line, countBy)
-    // 单行也放不下时硬切该行
+    // When a single line still does not fit, hard-split that line
     if (lineLen > budget) {
       flush()
       const subPieces = hardSplitText(line, budget, countBy)
@@ -182,11 +183,11 @@ function hardSplitText(text: string, maxChars: number, countBy: 'codepoint' | 'u
   let rest = text
   while (charLen(rest, countBy) > maxChars) {
     let splitAt = -1
-    // 优先断点：换行 / 中文句号 / 英文句号+空格
+    // Preferred break points: newline / Chinese full stop / English period + space
     for (let i = maxChars; i >= Math.max(1, Math.floor(maxChars * 0.6)); i--) {
       const ch = rest[i]
       if (ch === '\n') {
-        splitAt = i + 1 // 把换行留给上一段
+        splitAt = i + 1 // leave the newline with the previous piece
         break
       }
       if (ch === '。') {
@@ -199,9 +200,9 @@ function hardSplitText(text: string, maxChars: number, countBy: 'codepoint' | 'u
       }
     }
     if (splitAt <= 0) {
-      // 找不到优选断点时按码元截断
+      // When no preferred break point is found, truncate by code unit
       splitAt = maxChars
-      // 避免切断代理对（utf16 模式）
+      // avoid splitting a surrogate pair (utf16 mode)
       if (countBy === 'utf16') {
         const code = rest.charCodeAt(splitAt - 1)
         if (code >= 0xd800 && code <= 0xdbff && splitAt < rest.length) {

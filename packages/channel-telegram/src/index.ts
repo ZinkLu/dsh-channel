@@ -14,7 +14,7 @@ export const name = 'dsh-channel-telegram'
 export const inject = ['channels', 'agents', 'credentials'] as const
 
 export interface TelegramConfig {
-  /** 允许的 Telegram user id。必填、无宽松默认（提示注入的前门）。 */
+  /** Allowed Telegram user ids. Required, no permissive default (the front door for prompt injection). */
   allowedUserIds: number[]
   provider: string
   model?: string

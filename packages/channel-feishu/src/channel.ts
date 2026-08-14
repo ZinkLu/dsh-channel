@@ -2,7 +2,7 @@ import { Channel, type ChatType, type OutboundChoice } from 'dsh-channel'
 import type { FeishuClient, FeishuCredentials } from './client.js'
 
 export interface FeishuChannelOptions {
-  /** 每次发送时重新解析 app 凭据；禁止跨操作缓存。 */
+  /** Re-resolve app credentials on every send; caching across operations is forbidden. */
   resolveCredentials: () => Promise<FeishuCredentials | undefined>
   client: FeishuClient
 }
@@ -16,23 +16,23 @@ export class FeishuChannel extends Channel {
     this.opts = opts
   }
 
-  // 飞书 text 消息上限 4096 字符（openclaw/mimiclaw 同款）。
+  // Feishu text messages are capped at 4096 chars (same as openclaw/mimiclaw).
   get maxMessageChars(): number | undefined {
     return 4096
   }
-  // 飞书 text 消息是纯文本；富文本（post/card）需复杂结构，v1 不做。
+  // Feishu text messages are plain text; rich text (post/card) needs complex structures, which v1 does not implement.
   get formatTier(): 'plain' | 'markdown' | 'html' {
     return 'plain'
   }
-  // v1 不做交互式卡片，审批/提问降级编号文本。
+  // v1 does not implement interactive cards; approvals/questions degrade to numbered text.
   get supportsChoices(): boolean {
     return false
   }
-  // 飞书可编辑消息（im.message.update），但 v1 不做草稿流式。
+  // Feishu supports editable messages (im.message.update), but v1 does not implement draft streaming.
   get supportsEdit(): boolean {
     return false
   }
-  // 飞书 bot 无 typing 指示。
+  // Feishu bots have no typing indicator.
   get supportsTyping(): boolean {
     return false
   }

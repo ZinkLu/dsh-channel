@@ -154,7 +154,7 @@ test('bridge rejects non-allowlisted sender with a local reply', async () => {
   await waitFor(() => client.sends.length >= 1)
   await bridge.stop()
 
-  assert.ok(client.sends.some((send) => send.text.includes('没有权限')))
+  assert.ok(client.sends.some((send) => send.text.includes('You are not authorized to use this bot.')))
 })
 
 function messageTextFromContent(message: any): string {

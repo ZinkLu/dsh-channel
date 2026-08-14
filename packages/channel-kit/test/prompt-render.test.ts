@@ -8,7 +8,7 @@ function pending(overrides: Partial<PendingPrompt> = {}): PendingPrompt {
   return {
     num: 1,
     requestId: 'r1',
-    question: '选哪个？',
+    question: 'Which one?',
     options: ['A', 'B'],
     multiSelect: false,
     allowFreeText: false,
@@ -19,14 +19,14 @@ function pending(overrides: Partial<PendingPrompt> = {}): PendingPrompt {
 }
 
 test('renderPrompt produces choices with prompt:<num>:<idx> ids', () => {
-  const out = renderPrompt({ num: 1, question: '选哪个？', options: ['A', 'B'] }, caps)
+  const out = renderPrompt({ num: 1, question: 'Which one?', options: ['A', 'B'] }, caps)
   assert.equal(out.kind, 'choices')
   if (out.kind !== 'choices') return
   assert.deepEqual(out.choices, [
     { id: 'prompt:1:0', label: 'A' },
     { id: 'prompt:1:1', label: 'B' },
   ])
-  assert.match(out.text, /选哪个/)
+  assert.match(out.text, /Which one/)
 })
 
 test('renderPrompt marks the recommended option', () => {
@@ -70,7 +70,7 @@ test('parsePromptReply supports multi-select numbers', () => {
 
 test('parsePromptReply captures free text when allowed', () => {
   const entry = pending({ allowFreeText: true })
-  assert.deepEqual(parsePromptReply({ text: '随便写点什么' }, [entry]), { kind: 'answer', num: 1, answer: { selected: [], custom: '随便写点什么' } })
+  assert.deepEqual(parsePromptReply({ text: 'just write something' }, [entry]), { kind: 'answer', num: 1, answer: { selected: [], custom: 'just write something' } })
 })
 
 test('parsePromptReply rejects bare numbers when multiple pending', () => {

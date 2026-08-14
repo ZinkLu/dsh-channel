@@ -1,23 +1,23 @@
 # dsh-channel
 
-DSH 消息渠道契约包：`ctx.channels` 注册表、`Channel` 抽象基类、`channel/*` 事件词汇表、`MessageSourceMap.channel` 归并。零平台实现。
+DSH message channel contract package: the `ctx.channels` registry, the `Channel` abstract base class, the `channel/*` event vocabulary, and `MessageSourceMap.channel` merging. Zero platform implementations.
 
-## 导出
+## Exports
 
-- `ChannelRegistry`（default 导出也可直接作为 Cordis class 插件加载）
-- `Channel`（抽象基类）
-- `apply(ctx)`：安装 `ChannelRegistry` 到当前 context
-- 类型：`InboundMessage` / `OutboundMessage` / `OutboundChoice` / `DeliveryReceipt` / `ChatType` / `ChannelStatus`
+- `ChannelRegistry` (the default export can also be loaded directly as a Cordis class plugin)
+- `Channel` (abstract base class)
+- `apply(ctx)`: installs `ChannelRegistry` onto the current context
+- Types: `InboundMessage` / `OutboundMessage` / `OutboundChoice` / `DeliveryReceipt` / `ChatType` / `ChannelStatus`
 
-## 事件
+## Events
 
-| 事件 | 模式 | 说明 |
+| Event | Mode | Description |
 |---|---|---|
-| `channel/message` | emit | provider 收到去重后的入站消息 |
-| `channel/deliver` | waterfall | 出站投递；策略插件可包装/短路，观察者必须 `next()` |
-| `channel/status` | emit | provider 连接状态 |
+| `channel/message` | emit | provider received a deduplicated inbound message |
+| `channel/deliver` | waterfall | outbound delivery; policy plugins can wrap/short-circuit, observers must call `next()` |
+| `channel/status` | emit | provider connection status |
 
-## 使用
+## Usage
 
 ```ts
 import { Context } from '@deepseek-ai/cordis'
@@ -25,5 +25,5 @@ import { ChannelRegistry } from 'dsh-channel'
 
 const ctx = new Context()
 new ChannelRegistry(ctx)
-// 或 ctx.plugin(ChannelRegistry)
+// or ctx.plugin(ChannelRegistry)
 ```

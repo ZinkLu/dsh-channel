@@ -11,7 +11,7 @@ export interface PendingApproval {
 }
 
 export interface ApprovalRenderOptions {
-  /** 供测试注入时间；缺省用 Date.now()。 */
+  /** Inject time for tests; defaults to Date.now(). */
   now?: number
 }
 
@@ -20,23 +20,23 @@ export function renderApproval(
   caps: { supportsChoices: boolean },
   _opts: ApprovalRenderOptions = {},
 ): { kind: 'choices'; text: string; choices: ApprovalChoice[] } | { kind: 'text'; text: string } {
-  const title = `⚠️ 需要批准 #${req.num}：${req.toolName}`
-  const reason = req.reason ? `\n原因：${req.reason}` : ''
+  const title = `⚠️ Needs approval #${req.num}: ${req.toolName}`
+  const reason = req.reason ? `\nReason: ${req.reason}` : ''
 
   if (caps.supportsChoices) {
     return {
       kind: 'choices',
       text: `${title}${reason}`,
       choices: [
-        { id: `appr:${req.num}:1`, label: '批准' },
-        { id: `appr:${req.num}:0`, label: '拒绝' },
+        { id: `appr:${req.num}:1`, label: 'Approve' },
+        { id: `appr:${req.num}:0`, label: 'Reject' },
       ],
     }
   }
 
   return {
     kind: 'text',
-    text: `${title}${reason}\n回复 1 批准 / 2 拒绝`,
+    text: `${title}${reason}\nReply 1 to approve / 2 to reject`,
   }
 }
 
@@ -44,8 +44,8 @@ export type ApprovalReply =
   | { kind: 'answer'; num: number; outcome: 'allowed-once' | 'rejected' }
   | { kind: 'not-an-answer' }
 
-const ALLOW_WORDS = new Set(['批准', '同意', '允许', 'yes', 'y', 'allow', 'approve'])
-const DENY_WORDS = new Set(['拒绝', 'no', 'n', 'deny', 'reject'])
+const ALLOW_WORDS = new Set(['approve', 'agree', 'allow', 'yes', 'y'])
+const DENY_WORDS = new Set(['reject', 'deny', 'no', 'n'])
 
 export function parseApprovalReply(
   input: { text?: string; choiceId?: string; now?: number },
@@ -63,7 +63,7 @@ export function parseApprovalReply(
   const text = input.text?.trim() ?? ''
   if (text === '') return { kind: 'not-an-answer' }
 
-  // `#n` 编号形式：`#2 1` / `#2 批准` / `#2 拒绝`
+  // `#n` numbered form: `#2 1` / `#2 approve` / `#2 reject`
   const numbered = /^#\s*(\d+)(?:\s+(.*))?$/.exec(text)
   if (numbered) {
     const num = Number(numbered[1])
@@ -74,7 +74,7 @@ export function parseApprovalReply(
     return active.some((item) => item.num === num) ? { kind: 'answer', num, outcome } : { kind: 'not-an-answer' }
   }
 
-  // 裸应答词只在恰有一条 pending 时有效。
+  // A bare answer word is only valid when there is exactly one pending item.
   const lower = text.toLowerCase()
   const word = wordOutcome(lower)
   if (word) {
@@ -84,7 +84,7 @@ export function parseApprovalReply(
     return { kind: 'not-an-answer' }
   }
 
-  // `1`/`2` 或 `#1` 也走上面的编号分支；这里处理裸数字。
+  // `1`/`2` or `#1` also flow through the numbered branch above; here we handle bare digits.
   if (/^[01]$/.test(text) || text === '1' || text === '2') {
     if (active.length === 1) {
       return { kind: 'answer', num: active[0]!.num, outcome: text === '1' ? 'allowed-once' : 'rejected' }

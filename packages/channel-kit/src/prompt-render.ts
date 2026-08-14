@@ -1,23 +1,24 @@
 /**
- * 统一交互提示（offer/选项）渲染与应答解析。
+ * Unified interactive prompt (offer/options) rendering and reply parsing.
  *
- * 与 `approval-render.ts` 的二进制审批相比，这里覆盖 N 选项 / 多选 / 自由文本 /
- * plan-review 意图，是 `dsh-user-questions` seam 的呈现层（channel-agnostic）：
- * 载荷只含 question + options[]，不含任何平台回调 id；适配是一份能力事实的纯函数；
- * 文本降级只出编号/选项文本，绝不泄漏 callback_data。
+ * Compared with the binary approval in `approval-render.ts`, this covers N options /
+ * multi-select / free text / plan-review intent, and is the channel-agnostic presentation
+ * layer of the `dsh-user-questions` seam: the payload only carries question + options[],
+ * with no platform callback ids; adaptation is a pure function over capability facts;
+ * the text fallback only emits numbered/option text and never leaks callback_data.
  */
 
-/** 呈现上限（Channel.presentationLimits 的结构同款；kit 不依赖 dsh-channel，故在此独立定义）。 */
+/** Presentation limits (same shape as Channel.presentationLimits; the kit does not depend on dsh-channel, so it is defined independently here). */
 export interface PresentationLimits {
-  /** 单条消息最多按钮数；undefined=无已知上限。超限降级编号文本。 */
+  /** Max buttons per message; undefined = no known limit. Over the limit, degrade to numbered text. */
   readonly maxOptions?: number
-  /** 按钮文字上限（码点）；超限截断加 `…`。 */
+  /** Button label cap (code points); over the limit, truncate and append `…`. */
   readonly maxLabelLength?: number
-  /** 回调数据（callback_data/value）上限（字节）；如 Telegram=64。 */
+  /** Callback data (callback_data/value) cap (bytes); e.g. Telegram = 64. */
   readonly maxValueBytes?: number
 }
 
-/** 一条待应答的交互提示（桥接层注册表条目；`resolve` 由消费方填）。 */
+/** One interactive prompt awaiting a reply (a bridge-layer registry entry; `resolve` is filled in by the consumer). */
 export interface PendingPrompt {
   readonly num: number
   readonly requestId: string
@@ -29,7 +30,7 @@ export interface PendingPrompt {
   readonly recommendedIndex?: number
   readonly intent?: { readonly kind: 'plan-review'; readonly approve: string }
   readonly expiresAt: number
-  /** 消费方填：用户应答到达时回填。单选时 custom 覆盖 selected；多选时 custom 补充。 */
+  /** Filled in by the consumer: invoked when the user's reply arrives. For single-select, custom overrides selected; for multi-select, custom supplements it. */
   resolve(selected: readonly string[], custom?: string): void
 }
 
@@ -65,12 +66,13 @@ export interface RenderPromptInput {
   intent?: { readonly kind: 'plan-review'; readonly approve: string }
 }
 
-/** 选项 id 编码：按钮 `prompt:<num>:<idx>`（idx 从 0 起）。受 maxValueBytes 约束（num 短整型）。 */
+/** Option id encoding: button `prompt:<num>:<idx>` (idx is 0-based). Constrained by maxValueBytes (num is a short integer). */
 const CHOICE_ID_PREFIX = 'prompt'
 
 /**
- * 把一条交互提示渲染成平台可呈现的形态：有按钮能力时出 choices（含推荐标记/截断），
- * 否则降级为编号文本（多选/自由文本带说明）。
+ * Render an interactive prompt into a platform-presentable form: emit choices when the
+ * platform has buttons (with recommended marker/truncation), otherwise degrade to
+ * numbered text (with notes for multi-select/free text).
  */
 export function renderPrompt(input: RenderPromptInput, caps: PromptOptions): RenderedPrompt {
   const { num, question, detail, options, multiSelect = false, allowFreeText = false, recommendedIndex, intent } = input
@@ -83,22 +85,22 @@ export function renderPrompt(input: RenderPromptInput, caps: PromptOptions): Ren
       id: `${CHOICE_ID_PREFIX}:${num}:${index}`,
       label: formatChoiceLabel(label, index, recommendedIndex, caps.presentationLimits?.maxLabelLength),
     }))
-    const text = multiSelect ? `${body}\n（可多选）` : body
+    const text = multiSelect ? `${body}\n(you can select multiple)` : body
     return { kind: 'choices', text, choices }
   }
 
   const lines = [body, '']
   options.forEach((label, index) => {
-    const rec = recommendedIndex === index ? '（推荐）' : ''
+    const rec = recommendedIndex === index ? ' (Recommended)' : ''
     lines.push(`  ${index + 1}. ${label}${rec}`)
   })
-  if (allowFreeText) lines.push('', '回复数字选择，或直接输入你的答案。')
-  else if (multiSelect) lines.push('', '回复数字（可逗号/空格分隔多选，如 "1, 3"）。')
-  else lines.push('', '回复数字或选项文本。')
+  if (allowFreeText) lines.push('', 'Reply with a number, or type your answer directly.')
+  else if (multiSelect) lines.push('', 'Reply with numbers (comma/space separated for multi-select, e.g. "1, 3").')
+  else lines.push('', 'Reply with a number or the option text.')
   return { kind: 'text', text: lines.join('\n') }
 }
 
-/** 解析入站应答：按钮回调 id 或文本（编号/选项文本/自由文本）。 */
+/** Parse an inbound reply: button callback id or text (numbered/option text/free text). */
 export function parsePromptReply(
   input: { readonly text?: string; readonly choiceId?: string; readonly now?: number },
   pending: readonly PendingPrompt[],
@@ -119,7 +121,7 @@ export function parsePromptReply(
   const text = input.text?.trim() ?? ''
   if (text === '') return { kind: 'not-an-answer' }
 
-  // `#n ...` 编号形式。
+  // `#n ...` numbered form.
   const numbered = /^#\s*(\d+)(?:\s+(.*))?$/.exec(text)
   if (numbered) {
     const num = Number(numbered[1])
@@ -130,7 +132,7 @@ export function parsePromptReply(
     return answerFromBody(entry, rest)
   }
 
-  // 唯一一条 pending 时：裸数字、选项文本、自由文本都有效。
+  // With exactly one pending entry: bare numbers, option text, and free text are all valid.
   if (active.length === 1) {
     return answerFromBody(active[0]!, text)
   }
@@ -142,7 +144,7 @@ function answerFromBody(entry: PendingPrompt, body: string): PromptReply {
   const lower = body.toLowerCase()
   const selected: string[] = []
 
-  // 数字（多选时允许多个，如 "1, 3" / "1 3"）。
+  // Numbers (multiple allowed for multi-select, e.g. "1, 3" / "1 3").
   const tokens = body.split(/[,\s]+/).filter((t) => t !== '')
   if (tokens.length > 0 && tokens.every((t) => /^\d+$/.test(t))) {
     for (const token of tokens) {
@@ -155,13 +157,13 @@ function answerFromBody(entry: PendingPrompt, body: string): PromptReply {
     if (selected.length === 0) return { kind: 'not-an-answer' }
   }
 
-  // 精确选项文本匹配。
+  // Exact option-text match.
   const exact = entry.options.find((label) => label.toLowerCase() === lower)
   if (exact !== undefined) {
     return { kind: 'answer', num: entry.num, answer: { selected: [exact] } }
   }
 
-  // 自由文本：仅当该条目允许自由文本。
+  // Free text: only when the entry allows free text.
   if (entry.allowFreeText) {
     return { kind: 'answer', num: entry.num, answer: { selected, custom: body } }
   }

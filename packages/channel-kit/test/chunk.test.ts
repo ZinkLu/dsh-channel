@@ -33,7 +33,7 @@ test('chunkText hard-splits oversized code blocks and re-fences each piece', () 
 })
 
 test('chunkText numbering prefix converges', () => {
-  const text = Array.from({ length: 10 }, (_, i) => `第${i}段内容`.repeat(20)).join('\n\n')
+  const text = Array.from({ length: 10 }, (_, i) => `segment ${i} content`.repeat(20)).join('\n\n')
   const chunks = chunkText(text, { maxChars: 100, numbering: 'prefix' })
   assert.ok(chunks.length >= 2)
   for (let i = 0; i < chunks.length; i++) {
@@ -43,7 +43,7 @@ test('chunkText numbering prefix converges', () => {
 })
 
 test('chunkText prefers sentence breaks but always respects maxChars', () => {
-  const text = '第一句。第二句。第三句。'
+  const text = 'one. two. four. five.'
   const chunks = chunkText(text, { maxChars: 5 })
   for (const chunk of chunks) {
     assert.ok([...chunk].length <= 5)

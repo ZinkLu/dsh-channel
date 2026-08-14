@@ -114,7 +114,7 @@ test('bridge rejects non-allowlisted sender', async () => {
     client,
   )
 
-  // 拦截 deliver 观察出站。
+  // Intercept deliver to observe outbound.
   root.on('channel/deliver', (out: any, next) => {
     sent.push(out.markdown)
     return next()
@@ -122,7 +122,7 @@ test('bridge rejects non-allowlisted sender', async () => {
 
   await bridge.handleEvent(makeEvent({ sender: { sender_id: { open_id: 'ou_mallory' }, sender_type: 'user' } }))
 
-  assert.ok(sent.some((text) => text.includes('没有权限')))
+  assert.ok(sent.some((text) => text.includes('You are not authorized to use this bot')))
 })
 
 function messageTextFromContent(message: any): string {

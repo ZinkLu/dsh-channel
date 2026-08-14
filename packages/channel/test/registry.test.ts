@@ -120,7 +120,7 @@ test('ChannelRegistry.deliver degrades media to a text note when unsupported (no
   })
   assert.equal(receipt.status, 'sent')
   assert.equal(channel.sent.length, 2)
-  assert.equal(channel.sent[1], '42:⚠️ 无法投递文件附件。')
+  assert.equal(channel.sent[1], '42:⚠️ Could not deliver the file attachment.')
   assert.ok(!channel.sent[1]!.includes('/secret/host'))
 })
 

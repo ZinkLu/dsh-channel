@@ -1,23 +1,24 @@
 # dsh-channel-kit
 
-渠道公共脏活层：六件脏活的纯函数，不依赖 cordis，不依赖 dsh-channel。
+The shared grunt-work layer for channels: pure functions for the six grunt-work modules,
+with no dependency on cordis or dsh-channel.
 
-## 模块
+## Modules
 
-| 模块 | 文件 | 功能 |
+| Module | File | Purpose |
 |---|---|---|
-| chunk | `chunk.ts` | markdown 块切分、围栏代码块原子、超长硬切补围栏、`（i/n）` 前缀收敛 |
-| merge | `merge.ts` | 连发合并 reducer：命令/媒体旁路、`..`/`!!` 后缀、ack-long |
-| router | `router.ts` | 平台会话 → dsh session 的纯决策 |
-| approval-render | `approval-render.ts` | 审批按钮/编号文本渲染与回复解析 |
-| store | `store.ts` / `store/json-file.ts` | `ChannelStore` 接口、内存实现、JSON 文件实现（tmp+rename 原子写，500ms 防抖） |
-| format | `format.ts` | Markdown → `plain` / `markdown` / `html` 三档降级 |
-| promptHint | `prompt-hint.ts` | 平台提示段，注入 agent 作用域 system prompt |
+| chunk | `chunk.ts` | markdown block splitting, fenced code blocks kept atomic, re-fencing on oversized hard splits, `（i/n）` prefix convergence |
+| merge | `merge.ts` | burst-merge reducer: command/media bypass, `..`/`!!` suffixes, ack-long |
+| router | `router.ts` | pure decision from platform session → dsh session |
+| approval-render | `approval-render.ts` | approval button/numbered-text rendering and reply parsing |
+| store | `store.ts` / `store/json-file.ts` | `ChannelStore` interface, in-memory implementation, JSON file implementation (tmp+rename atomic writes, 500ms debounce) |
+| format | `format.ts` | Markdown → `plain` / `markdown` / `html` three-tier degradation |
+| promptHint | `prompt-hint.ts` | platform prompt segment, injected into the agent's scoped system prompt |
 
-## 使用
+## Usage
 
 ```ts
 import { chunkText, mergeReduce, renderForTier, route } from 'dsh-channel-kit'
 ```
 
-详见各源码文件顶部的接口注释与 `test/*.test.ts`。
+See the interface comments at the top of each source file and `test/*.test.ts`.

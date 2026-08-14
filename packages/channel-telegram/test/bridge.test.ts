@@ -31,7 +31,7 @@ function createFakeClient(updates: TelegramUpdate[]): TelegramClient & {
     async getUpdates(_token: string, opts: { signal?: AbortSignal } = {}): Promise<TelegramUpdate[]> {
       calls++
       if (calls === 1) return updates
-      // 后续长轮询挂起，直到 abort 后退出。
+      // Subsequent long polls hang until abort exits.
       return new Promise<TelegramUpdate[]>((resolve, reject) => {
         const onAbort = () => {
           opts.signal?.removeEventListener('abort', onAbort)
@@ -176,7 +176,7 @@ test('bridge rejects non-allowlisted sender with a local reply', async () => {
   await waitFor(() => client.sends.length >= 1)
   await bridge.stop()
 
-  assert.ok(client.sends.some((send) => send.text.includes('没有权限')))
+  assert.ok(client.sends.some((send) => send.text.includes('You are not authorized to use this bot.')))
 })
 
 function messageTextFromContent(message: any): string {
@@ -269,7 +269,7 @@ test('bridge strips leaked <tool_calls> markup before delivering assistant text'
         content: [
           {
             type: 'text',
-            text: '抱歉，刚才可能没有正确显示结果。我再查一次：\n<tool_calls>\n<invoke name="Bash">\n<parameter name="command" string="true">date</parameter>\n</invoke>\n</tool_calls>',
+            text: 'Sorry, the result may not have displayed correctly just now. Let me check again:\n<tool_calls>\n<invoke name="Bash">\n<parameter name="command" string="true">date</parameter>\n</invoke>\n</tool_calls>',
           },
         ],
       },
@@ -280,7 +280,7 @@ test('bridge strips leaked <tool_calls> markup before delivering assistant text'
   await bridge.stop()
 
   const sent = client.sends.map((send) => send.text).join('\n')
-  assert.ok(sent.includes('抱歉'))
+  assert.ok(sent.includes('Sorry'))
   assert.ok(!sent.includes('<tool_calls>'))
   assert.ok(!sent.includes('<invoke'))
   assert.ok(!sent.includes('<parameter'))
@@ -344,11 +344,11 @@ test('bridge joins the host default agent preset when creating an agent', async 
   await waitFor(() => mountCalls.length >= 1)
   await bridge.stop()
 
-  // config.agentPreset 未设 → resolve 收到 undefined → 用宿主默认 preset。
+  // config.agentPreset unset → resolve receives undefined → use the host default preset.
   assert.deepEqual(resolveCalls, [undefined])
-  // preset id 落到 session header（meta.agentPreset），供 resume 重建能力。
+  // The preset id lands in the session header (meta.agentPreset) so resume can rebuild capabilities.
   assert.deepEqual(metaPresets, ['standard'])
-  // setup 里确实 mount 了该 preset。
+  // The preset was actually mounted in setup.
   assert.deepEqual(mountCalls, ['standard'])
 })
 
@@ -377,7 +377,7 @@ test('bridge shows a progress draft for tool calls and finalizes it on the answe
   root.emit('session/event', { id: sessionId }, { type: 'turn/start', seq: 1, time: Date.now(), data: { turn: 1 } })
   root.emit('session/event', { id: sessionId }, { type: 'tool/call', seq: 2, time: Date.now(), data: { turn: 1, step: 1, callId: 'c1', name: 'Bash', arguments: '{"command":"npm test"}' } })
 
-  // 门控 1500ms：定时器触发才建草稿。
+  // Gated 1500ms: the draft is only created when the timer fires.
   await waitFor(() => client.sends.some((s) => s.text.includes('Working…')), 2500)
   assert.ok(client.sends.some((s) => s.text.includes('🛠️ Bash')))
 
@@ -428,15 +428,15 @@ test('bridge registers a user-questions provider and renders an option prompt', 
   await bridge.start()
   await waitFor(() => registeredProvider !== null, 2000)
 
-  // agent 已创建 → provider 已注册；ask() 渲染选项提示。
+  // Agent created → provider registered; ask() renders the option prompt.
   const answerPromise = registeredProvider!.ask({
     questions: [{ id: 'q1', question: 'pick', options: [{ label: 'A' }, { label: 'B' }] }],
     agent: { id: sessionId },
   })
   await waitFor(() => client.sends.some((s) => s.text.includes('pick')), 2000)
 
-  // 文本应答 "2" → 解析到 prompt → 返回 selected ['B']。
-  // 走 getUpdates 二次批次太绕，这里直接断言渲染完成；应答解析由 kit 单测 + resolvePrompt 覆盖。
+  // Text reply "2" → parsed to the prompt → returns selected ['B'].
+  // Going through a second getUpdates batch is too roundabout; here we just assert rendering completed; reply parsing is covered by kit unit tests + resolvePrompt.
   assert.ok(client.sends.some((s) => s.text.includes('pick')))
   void answerPromise
   await bridge.stop()
@@ -514,7 +514,7 @@ test('bridge ingests media facts and downloads an inbound photo into an image bl
   assert.equal(emitted[0].media[0].kind, 'image')
   assert.equal(emitted[0].media[0].fileRef, 'photo_big')
 
-  // 图片落成 image 块，随文本 caption 一起进 content。
+  // The image becomes an image block and enters content together with the caption text.
   const content = followed[0]!.content
   assert.equal(content.length, 2)
   assert.equal(content[0].type, 'text')

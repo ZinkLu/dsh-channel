@@ -1,158 +1,179 @@
-# DSH 核心与能力 Seam 参考（对齐 `@deepseek-ai/*@0.1.0-rc.6`）
+# DSH Core and Capability Seams Reference (Aligned to `@deepseek-ai/*@0.1.0-rc.6`)
 
-> 本文记录 DeepSeek Harness (dsh) 自身的核心架构与能力 seam，作为本仓库
-> (`dsh-channel`) 的**唯一对齐基线**。写作时逐条对照了官方参考文档
-> （https://deepseek-harness.github.io/deepseek-harness/reference/ ）**与已安装的
-> rc.6 编译类型声明**（`node_modules/@deepseek-ai/*/lib/types/*.d.ts`）。凡是
-> 两者有版本漂移的地方都单独标注，不要拿 master 文档里的符号直接写代码。
+> This document records the DeepSeek Harness (dsh) core architecture and capability seams as
+> the **single alignment baseline** for this repository (`dsh-channel`). It was written by
+> cross-checking, item by item, the official reference documentation
+> (https://deepseek-harness.github.io/deepseek-harness/reference/ ) **and the installed rc.6
+> compiled type declarations** (`node_modules/@deepseek-ai/*/lib/types/*.d.ts`). Wherever the
+> two show version drift it is called out separately — do not write code directly from
+> symbols that only exist in the master docs.
 
-- 官方文档 = `deepseek-harness` **master 分支**生成（含 `steering/message`、
-  `TurnTriggerMap` 等 rc.6 里尚不存在的符号）。
-- 本项目 `package.json` 的 devDependencies 钉在 `^0.1.0-rc.6`；运行时 harness
-  也跑在 rc.6 上。**代码以 rc.6 为准**，文档仅作语义参考。
-
----
-
-## 0. 一句话结论（对齐后的形状）
-
-dsh 没有需要打补丁的"特权内核"。**每个 ctx 键要么是 `core`（唯一主干服务）、
-要么是 `seam`（可替换能力的 Service Definition）、要么是 `bundle`（组合点）**。
-扩展 dsh 的方式是往别的插件旁边挂一个插件：所有注册都是可逆副作用，插件卸载即撤销。
-
-- `core`：一个进程/作用域内唯一的服务，持有产品事实（注册表、日志、状态折叠）。
-- `seam`：**声明接口的 Service Definition + 实现它的 Provider + 使用它的 Consumer**
-  三者合起来才构成一项能力；替换 provider 就能换掉整个产品行为（如把
-  `ctx.subprocess` 指向远程沙箱，Bash/PTY/LSP 一起搬走，无需 provider 专用 fork）。
-- `bundle`：组合点（如 `ctx.agentLoop`），是"默认产品循环"的**唯一具体实现**，
-  扩展包依赖 `dsh-agent` 的事件与服务，**绝不**直接依赖 `dsh-agent-loop`，以保持循环可替换。
-
-本文其余部分：
-1. [Cordis 底座](#1-cordis-底座) —— Context / Service / Events / 分发模式 / effect
-2. [ctx 全表：seam 与 core](#2-ctx-全表seam-与-core) —— 主干 + 本项目触点的完整角色表
-3. [核心包（packages/core/）](#3-核心包packagescore) —— 六包与 `ctx.agents` 精确 API
-4. [轮次/步骤生命周期](#4-轮次步骤生命周期) —— turn/step 与 `agent/*` 事件
-5. [工具执行流水线](#5-工具执行流水线) —— `tools/*` 事件与 approval 降级
-6. [会话日志与 SessionEventMap](#6-会话日志与-sessioneventmap) —— 唯一真源
-7. [全仓通用类型模式](#7-全仓通用类型模式) —— `…Map→union` 与 Branded id
-8. [与本项目设计的对齐核对](#8-与本项目设计的对齐核对) —— 摘要（详见 `dsh-core-alignment-audit.md`）
+- The official docs are generated from the `deepseek-harness` **master branch** (including
+  symbols such as `steering/message` and `TurnTriggerMap` that do not yet exist in rc.6).
+- This project's `package.json` devDependencies are pinned to `^0.1.0-rc.6`; the runtime
+  harness also runs on rc.6. **Code takes rc.6 as authoritative**; the docs serve only as
+  semantic reference.
 
 ---
 
-## 1. Cordis 底座
+## 0. One-line conclusion (the shape after alignment)
 
-dsh 底层是 vendor 进来的 Cordis。五个核心概念（官方 cordis-primer）：
+dsh has no "privileged kernel" that needs patching. **Every ctx key is either `core` (the
+single backbone service), a `seam` (a Service Definition for a replaceable capability), or a
+`bundle` (a composition point)**. The way to extend dsh is to mount a plugin alongside the
+other plugins: all registrations are reversible side effects, and unloading the plugin
+undoes them.
 
-1. **插件** = 实现 `Service` 的对象：函数插件（可选 `inject` + `apply(ctx)`）或
-   `Service` 子类。生命周期由 Cordis 挂载到当前上下文。
-2. **上下文是服务容器**：一个服务占一个稳定 `ctx.<key>`；其他插件**通过 key 查找**，
-   不 import 具体实现。
-3. **`inject` 声明服务依赖**：插件等待所依赖的服务就绪才启动；加载顺序用服务依赖
-   表达，不手工编排。
-4. **类型化事件用于通信**：通过 TypeScript 声明合并注册事件名，再以 emit /
-   waterfall / parallel / serial / bail 分发。
-5. **注册是可逆副作用**：提示片段、工具 schema、适配器、provider、监听器经
-   `ctx.effect()` 或 `ctx.on()` 安装，reload/teardown 自动撤销。
+- `core`: the only service of its kind within a process/scope, holding product facts
+  (registry, log, status folding).
+- `seam`: a capability only comes together from **a Service Definition that declares the
+  interface + a Provider that implements it + a Consumer that uses it**; swapping the
+  provider swaps the entire product behavior (e.g. pointing `ctx.subprocess` at a remote
+  sandbox moves Bash/PTY/LSP all together, with no provider-specific fork).
+- `bundle`: a composition point (e.g. `ctx.agentLoop`), the **only concrete implementation**
+  of the "default product loop". Extension packages depend on `dsh-agent`'s events and
+  services and **never** depend directly on `dsh-agent-loop`, so the loop stays replaceable.
 
-### 1.1 事件分发模式（`DispatchMode`）
+The rest of this document:
+1. [Cordis foundation](#1-cordis-foundation) — Context / Service / Events / dispatch modes / effect
+2. [Full ctx table: seam vs core](#2-full-ctx-table-seam-vs-core) — complete role table of the backbone plus this project's touchpoints
+3. [Core packages (packages/core/)](#3-core-packages-packagescore) — the six packages and the precise `ctx.agents` API
+4. [Turn/step lifecycle](#4-turnstep-lifecycle) — turn/step and `agent/*` events
+5. [Tool execution pipeline](#5-tool-execution-pipeline) — `tools/*` events and approval degradation
+6. [Session log and SessionEventMap](#6-session-log-and-sessioneventmap) — single source of truth
+7. [Repo-wide common type patterns](#7-repo-wide-common-type-patterns) — `…Map→union` and Branded ids
+8. [Alignment check against this project's design](#8-alignment-check-against-this-projects-design) — summary (see `dsh-core-alignment-audit.md` for details)
 
-| 模式 | await | 顺序 | 有返回值 | 语义 |
+---
+
+## 1. Cordis foundation
+
+dsh sits on top of the vendored Cordis. Five core concepts (from the official cordis-primer):
+
+1. **Plugin** = an object implementing `Service`: a function plugin (optional `inject` +
+   `apply(ctx)`) or a `Service` subclass. Cordis mounts its lifecycle onto the current context.
+2. **The context is a service container**: one service occupies one stable `ctx.<key>`; other
+   plugins **look services up by key**, not by importing the concrete implementation.
+3. **`inject` declares service dependencies**: a plugin only starts once the services it
+   depends on are ready; load order is expressed via service dependencies, not
+   hand-orchestrated.
+4. **Typed events for communication**: event names are registered via TypeScript declaration
+   merging, then dispatched via emit / waterfall / parallel / serial / bail.
+5. **Registrations are reversible side effects**: prompt fragments, tool schemas, adapters,
+   providers, and listeners are installed through `ctx.effect()` or `ctx.on()` and
+   automatically undone on reload/teardown.
+
+### 1.1 Event dispatch modes (`DispatchMode`)
+
+| Mode | await | Order | Has return value | Semantics |
 |---|---|---|---|---|
-| `emit` | 否 | 注册顺序 | 否 | 观察；同步跑、忽略返回值 |
-| `waterfall` | 否* | 注册顺序 | 是 | 环绕中间件：`(...args, next)`，调 `next()` 委托下去，不调则短路 |
-| `parallel` | 是 | 并发 | 否 | 全部并行，等所有监听器 settle |
-| `serial` | 是 | 注册顺序 | 是 | 依次 await，直到一个 bail（返回非 null/false/undefined） |
-| `bail` | 否 | 注册顺序 | 是 | 同步依次调用，遇到第一个 bail 值停止 |
+| `emit` | no | registration order | no | observe; runs synchronously, ignores return values |
+| `waterfall` | no* | registration order | yes | around-middleware: `(...args, next)`, call `next()` to delegate onward, don't call it to short-circuit |
+| `parallel` | yes | concurrent | no | all in parallel, wait for every listener to settle |
+| `serial` | yes | registration order | yes | await one after another, until one bails (returns non-null/false/undefined) |
+| `bail` | no | registration order | yes | call synchronously in order, stop at the first bail value |
 
-> *`waterfall` 本身返回最外层监听器的返回值（可能是 Promise）；"是否 await"指分发本身不等待。
+> *`waterfall` itself returns the outermost listener's return value (possibly a Promise);
+> "whether await" refers to the dispatch itself not waiting.
 
-**waterfall 语义**：每个监听器包装"链的其余部分"——`next()` 执行下一个监听器
-（最终是内置行为），下游返回值经 `next()` 回传到当前包装层；不调 `next()` 直接
-返回 = 短路。**单决策事件里短路是设计意图**（策略监听器拥有决策权时直接返回）；
-纯观察/标注的监听器必须委托。对应源码：`@deepseek-ai/cordis/lib/types/events.d.ts`
-（`ctx.parallel/emit/serial/bail/waterfall/on/once`）。
+**waterfall semantics**: each listener wraps "the rest of the chain" — `next()` runs the next
+listener (ultimately the built-in behavior), and the downstream return value flows back
+through `next()` to the current wrapper; returning directly without calling `next()` =
+short-circuit. **In a single-decision event, short-circuiting is the design intent** (a policy
+listener returns directly when it holds the decision); purely observing/annotating listeners
+must delegate. Corresponding source: `@deepseek-ai/cordis/lib/types/events.d.ts`
+(`ctx.parallel/emit/serial/bail/waterfall/on/once`).
 
-### 1.2 Context / Service / effect 要点
+### 1.2 Context / Service / effect essentials
 
-- `Context` 是**代理**：属性读取走服务解析器；`extend()`/`isolate()`/`intercept()`
-  创建有作用域的子上下文而不改父上下文。
-  - `ctx.isolate(name, label?)`：给 `name` 一个独立服务作用域（同 label 两次 = 同作用域）。
-  - `ctx.intercept(name, config)`：为下方插件合并该服务的拦截配置。
-- `ctx.provide(name, value)`：注册一个**归当前 fiber 所有**的服务实现；fiber 激活后可见，
-  卸载时撤销并唤醒依赖方。
-- `Service` 基类：`super(ctx, name)` 即注册为 `ctx.<name>`；持有 `protected ctx`。
-  子类实例就是那个 ctx 键的值。
-- `ctx.effect(execute, label?)`：`execute` 返回 disposer（或 generator，按 yield 顺序
-  逐个登记）；返回的 disposer 单次、可 await。副作用创建与销毁写在同一个 effect 里，
-  才能保证 teardown 顺序。签名：`@deepseek-ai/cordis/lib/types/fiber.d.ts`。
+- `Context` is a **proxy**: property reads go through the service resolver;
+  `extend()`/`isolate()`/`intercept()` create scoped child contexts without modifying the
+  parent context.
+  - `ctx.isolate(name, label?)`: gives `name` an independent service scope (same label twice =
+    same scope).
+  - `ctx.intercept(name, config)`: merges interception config for that service for the plugins
+    below.
+- `ctx.provide(name, value)`: registers a service implementation **owned by the current
+  fiber**; visible once the fiber activates, revoked (and dependents re-awakened) on unload.
+- `Service` base class: `super(ctx, name)` registers as `ctx.<name>`; holds `protected ctx`.
+  The subclass instance is the value of that ctx key.
+- `ctx.effect(execute, label?)`: `execute` returns a disposer (or a generator, registering
+  each item in yield order); the returned disposer is single-use and awaitable. Side-effect
+  creation and teardown must live in the same effect to guarantee teardown order. Signature:
+  `@deepseek-ai/cordis/lib/types/fiber.d.ts`.
 
 ---
 
-## 2. ctx 全表：seam 与 core
+## 2. Full ctx table: seam vs core
 
-角色标注规则（官方 capability-seams 页）：**seam = 可替换能力**（Service Definition
-+ Provider + Consumer 三者设计成一体）；**core = 唯一主干服务**；**bundle = 组合点**。
-下表左侧列是官方全表里与本项目/主干最相关的一部分（完整 ~50 项见官方
-`/reference/capability-seams`）。
+Role-annotation rule (from the official capability-seams page): **seam = replaceable
+capability** (Service Definition + Provider + Consumer designed as one unit); **core = the
+single backbone service**; **bundle = composition point**. The left column of the table below
+is the subset of the official full table most relevant to this project/backbone (the full
+~50 entries are in the official `/reference/capability-seams`).
 
-| ctx 键 | 角色 | 声明包 | rc.6 具体类型 | 直接消费方 | 说明 |
+| ctx key | Role | Declaring package | rc.6 concrete type | Direct consumers | Notes |
 |---|---|---|---|---|---|
-| `ctx.sessions` | **core** | dsh-session | `SessionStore`（`extends Service`） | agent-loop、agent、session-persistence、query、subagent、invariants | 仅追加 `Session` 实例 + 持久会话事件流 |
-| `ctx.systemPrompt` | **core** | dsh-system-prompt | `SystemPrompt` | agent-loop、tools、tool-fs/terminal/web | 每步收集提示片段 + 面向模型的 tool schema |
-| `ctx.tools` | **core** | dsh-tools | `ToolRuntime` | agent-loop、各 tool-* | 作用域化注册表 + 把关执行流水线 |
-| `ctx.agents` | **core** | dsh-agent | `AgentRegistry` | agent-loop、acp、subagent-inprocess | 实时 `Agent` 句柄、创建/恢复工厂 seam、发起者传播 |
-| `ctx.agentLoop` | **bundle** | dsh-agent-loop | `AgentLoop`（`implements AgentFactory`） | —（唯一具体循环） | 默认产品循环；扩展包不得依赖它 |
-| `ctx.scope` | （无 ctx 键） | dsh-scope | 库：`createScope`/`scopeOf`/`scopeTarget` | session、system-prompt 等 | 按 agent 划分作用域的注册原语 |
-| `ctx.llm` | **seam** | dsh-llm | `LlmRuntime`（抽象 `LlmAdapter`） | agent-loop、compaction | 消息/流词汇 + 适配器注册表 |
-| `ctx.approval` | **seam** | dsh-user-approval | `ApprovalService` | tools、tool-bash | 一次性权限决策（`approval/request` waterfall） |
-| `ctx.credentials` | **seam** | dsh-credentials | `CredentialProvider`（抽象） | llm 适配器、apiproxy | 机密引用解析，每次操作重解析 |
-| `ctx.sessionPersistence` | seam | dsh-session-persistence | — | agent-loop、session-query、tool-bash | 同一套 SessionEvent 词汇的持久化后端 |
-| `ctx.subprocess` | seam | dsh-subprocess | — | bash、terminal、LSP、subagent | 进程坐标、进程树/会话生命周期、stdio、kill 升级 |
-| `ctx.shell` | seam | dsh-shell | — | tool-bash、tool-pwsh | 面向模型的 shell 执行 |
-| `ctx.terminals` | seam | dsh-terminal | — | tool-terminal | 持久化 PTY 会话 |
-| `ctx.fs` | seam | dsh-fs | — | tool-fs、fs-observation-policy | 读/写/编辑 + 沙箱限制 |
-| `ctx.sandbox` | seam | dsh-sandbox | — | bash-sandbox、terminal-bash | 包装 spawn 的 argv，报告强制执行情况 |
-| `ctx.jobs` | seam | dsh-jobs | — | tool-jobs、tool-bash/subagent | 后台工作登记/收集/终止 |
-| `ctx.subagents` | seam | dsh-subagent | — | tool-subagent、tool-ralph | 委派（一次性/可延续）的传输 |
-| `ctx.invariants` | **core** | dsh-invariants | `InvariantRegistry` | session、agent、scope、agent-loop | 包自有的运行时不变式注册表 |
+| `ctx.sessions` | **core** | dsh-session | `SessionStore` (`extends Service`) | agent-loop, agent, session-persistence, query, subagent, invariants | append-only `Session` instances + persistent session event stream |
+| `ctx.systemPrompt` | **core** | dsh-system-prompt | `SystemPrompt` | agent-loop, tools, tool-fs/terminal/web | collects prompt fragments per step + model-facing tool schemas |
+| `ctx.tools` | **core** | dsh-tools | `ToolRuntime` | agent-loop, the tool-* packages | scoped registry + gated execution pipeline |
+| `ctx.agents` | **core** | dsh-agent | `AgentRegistry` | agent-loop, acp, subagent-inprocess | live `Agent` handles, create/resume factory seam, initiator propagation |
+| `ctx.agentLoop` | **bundle** | dsh-agent-loop | `AgentLoop` (`implements AgentFactory`) | — (the only concrete loop) | the default product loop; extension packages must not depend on it |
+| `ctx.scope` | (no ctx key) | dsh-scope | library: `createScope`/`scopeOf`/`scopeTarget` | session, system-prompt, etc. | registration primitives scoped per agent |
+| `ctx.llm` | **seam** | dsh-llm | `LlmRuntime` (abstract `LlmAdapter`) | agent-loop, compaction | message/stream vocabulary + adapter registry |
+| `ctx.approval` | **seam** | dsh-user-approval | `ApprovalService` | tools, tool-bash | one-shot permission decisions (`approval/request` waterfall) |
+| `ctx.credentials` | **seam** | dsh-credentials | `CredentialProvider` (abstract) | llm adapters, apiproxy | resolves secret references, re-resolved on every operation |
+| `ctx.sessionPersistence` | seam | dsh-session-persistence | — | agent-loop, session-query, tool-bash | persistence backend for the same SessionEvent vocabulary |
+| `ctx.subprocess` | seam | dsh-subprocess | — | bash, terminal, LSP, subagent | process coordinates, process-tree/session lifecycle, stdio, kill escalation |
+| `ctx.shell` | seam | dsh-shell | — | tool-bash, tool-pwsh | model-facing shell execution |
+| `ctx.terminals` | seam | dsh-terminal | — | tool-terminal | persistent PTY sessions |
+| `ctx.fs` | seam | dsh-fs | — | tool-fs, fs-observation-policy | read/write/edit + sandbox restrictions |
+| `ctx.sandbox` | seam | dsh-sandbox | — | bash-sandbox, terminal-bash | wraps spawn's argv, reports enforcement |
+| `ctx.jobs` | seam | dsh-jobs | — | tool-jobs, tool-bash/subagent | background-job registration/collection/termination |
+| `ctx.subagents` | seam | dsh-subagent | — | tool-subagent, tool-ralph | transport for delegation (one-shot/continuable) |
+| `ctx.invariants` | **core** | dsh-invariants | `InvariantRegistry` | session, agent, scope, agent-loop | package-owned runtime invariant registry |
 
-> 本项目直接触点的精确签名（rc.6 源码行号）见 §3、§5、§6 与 `dsh-core-alignment-audit.md`。
+> The precise signatures of this project's touchpoints (rc.6 source line numbers) are in §3,
+> §5, §6 and `dsh-core-alignment-audit.md`.
 
 ---
 
-## 3. 核心包（packages/core/）
+## 3. Core packages (packages/core/)
 
-一个轮次按同一循环流经六个包：agent-loop 的 driver 认领排队提示词 → 在
-`ctx.sessions` 上开轮次 → `ctx.systemPrompt` 组装请求前缀、从日志派生历史 →
-`ctx.llm` seam 流式取响应 → `ctx.tools` 分发工具调用 → 每个模型可见事实追加回日志。
+One turn flows through six packages along the same loop: the agent-loop driver claims queued
+prompts → opens a turn on `ctx.sessions` → `ctx.systemPrompt` assembles the request prefix and
+derives history from the log → the `ctx.llm` seam streams the response → `ctx.tools` dispatches
+tool calls → every model-visible fact is appended back to the log.
 
-| 包 | 职责 | ctx 键 |
+| Package | Responsibility | ctx key |
 |---|---|---|
-| session | 仅追加 `SessionEvent` 日志 + 内存 store（唯一真源） | `ctx.sessions` |
-| system-prompt | 提示片段与工具 schema 组装 | `ctx.systemPrompt` |
-| tools | 作用域化工具注册表 + 受保护执行流水线 | `ctx.tools` |
-| agent | `Agent` 接口、实时注册表、发起者作用域、`agent/*` 事件 | `ctx.agents` |
-| agent-loop | 实现公开 Agent 约定的具体 driver | `ctx.agentLoop` |
-| scope | 按 agent 作用域的注册原语库（**非服务、零依赖**） | 无 |
+| session | append-only `SessionEvent` log + in-memory store (single source of truth) | `ctx.sessions` |
+| system-prompt | assembles prompt fragments and tool schemas | `ctx.systemPrompt` |
+| tools | scoped tool registry + protected execution pipeline | `ctx.tools` |
+| agent | the `Agent` interface, live registry, initiator scoping, `agent/*` events | `ctx.agents` |
+| agent-loop | the concrete driver implementing the public Agent contract | `ctx.agentLoop` |
+| scope | registration-primitive library scoped per agent (**not a service, zero dependencies**) | none |
 
-`scope/` 是唯一非服务包，位于 session/system-prompt 之下，让二者消费它而不成环。
+`scope/` is the only non-service package, sitting beneath session/system-prompt so both can
+consume it without creating a cycle.
 
-### 3.1 `ctx.agents` 精确 API（rc.6）
+### 3.1 The precise `ctx.agents` API (rc.6)
 
-源码：`dsh-agent/lib/types/index.d.ts`、`dsh-agent/lib/types/runtime-types.d.ts`。
+Source: `dsh-agent/lib/types/index.d.ts`, `dsh-agent/lib/types/runtime-types.d.ts`.
 
 ```ts
-// 创建 / 恢复（index.d.ts）
+// create / resume (index.d.ts)
 interface CreateAgentOptions {
-  readonly sessionId: SessionId                       // 活 agent/session 共享身份
+  readonly sessionId: SessionId                       // a live agent/session share an identity
   readonly meta?: { cwd?; parentSession?; seedLength?; origin?: 'subagent'; delegationDepth?; agentPreset? }
-  readonly seed?: readonly SessionEvent[]             // 可选 fork 回放前缀
+  readonly seed?: readonly SessionEvent[]             // optional fork replay prefix
   readonly agentOptions?: AgentOptions
-  readonly signal?: AbortSignal                       // 仅创建期有效
-  readonly setup?: AgentSetup                          // 发布前组装 agent 作用域世界
+  readonly signal?: AbortSignal                       // valid only during creation
+  readonly setup?: AgentSetup                          // assembles the agent-scope world before publish
 }
 interface ResumeAgentOptions { resumeSessionId; agentOptions?; signal?; setup? }
 interface AgentHandle { agent: Agent; dispose(): Promise<void> }
-// AgentRegistry（Service）
+// AgentRegistry (Service)
 class AgentRegistry {
   create(options: CreateAgentOptions): Promise<AgentHandle>
   resume(options: ResumeAgentOptions): Promise<AgentHandle>
@@ -165,21 +186,21 @@ class AgentRegistry {
 ```
 
 ```ts
-// Agent（runtime-types.d.ts）—— 面向编程的 surface
+// Agent (runtime-types.d.ts) — the program-facing surface
 interface Agent {
   readonly id: SessionId
   readonly options: AgentOptions                       // { provider?, model?, maxTokens? }
-  readonly session: Session                            // 其日志 = 持久唯一真源
+  readonly session: Session                            // its log = the persistent single source of truth
   readonly inbox: Inbox
   readonly status: AgentStatus                         // 'idle' | 'running'
-  readonly ctx: Context                                // agent 作用域上下文
+  readonly ctx: Context                                // the agent-scope context
   cancel(cause: AgentCancelCause, options?: CancelOptions): void
   whenIdle(): Promise<void>
   runMaintenance<T>(task: (signal) => Promise<T>): Promise<T>
   send(message: UserMessage, target: InboxTarget, wakeup: boolean): void
-  followup(message: UserMessage): void                 // 独立新 turn + 唤醒
-  steer(message: UserMessage): void                    // 插话，最近 step 边界消费
-  inject(message: UserMessage): void                   // 注入上下文，不唤醒
+  followup(message: UserMessage): void                 // independent new turn + wake
+  steer(message: UserMessage): void                    // interjection, consumed at the nearest step boundary
+  inject(message: UserMessage): void                   // injects context, does not wake
 }
 // InboxTarget = 'next-turn' | 'next-step'
 // PreStepDecision = {kind:'reject'} | {kind:'enter', messages: UserMessage[]}
@@ -187,95 +208,104 @@ interface Agent {
 // SessionStartSource = 'startup' | 'resume' | 'clear' | 'compact'
 ```
 
-**要点**：
-- `create()`/`resume()` 是**异步事务**：先 `setup(agentCtx)`（未发布），再 insert →
-  announce session → announce agent → `agent/session-start` → 才起循环；setup 拒绝、
-  commit 抛错或 owner dispose 都回滚、两个 id 都不发布。
-- 投递三预设：`followup`（独立 turn）、`steer`（最近 step 边界）、`inject`（不唤醒）。
-- **输出没有回调 API**：从 `session/event` 流读 `assistant/message` / `turn/end`
-  （见 §6）。`agent/status`（emit）+ `agent.status` 可驱动 typing 指示。
+**Essentials**:
+- `create()`/`resume()` are **async transactions**: first `setup(agentCtx)` (unpublished),
+  then insert → announce session → announce agent → `agent/session-start` → only then start
+  the loop; a setup rejection, a commit throw, or owner dispose all roll back and publish
+  neither id.
+- Three delivery presets: `followup` (independent turn), `steer` (nearest step boundary),
+  `inject` (does not wake).
+- **Output has no callback API**: read `assistant/message` / `turn/end` from the
+  `session/event` stream (see §6). `agent/status` (emit) + `agent.status` can drive typing
+  indicators.
 
-### 3.2 `ctx.agentLoop`（bundle）
+### 3.2 `ctx.agentLoop` (bundle)
 
-`AgentLoop extends Service implements AgentFactory`（`dsh-agent-loop/lib/types/index.d.ts:102`）：
-`create(id, options?, meta?)` / `createAgent(ownerCtx, options)` / `resume(ownerCtx, options)`。
-它是 `ctx.agents.setFactory()` 注册的工厂；**消费方通过 `ctx.agents` 编程，永不依赖
-`dsh-agent-loop`**。
+`AgentLoop extends Service implements AgentFactory` (`dsh-agent-loop/lib/types/index.d.ts:102`):
+`create(id, options?, meta?)` / `createAgent(ownerCtx, options)` / `resume(ownerCtx, options)`.
+It is the factory registered via `ctx.agents.setFactory()`; **consumers program through
+`ctx.agents` and never depend on `dsh-agent-loop`**.
 
-### 3.3 `ctx.scope`（库）
+### 3.3 `ctx.scope` (library)
 
-`dsh-scope/lib/types/index.d.ts`：
-- `type ScopeKey = object`（不透明、身份比较）
-- `type Scoped<T>`：`scopeTarget(base, key)` 返回的路由接收器品牌标记
-- `createScope(ctx, key, options?): Scope`、`scopeOf(ctx): ScopeKey | undefined`、
+`dsh-scope/lib/types/index.d.ts`:
+- `type ScopeKey = object` (opaque, compared by identity)
+- `type Scoped<T>`: the brand marker on the routing receiver returned by
+  `scopeTarget(base, key)`
+- `createScope(ctx, key, options?): Scope`, `scopeOf(ctx): ScopeKey | undefined`,
   `scopeTarget<T>(base, key): Scoped<T>`
-- 作用域过滤的事件用 `Scoped<T>` 作 `this` 类型；真实主体仍走显式参数。
+- scope-filtered events use `Scoped<T>` as the `this` type; the real subject still travels as
+  an explicit parameter.
 
 ---
 
-## 4. 轮次/步骤生命周期
+## 4. Turn/step lifecycle
 
-一个**步骤** = 一次模型请求 + 它调用的工具。一个**轮次** = 零或多个步骤：领到首条
-输入前打开，不再欠任何工作时关闭。
+A **step** = one model request + the tools it calls. A **turn** = zero or more steps: it
+opens before the first input is claimed and closes once no more work is owed.
 
 ```
 turn/start
-  claim next-step 输入 + 一条排队消息
-  组装提示片段 + 工具 schema
-  -> agent/pre-step        （waterfall：reject | enter(messages)）
-  reject / 首次 enter 改写为空 -> 以零步骤关闭轮次
+  claim next-step input + one queued message
+  assemble prompt fragments + tool schemas
+  -> agent/pre-step        (waterfall: reject | enter(messages))
+  reject / first enter rewritten to empty -> close the turn with zero steps
   step/start
-    已进入消息追加为 user/message
-    从日志 deriveMessages() 派生模型历史
+    entered messages appended as user/message
+    deriveMessages() derives model history from the log
     agent/request -> llm/stream -> assistant/chunk* -> assistant/message
     tool/call* -> tools/pre-execute -> tools/execute -> tools/post-execute -> tool/result*
   step/end
-  工具欠另一次请求 或 next-step 输入到达 -> claim -> 下一步
-  -> agent/turn-stopping  （serial，无 next()）
+  tool owes another request or next-step input arrives -> claim -> next step
+  -> agent/turn-stopping  (serial, no next())
 turn/end
 ```
 
-- **持久会话事件**：`turn/*`、`step/*`、`user/message`、`assistant/*`、`tool/*`。
-- **实时扩展点**（三域）：`agent/*`（inbox/step/status/request/验证/续跑）、
-  `tools/*`（能力 seam 策略/适配器）、`llm/stream`。
-- `agent/pre-step`、`agent/request`、`llm/stream` 与三个 `tools/*` 是 **waterfall**
-  （监听器必须调 `next()` 才委托）；`agent/turn-stopping` 是 **serial**（无 `next()`）。
-- 输入通过同一个 inbox 到达 driver；`agent/pre-step` 决定模型看到什么。
+- **Persistent session events**: `turn/*`, `step/*`, `user/message`, `assistant/*`, `tool/*`.
+- **Realtime extension points** (three domains): `agent/*` (inbox/step/status/request/
+  validation/continuation), `tools/*` (capability seam policy/adapters), `llm/stream`.
+- `agent/pre-step`, `agent/request`, `llm/stream` and the three `tools/*` are **waterfall**
+  (a listener must call `next()` to delegate); `agent/turn-stopping` is **serial** (no
+  `next()`).
+- Input reaches the driver through the same inbox; `agent/pre-step` decides what the model
+  sees.
 
-**`agent/*` 事件**（`dsh-agent/lib/types/runtime-types.d.ts`）：
-`agent/created`、`agent/disposed`、`agent/status`、`agent/inbox/inserted|claimed|discarded`、
-`agent/session-start`（以上 emit）、`agent/pre-step`、`agent/request`、`agent/request-error`
-（waterfall）、`agent/turn-stopping`（serial）、`agent/error`（emit）。
+**`agent/*` events** (`dsh-agent/lib/types/runtime-types.d.ts`):
+`agent/created`, `agent/disposed`, `agent/status`, `agent/inbox/inserted|claimed|discarded`,
+`agent/session-start` (the above are emit), `agent/pre-step`, `agent/request`,
+`agent/request-error` (waterfall), `agent/turn-stopping` (serial), `agent/error` (emit).
 
 ---
 
-## 5. 工具执行流水线
+## 5. Tool execution pipeline
 
-源码：`dsh-tools/lib/types/index.d.ts`（`ToolRuntime`、`ToolDefinition`、`defineTool`、
-`tools/*` 事件）。
+Source: `dsh-tools/lib/types/index.d.ts` (`ToolRuntime`, `ToolDefinition`, `defineTool`,
+`tools/*` events).
 
 ```ts
 class ToolRuntime extends Service {   // ctx.tools
   register(definition: ToolDefinition): () => void
-  restrict(filter: ToolRestriction): () => void     // 作用域内 allow/deny 全局工具
-  guard(guard: ToolGuard): () => void                // 单调守卫（只能 deny，不能 force-allow）
+  restrict(filter: ToolRestriction): () => void     // allow/deny global tools within a scope
+  guard(guard: ToolGuard): () => void                // monotonic guard (can only deny, never force-allow)
   get(name, scope?): ToolDefinition | undefined
   schemas(scope?): ToolSchema[]
   execute(exec: ToolExecutionInput): Promise<ToolExecutionResult>
 }
 ```
 
-顺序：`tools/pre-execute`（waterfall，可 `allow | deny | ask`）→ **单调守卫** →
-`tools/execute`（waterfall，around-dispatch，超时/重试/度量）→ 工具体 →
-`tools/post-execute`（waterfall，`accept | block` + 可选 `additionalContexts`）→
-`finalizeContent`（定义自有，同步纯内容变换）→ 无损快照 → `tools/result`（emit，冻结快照）。
+Order: `tools/pre-execute` (waterfall, can `allow | deny | ask`) → **monotonic guard** →
+`tools/execute` (waterfall, around-dispatch, timeout/retry/metrics) → tool body →
+`tools/post-execute` (waterfall, `accept | block` + optional `additionalContexts`) →
+`finalizeContent` (definition-owned, synchronous pure content transform) → lossless snapshot →
+`tools/result` (emit, frozen snapshot).
 
-**approval 降级（本项目 R2/A3 的直接依据）**：`ToolRuntime.serviceAsk`（源码
-`dsh-tools/lib/types/index.d.ts:784-794`）**机会主义地 `ctx.get('approval')`**——
-没装 `ApprovalService` 时"保持历史上的 degrade to deny"，`ask` 一律转 deny；
-只有 `allowed-once` 放行，三个非放行结果各自带不同 reason。agentless 执行同样降级。
+**Approval degradation (the direct basis for this project's R2/A3)**: `ToolRuntime.serviceAsk`
+(source `dsh-tools/lib/types/index.d.ts:784-794`) **opportunistically `ctx.get('approval')`** —
+when no `ApprovalService` is installed it preserves the historical "degrade to deny", turning
+every `ask` into deny; only `allowed-once` passes, and the three non-approving outcomes each
+carry a distinct reason. Agentless execution degrades the same way.
 
-**`approval/request`（seam，`dsh-user-approval`）**：
+**`approval/request` (seam, `dsh-user-approval`)**:
 ```ts
 type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
 type ApprovalPolicy  = 'ask' | 'never'
@@ -283,46 +313,56 @@ interface ApprovalRequest {
   readonly agent: Agent; readonly toolName: string
   readonly callId?: CallId; readonly reason?: string; readonly signal?: AbortSignal
 }
-// 事件：'approval/request'(req, next) => Promise<ApprovalOutcome>   (waterfall)
-// 审计对：SessionEventMap 扩展 'approval/asked' / 'approval/decided'（log-only）
+// event: 'approval/request'(req, next) => Promise<ApprovalOutcome>   (waterfall)
+// audit pair: SessionEventMap extensions 'approval/asked' / 'approval/decided' (log-only)
 ```
-`signal` abort → `'cancelled'`（迟到回答丢弃）；无/抛错 answerer → `'unavailable'`
-（fail-closed）；`'never'` 策略在 dispatch 前就地 `'rejected'`；rogue 非词汇返回值
-归一化为 `'unavailable'`。源码：`dsh-user-approval/lib/types/index.d.ts` 与 `types.d.ts`。
+`signal` abort → `'cancelled'` (late answers discarded); no/throwing answerer →
+`'unavailable'` (fail-closed); the `'never'` policy rejects in place before dispatch; rogue
+non-vocabulary return values are normalized to `'unavailable'`. Source:
+`dsh-user-approval/lib/types/index.d.ts` and `types.d.ts`.
 
-### 5.1 工具属于 agent preset（agent 平面）
+### 5.1 Tools belong to the agent preset (agent plane)
 
-Web 部署下**工具不是全局的**，而是按会话由 preset 在 agent 平面挂载。分两层：
+In a Web deployment **tools are not global**; instead they are mounted per session by the
+preset on the agent plane. Two layers:
 
-- `dsh-base` 全局装载 `tool-*`（TUI 单会话直接用）；`dsh-web-app` 把这些全局工具行
-  **全部 `disabled: true`**，改挂 `dsh-agent-presets`（`default: standard`）。
-- `standard` preset（`config/agent-presets/standard/agent.cordis.yml`）是 **agent-plane
-  组合**：把 `tool-bash`/`tool-fs`/`tool-web`/`tool-subagent`/`tool-ralph`/`tool-workflow`/
-  `plan-mode`/`tool-todo`/`tool-ask-user` 等整套工具 + persona + skills 重新挂进每个会话。
+- `dsh-base` globally loads `tool-*` (the TUI single session uses them directly);
+  `dsh-web-app` sets all of those global tools to **`disabled: true`** and instead mounts
+  `dsh-agent-presets` (`default: standard`).
+- The `standard` preset (`config/agent-presets/standard/agent.cordis.yml`) is an
+  **agent-plane composition**: it re-mounts the full set — `tool-bash`/`tool-fs`/`tool-web`/
+  `tool-subagent`/`tool-ralph`/`tool-workflow`/`plan-mode`/`tool-todo`/`tool-ask-user` and
+  more — plus persona and skills into every session.
 
-**join 机制**：`dsh-agent-presets` 提供 `mount(agentCtx, id?)` 与 `composeFrom(agentCtx, parentCtx)`，
-**必须在 agent factory 的 `setup(agentCtx)` 里调用**（失败会回滚整个创建）。canonical 调用点
-是 `dsh-host-apiproxy` 的 `composeAgent`：先 `resolve(id)` 拿到 resolved id → 写进
-`meta.agentPreset`（session header，供 resume 重建）→ setup 里 `await presets.mount(agentCtx, resolvedId)`。
+**The join mechanism**: `dsh-agent-presets` provides `mount(agentCtx, id?)` and
+`composeFrom(agentCtx, parentCtx)`, which **must be called inside the agent factory's
+`setup(agentCtx)`** (a failure rolls back the whole creation). The canonical call site is
+`dsh-host-apiproxy`'s `composeAgent`: first `resolve(id)` to get the resolved id → write it
+into `meta.agentPreset` (session header, for rebuild on resume) → then, in setup,
+`await presets.mount(agentCtx, resolvedId)`.
 
-**漏 join 的后果**：agent 发布时 `dsh-agent-presets` 打警告——
+**Consequences of a missed join**: when an agent is published, `dsh-agent-presets` logs a
+warning —
 
 > `agent … was published without joining an agent preset; its tools, prompt sections, and skill catalog resolve against the empty global layer`
 
-空全局层 ⇒ `request/header.tools` 为空 ⇒ DeepSeek 模型把想调用的工具写成 `<tool_calls>`
-XML 纯文本吐出来。**对本项目（channel）的直接要求**：任何渠道 provider 用
-`ctx.agents.create()` 建 agent 时，都必须 resolve + 记录 + mount preset，才能继承宿主
-默认能力；无 roster（`ctx.get('agentPresets')` 为空）时降级走 host 全局层。
+An empty global layer ⇒ `request/header.tools` is empty ⇒ the DeepSeek model emits the tools
+it wanted to call as `<tool_calls>` XML plain text. **Direct requirement for this project
+(channel)**: any channel provider that creates an agent with `ctx.agents.create()` must
+resolve + record + mount the preset in order to inherit the host's default capabilities; with
+no roster (`ctx.get('agentPresets')` empty) it degrades to the host's global layer.
 
 ---
 
-## 6. 会话日志与 SessionEventMap
+## 6. Session log and SessionEventMap
 
-源码：`dsh-session/lib/types/types.d.ts`、`dsh-session/lib/types/index.d.ts`。
+Source: `dsh-session/lib/types/types.d.ts`, `dsh-session/lib/types/index.d.ts`.
 
-- `Session`：一份类型化 `SessionEvent` 的**仅追加日志**（唯一真源）。`deriveMessages()`
-  从中投影 LLM 消息历史，不单独存历史。
-- 信封（rc.6）：**按 `type` 判别的联合**，不是独立的 `type`/`data` 联合：
+- `Session`: an **append-only log** of typed `SessionEvent`s (single source of truth).
+  `deriveMessages()` projects the LLM message history from it — history is not stored
+  separately.
+- The envelope (rc.6): **a union discriminated by `type`**, not a separate `type`/`data`
+  union:
   ```ts
   type SessionEvent<T = SessionEventType> = {
     [K in SessionEventType]: {
@@ -330,70 +370,77 @@ XML 纯文本吐出来。**对本项目（channel）的直接要求**：任何�
     } & (K extends SurfaceEventType ? { sourceEventSeqs?: number[]; surfaceOp?: SurfaceOp } : object)
   }[T]
   ```
-- `SessionEventType = keyof SessionEventMap`；插件经
+- `SessionEventType = keyof SessionEventMap`; plugins extend it via merging through
   **`declare module '@deepseek-ai/dsh-session/types' { interface SessionEventMap { … } }`**
-  归并扩展（`dsh-user-approval` 的 `approval/asked|decided|policy` 是现成范例）。
-- `SurfaceEventType = 'user/message' | 'assistant/message' | 'tool/result'`——**只有这三类
-  能携带 `surfaceOp`/`sourceEventSeqs`、也只有它们派生模型历史**。
-- rc.6 的 `SessionEventMap` 变体（dsh-session）：`turn/start`、`turn/end`、`step/start`、
-  `step/end`、`user/message`、`assistant/chunk`、`assistant/message`、`tool/call`、
-  `tool/result`、`todo/write`、`request/header`、`request/context`、`session/end-seed`。
-  扩展：`agent/inbox/spliced`（dsh-agent）、`approval/asked|decided|policy`（dsh-user-approval）。
-  > master 文档还列了 `steering/message`，rc.6 **没有**；rc.6 的 steering/注入落在
-  > inbox 里，认领后以 `user/message`（`source` 区分）落日志。
+  (`dsh-user-approval`'s `approval/asked|decided|policy` is the ready-made example).
+- `SurfaceEventType = 'user/message' | 'assistant/message' | 'tool/result'` — **only these
+  three can carry `surfaceOp`/`sourceEventSeqs`, and only they derive model history**.
+- rc.6's `SessionEventMap` variants (dsh-session): `turn/start`, `turn/end`, `step/start`,
+  `step/end`, `user/message`, `assistant/chunk`, `assistant/message`, `tool/call`,
+  `tool/result`, `todo/write`, `request/header`, `request/context`, `session/end-seed`.
+  Extensions: `agent/inbox/spliced` (dsh-agent), `approval/asked|decided|policy`
+  (dsh-user-approval).
+  > The master docs also list `steering/message`, which rc.6 **does not have**; in rc.6,
+  > steering/injection lands in the inbox and, once claimed, is logged as `user/message`
+  > (distinguished by `source`).
 
-- `ctx.sessions`（`SessionStore extends Service`，`index.d.ts:290`）：
-  `create(id?, options?)` / `prepare` + `enter` + `announce`（有序复合 effect 用）/
-  `get(id)` / `list()` / `fork(source, boundary?, childSessionId?)` / `flush(session)`。
-  - `fork` 拒绝码（`SessionForkErrorCode`）：`SESSION_NOT_FOUND` / `SESSION_NOT_LIVE` /
-    `SESSION_ALREADY_EXISTS` / `INVALID_BOUNDARY` / `OPEN_TURN`。
-- `session/event`（`index.d.ts:66`）：**emit、post-commit、fire-and-forget**；
-  `(this: Scoped<Session>, session, event)`；observer 失败被包含，不影响已提交的 append。
-- `session/flush`（`index.d.ts:75`）：**parallel** 持久化检查点（无 veto）。
-- `TurnEndReasonMap`（`types.d.ts:135`）：`completed | aborted(reason) | blocked |
-  error(error) | max-tokens | interrupted`。
+- `ctx.sessions` (`SessionStore extends Service`, `index.d.ts:290`):
+  `create(id?, options?)` / `prepare` + `enter` + `announce` (for ordered composite effects) /
+  `get(id)` / `list()` / `fork(source, boundary?, childSessionId?)` / `flush(session)`.
+  - `fork` rejection codes (`SessionForkErrorCode`): `SESSION_NOT_FOUND` / `SESSION_NOT_LIVE` /
+    `SESSION_ALREADY_EXISTS` / `INVALID_BOUNDARY` / `OPEN_TURN`.
+- `session/event` (`index.d.ts:66`): **emit, post-commit, fire-and-forget**;
+  `(this: Scoped<Session>, session, event)`; observer failures are contained and do not
+  affect the already-committed append.
+- `session/flush` (`index.d.ts:75`): **parallel** persistence checkpoint (no veto).
+- `TurnEndReasonMap` (`types.d.ts:135`): `completed | aborted(reason) | blocked |
+  error(error) | max-tokens | interrupted`.
 
 ---
 
-## 7. 全仓通用类型模式
+## 7. Repo-wide common type patterns
 
-### 7.1 `…Map → derived-union`（声明合并扩展）
+### 7.1 `…Map → derived-union` (declaration-merging extension)
 
 ```ts
 interface ThingMap { 'a': { kind: 'a' }; 'b': { kind: 'b' } }
-type Thing = ThingMap[keyof ThingMap]           // 判别联合
+type Thing = ThingMap[keyof ThingMap]           // discriminated union
 declare module '@deepseek-ai/dsh-llm' { interface ThingMap { 'c': { kind: 'c' } } }
 ```
 
-rc.6 的规范 map（本项目会扩展 `MessageSourceMap`）：
-- dsh-llm：`ContentBlockMap`、`MessageSourceMap`、`FinishReasonMap`（另有 `ModelModalityMap`）
-- dsh-session：`TurnEndReasonMap`、`SessionEventMap`
+The canonical maps in rc.6 (this project will extend `MessageSourceMap`):
+- dsh-llm: `ContentBlockMap`, `MessageSourceMap`, `FinishReasonMap` (plus `ModelModalityMap`)
+- dsh-session: `TurnEndReasonMap`, `SessionEventMap`
 
-消费方 switch 两个大判别联合：`StreamChunk`（流协议）与 `SessionEvent`（日志条目）。
-**约定 switch 标签、不用链式 if**，拼错标签编译失败。
+Consumers switch over two big discriminated unions: `StreamChunk` (the stream protocol) and
+`SessionEvent` (the log entry). **By convention, switch on the tag and never use chained
+ifs** — a mistyped tag fails to compile.
 
-`MessageSourceMap`（`dsh-llm/lib/types/message.d.ts:94`）现状：
-`user | plugin | model | tool`；`MessageSource = MessageSourceMap[keyof MessageSourceMap]`。
-本项目加 `channel` 变体即对齐此扩展点（见设计 §3.1）。
+`MessageSourceMap` (`dsh-llm/lib/types/message.d.ts:94`) as it stands:
+`user | plugin | model | tool`; `MessageSource = MessageSourceMap[keyof MessageSourceMap]`.
+Adding a `channel` variant in this project aligns with this extension point (see design
+§3.1).
 
 ### 7.2 Branded id
 
-`Branded<B>` 原语在纯类型包 `dsh-brand`（零运行时、零依赖）。结构是字符串，类型层面
-不可互换。核心 id：`SessionId`（dsh-session）、`CallId`（dsh-llm），另有
-`CredentialRef`（dsh-credentials）、`ApprovalRequestId`（dsh-user-approval）、
-`MessageId`/`ProviderRequestId`（dsh-llm）。
+The `Branded<B>` primitive lives in the pure-type package `dsh-brand` (zero runtime, zero
+dependencies). Structurally a string, but not interchangeable at the type level. Core ids:
+`SessionId` (dsh-session), `CallId` (dsh-llm), plus `CredentialRef` (dsh-credentials),
+`ApprovalRequestId` (dsh-user-approval), `MessageId`/`ProviderRequestId` (dsh-llm).
 
 ---
 
-## 8. 与本项目设计的对齐核对
+## 8. Alignment check against this project's design
 
-`dsh-channel-design.md` §1.1/§1.2 与 R1–R10（现见 design §6）的**逐条核对**
-（每条附 rc.6 源码行号）见 `dsh-core-alignment-audit.md`。
+The **item-by-item check** of `dsh-channel-design.md` §1.1/§1.2 and R1–R10 (now design §6) —
+each entry with its rc.6 source line numbers — is in `dsh-core-alignment-audit.md`.
 
-摘要结论：
-- **`ChannelRegistry`(core) + `Channel`(普通抽象类 seam) 的拆分、`ctx.llm`/`LlmAdapter`
-  的对照、`approval/request` 的降级语义、`ctx.credentials.resolve`、`ctx.sessions.fork`、
-  `session/event` 与 `SessionEventMap` 扩展点——全部与 rc.6 源码逐字对齐。**
-- 需要修正/补精的两处：`SessionEvent` 是**按 type 判别的联合**（表面事件才带
-  `surfaceOp`/`sourceEventSeqs`）；`registerAdapter` 返回的是**可调用 disposer +
-  `.replace()`** 的 handle（不是 `{ dispose }` 对象）。详见 audit 文档。
+Summary conclusion:
+- **The `ChannelRegistry`(core) + `Channel` (plain abstract-class seam) split, the mapping to
+  `ctx.llm`/`LlmAdapter`, the degradation semantics of `approval/request`,
+  `ctx.credentials.resolve`, `ctx.sessions.fork`, the `session/event` and `SessionEventMap`
+  extension points — all align word-for-word with the rc.6 source.**
+- Two spots need correction/refinement: `SessionEvent` is **a union discriminated by type**
+  (only surface events carry `surfaceOp`/`sourceEventSeqs`); `registerAdapter` returns a
+  handle that is a **callable disposer + `.replace()`** (not a `{ dispose }` object). See the
+  audit document for details.

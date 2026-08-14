@@ -59,13 +59,13 @@ interface AgentPresetJoin {
   mount?: (agentCtx: Context) => Promise<void>
 }
 
-/** dsh-agent-presets 的最小鸭子类型（可选依赖，不 import 包）。 */
+/** Minimal duck type of dsh-agent-presets (optional dependency; the package is not imported). */
 interface AgentPresetsLike {
   resolve: (id?: string) => Promise<{ id: string }>
   mount: (agentCtx: Context, id?: string) => Promise<unknown>
 }
 
-/** dsh-user-questions 的最小鸭子类型（可选依赖，不 import 包）。 */
+/** Minimal duck type of dsh-user-questions (optional dependency; the package is not imported). */
 interface UserQuestionsLike {
   registerProvider(provider: UserQuestionProviderLike): () => void
 }
@@ -150,7 +150,7 @@ export class WeChatBridge {
       try {
         disposer()
       } catch {
-        // 忽略 listener disposer 错误。
+        // Ignore listener disposer errors.
       }
     }
 
@@ -171,7 +171,7 @@ export class WeChatBridge {
       try {
         await handle.dispose()
       } catch {
-        // agent 可能已被其他 fiber 释放。
+        // The agent may already have been released by another fiber.
       }
       this.ownedHandles.delete(sessionId)
     }
@@ -179,7 +179,7 @@ export class WeChatBridge {
     await this.store.flush()
   }
 
-  // ---- 启动恢复 ----
+  // ---- Startup recovery ----
 
   private async restore(): Promise<void> {
     const now = Date.now()
@@ -195,7 +195,7 @@ export class WeChatBridge {
       try {
         await this.ensureAgent(sessionId, chatKey, false)
       } catch {
-        // 恢复失败不阻塞渠道启动；首条消息会再试 create。
+        // Recovery failure does not block channel startup; the first message retries create.
       }
     }
 
@@ -237,7 +237,7 @@ export class WeChatBridge {
         this.store.markFailed(item.key, `recovery: empty assistant message ${item.key}`)
         continue
       }
-      const marker = item.state === 'pending' ? '' : '（恢复重发，可能重复）\n'
+      const marker = item.state === 'pending' ? '' : '(resumed resend, may duplicate)\n'
       try {
         await this.sendOutbound(item.chatKey, marker + text, item.key, { origin: { sessionId, seq }, recover: item.state })
       } catch (error) {
@@ -246,7 +246,7 @@ export class WeChatBridge {
     }
   }
 
-  // ---- 轮询 ----
+  // ---- Polling ----
 
   private startPolling(): void {
     this.pollAbort = new AbortController()
@@ -302,7 +302,7 @@ export class WeChatBridge {
   private async processMessage(message: WeixinMessage): Promise<void> {
     const accountId = (await this.resolveAccountId()) ?? ''
     const sender = senderId(message)
-    // 自消息防回环（hermes：sender_id == account_id）。
+    // Self-message loopback guard (hermes: sender_id == account_id).
     if (!sender || sender === accountId || message.msg_type === 2) return
 
     const chatType = chatTypeOf(message, accountId)
@@ -310,7 +310,7 @@ export class WeChatBridge {
     const messageId = String(message.message_id ?? message.client_id ?? '')
     if (!chatKey) return
 
-    // 群聊 v1 不路由，但事实照发（策略插件审计可用）。
+    // Group chats are not routed in v1, but facts are still emitted (usable for policy-plugin auditing).
     if (chatType !== 'direct') {
       this.ingest(message, chatKey, 'group')
       return
@@ -318,18 +318,18 @@ export class WeChatBridge {
 
     const allowed = this.config.allowedUserIds.includes(sender)
     if (!allowed) {
-      await this.sendLocal(chatKey, '⚠️ 你没有权限使用本机器人。')
+      await this.sendLocal(chatKey, '⚠️ You are not authorized to use this bot.')
       return
     }
 
     if (messageId && this.store.seenInbound(messageId)) return
 
-    // context_token 回显 + typing ticket 预热（hermes ContextTokenStore / _maybe_fetch_typing_ticket）。
+    // context_token echo + typing ticket warm-up (hermes ContextTokenStore / _maybe_fetch_typing_ticket).
     const contextToken = message.context_token
     if (contextToken) this.client.setContextToken(chatKey, contextToken)
     void this.warmTypingTicket(chatKey, contextToken)
 
-    // 审批/提问应答优先于 merge/router（openclaw 控制命令铁律）。
+    // Approval/prompt answers take priority over merge/router (openclaw control-command iron rule).
     const activePending = [...this.pendingApprovals.values()]
     const approvalReply = parseApprovalReply({ text: messageText(message) }, activePending)
     if (approvalReply.kind === 'answer') {
@@ -392,7 +392,7 @@ export class WeChatBridge {
       const { typingTicket } = await this.client.getConfig(token, chatKey, { contextToken })
       if (typingTicket) this.typingTickets.set(chatKey, typingTicket)
     } catch {
-      // ticket 拿不到就降级为不打 typing。
+      // If the ticket cannot be obtained, degrade to not sending typing.
     }
   }
 
@@ -431,7 +431,7 @@ export class WeChatBridge {
       if (effect.kind === 'armTimer') {
         this.armMergeTimer(chatKey, effect.at)
       } else if (effect.kind === 'ack-long') {
-        await this.sendLocal(chatKey, '收到，处理中…')
+        await this.sendLocal(chatKey, 'Received, working on it…')
       } else if (effect.kind === 'flush') {
         const ids = this.mergeMessageIds.get(chatKey) ?? []
         const senderId = this.mergeSenderIds.get(chatKey) ?? ''
@@ -472,7 +472,7 @@ export class WeChatBridge {
     await this.handleMergeEffects(chatKey, result.state, result.effects)
   }
 
-  // ---- 路由与投递 ----
+  // ---- Routing and delivery ----
 
   private routeContext() {
     return {
@@ -498,7 +498,7 @@ export class WeChatBridge {
 
     const agent = await this.ensureAgent(decision.sessionId, chatKey, decision.create)
     if (!agent) {
-      await this.sendLocal(chatKey, '⚠️ 无法创建或恢复会话。')
+      await this.sendLocal(chatKey, '⚠️ Could not create or resume the session.')
       return
     }
 
@@ -582,7 +582,7 @@ export class WeChatBridge {
         }),
       })
     } catch {
-      // systemPrompt 是可选依赖，缺失/异常都不阻塞 agent 创建。
+      // systemPrompt is an optional dependency; its absence or failure does not block agent creation.
     }
     this.registerUserQuestionsProvider(agentCtx)
     if (mount !== undefined) {
@@ -596,7 +596,7 @@ export class WeChatBridge {
     try {
       userQuestions.registerProvider({ ask: (request) => this.askUserQuestions(request) })
     } catch {
-      // 单槽冲突：本作用域已有 provider，不抢、不阻塞 agent 创建。
+      // Single-slot conflict: this scope already has a provider; do not steal it or block agent creation.
     }
   }
 
@@ -692,11 +692,11 @@ export class WeChatBridge {
     try {
       await this.ctx.channels.deliver(out)
     } catch {
-      // 提示发送失败：answerer 超时后 fail-closed（空回答），绝不默认放行。
+      // Prompt send failure: the answerer fail-closes (empty answer) after timeout; never allow by default.
     }
   }
 
-  // ---- 出站 ----
+  // ---- Outbound ----
 
   private onSessionEvent(session: Session, event: SessionEvent): void {
     const chatKey = this.sessionChatKeys.get(session.id)
@@ -711,7 +711,7 @@ export class WeChatBridge {
       }
     } else if (event.type === 'turn/end' && event.data.reason.kind !== 'completed') {
       const label = turnEndLabel(event.data.reason.kind)
-      void this.sendLocal(chatKey, `⏹ 本轮结束：${label}`).catch(() => {})
+      void this.sendLocal(chatKey, `⏹ Turn ended: ${label}`).catch(() => {})
     }
   }
 
@@ -767,7 +767,7 @@ export class WeChatBridge {
     }
   }
 
-  // ---- 命令 ----
+  // ---- Commands ----
 
   private async handleCommand(commandText: string, chatKey: string): Promise<void> {
     const match = /^\/([^\s@]+)\s*(.*)$/.exec(commandText)
@@ -775,37 +775,37 @@ export class WeChatBridge {
     const args = (match?.[2] ?? '').trim()
 
     if (command === 'start' || command === 'help') {
-      await this.sendLocal(chatKey, '可用命令：\n/start - 开始使用\n/new - 新建会话\n/status - 会话状态\n/bind <sessionId> - 绑定会话\n/help - 帮助')
+      await this.sendLocal(chatKey, 'Available commands:\n/start - Start\n/new - New session\n/status - Session status\n/bind <sessionId> - Bind session\n/help - Help')
       return
     }
     if (command === 'new') {
       const sessionId = `channel:wechat:${chatKey}:${Date.now()}`
       this.store.setBinding(chatKey, sessionId)
       this.sessionChatKeys.set(sessionId, chatKey)
-      await this.sendLocal(chatKey, `✅ 已创建新会话：${sessionId}`)
+      await this.sendLocal(chatKey, `✅ New session created: ${sessionId}`)
       return
     }
     if (command === 'bind') {
       if (!args) {
-        await this.sendLocal(chatKey, '用法：/bind <sessionId>')
+        await this.sendLocal(chatKey, 'Usage: /bind <sessionId>')
         return
       }
       this.store.setBinding(chatKey, args)
       this.sessionChatKeys.set(args, chatKey)
-      await this.sendLocal(chatKey, `✅ 已绑定会话：${args}`)
+      await this.sendLocal(chatKey, `✅ Session bound: ${args}`)
       return
     }
     if (command === 'status') {
       const binding = this.store.bindings()[chatKey]
       const sessionId = binding ?? `channel:wechat:${chatKey}`
       const agent = this.ctx.agents.get(SessionId(sessionId))
-      await this.sendLocal(chatKey, agent ? `会话 ${sessionId} 状态：${agent.status}` : `会话 ${sessionId} 未在运行。`)
+      await this.sendLocal(chatKey, agent ? `Session ${sessionId} status: ${agent.status}` : `Session ${sessionId} is not running.`)
       return
     }
-    await this.sendLocal(chatKey, `未知命令：${command}，使用 /help 查看帮助。`)
+    await this.sendLocal(chatKey, `Unknown command: ${command}. Use /help for help.`)
   }
 
-  // ---- 审批 ----
+  // ---- Approval ----
 
   private onApprovalRequest = async (req: import('@deepseek-ai/dsh-user-approval').ApprovalRequest, next: () => Promise<import('@deepseek-ai/dsh-user-approval').ApprovalOutcome>): Promise<import('@deepseek-ai/dsh-user-approval').ApprovalOutcome> => {
     const chatKey = this.sessionChatKeys.get(req.agent.id)
@@ -867,7 +867,7 @@ export class WeChatBridge {
     try {
       await this.ctx.channels.deliver(out)
     } catch {
-      // 审批提示发送失败时，answerer 超时后 next()；绝不默认放行。
+      // When the approval prompt fails to send, the answerer calls next() after timeout; never allow by default.
     }
   }
 
@@ -916,15 +916,15 @@ function assistantMessageText(message: unknown): string {
 function turnEndLabel(kind: string): string {
   switch (kind) {
     case 'aborted':
-      return '已中止'
+      return 'Aborted'
     case 'blocked':
-      return '已阻塞'
+      return 'Blocked'
     case 'error':
-      return '出错'
+      return 'Error'
     case 'max-tokens':
-      return '达到 token 上限'
+      return 'Max tokens'
     case 'interrupted':
-      return '已中断'
+      return 'Interrupted'
     default:
       return kind
   }

@@ -15,13 +15,13 @@ export type MergeEffect =
   | { kind: 'armTimer'; at: number }
 
 export interface MergeOptions {
-  /** 去抖窗口，默认 5000ms */
+  /** Debounce window, default 5000ms */
   windowMs?: number
-  /** 超过该长度（码点）的普通文本先回 ack-long，默认 4000 */
+  /** Plain text longer than this (code points) first gets an ack-long, default 4000 */
   ackLongChars?: number
-  /** 续等后缀，默认 '..' */
+  /** Continue-waiting suffix, default '..' */
   continueSuffix?: string
-  /** 立即 flush 后缀，默认 '!!' */
+  /** Immediate flush suffix, default '!!' */
   flushSuffix?: string
 }
 
@@ -38,7 +38,7 @@ export function mergeReduce(state: MergeState, input: MergeInput, opts: MergeOpt
   const { text, hasMedia, isCommand, now } = input
   const effects: MergeEffect[] = []
 
-  // 命令永不入缓冲，立即旁路（stop/审批不能被去抖延迟）。
+  // Commands never enter the buffer; they bypass immediately (stop/approval must not be delayed by debouncing).
   if (isCommand) {
     if (state.buffer.length > 0) {
       effects.push({ kind: 'flush', text: state.buffer.join('\n') })
@@ -47,7 +47,7 @@ export function mergeReduce(state: MergeState, input: MergeInput, opts: MergeOpt
     return { state: emptyMergeState, effects }
   }
 
-  // 带媒体的消息立即 flush 当前缓冲并单独交付（附件不与文本批合并）。
+  // Messages with media immediately flush the current buffer and are delivered separately (attachments are not merged into the text batch).
   if (hasMedia) {
     if (state.buffer.length > 0) {
       effects.push({ kind: 'flush', text: state.buffer.join('\n') })
@@ -57,11 +57,11 @@ export function mergeReduce(state: MergeState, input: MergeInput, opts: MergeOpt
   }
 
   if (text.trim() === '') {
-    // 空文本不合并，也不影响窗口。
+    // Empty text is not merged and does not affect the window.
     return { state, effects }
   }
 
-  // 长输入先回"收到，处理中"（如果消费方启用）。
+  // A long input first gets an ack ("received, processing") if the consumer enables it.
   if ([...text].length >= ackLongChars) {
     effects.push({ kind: 'ack-long' })
   }
@@ -69,7 +69,7 @@ export function mergeReduce(state: MergeState, input: MergeInput, opts: MergeOpt
   const endsWith = (suffix: string) => suffix.length > 0 && text.endsWith(suffix)
 
   if (endsWith(continueSuffix)) {
-    // `..` 后缀 = 继续等（重置窗口），后缀从投递文本中剥掉。
+    // A `..` suffix = keep waiting (reset the window); the suffix is stripped from the delivered text.
     const stripped = text.slice(0, -continueSuffix.length).trimEnd()
     const buffer = stripped === '' ? state.buffer : [...state.buffer, stripped]
     const deadline = now + windowMs
@@ -78,7 +78,7 @@ export function mergeReduce(state: MergeState, input: MergeInput, opts: MergeOpt
   }
 
   if (endsWith(flushSuffix)) {
-    // `!!` 后缀 = 立即 flush；后缀从投递文本中剥掉。
+    // A `!!` suffix = flush immediately; the suffix is stripped from the delivered text.
     const stripped = text.slice(0, -flushSuffix.length).trimEnd()
     const buffer = stripped === '' ? state.buffer : [...state.buffer, stripped]
     const flushText = buffer.join('\n')
@@ -98,7 +98,7 @@ function onTick(state: MergeState, now: number): { state: MergeState; effects: M
     const text = state.buffer.join('\n')
     return { state: emptyMergeState, effects: text.trim() === '' ? [] : [{ kind: 'flush', text }] }
   }
-  // 早到的 tick：重新请求在 deadline 时刻唤醒。
+  // Early tick: re-request a wakeup at the deadline.
   if (state.deadline !== undefined) {
     return { state, effects: [{ kind: 'armTimer', at: state.deadline }] }
   }

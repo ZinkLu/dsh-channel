@@ -50,7 +50,7 @@ test('WeChatChannel.send echoes context token for the peer', async () => {
       return this.tokens[chatKey]
     },
     async sendMessage(_token: string, chatKey: string, text: string, opts?: { contextToken?: string }): Promise<{ client_id: string }> {
-      // 镜像真实 WeixinClient：opts.contextToken 缺省时内部查 peer token。
+      // Mirror the real WeixinClient: look up the peer token internally when opts.contextToken is absent.
       const contextToken = opts?.contextToken ?? this.contextToken(chatKey)
       sends.push({ chatKey, text, contextToken })
       return { client_id: `id-${sends.length}` }

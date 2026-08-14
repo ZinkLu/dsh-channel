@@ -21,7 +21,7 @@ test('FeishuClient requests and caches tenant_access_token', async () => {
 
   const token = await client.getTenantAccessToken({ appId: 'cli_a', appSecret: 'secret_b' })
   assert.equal(token, 't-123')
-  // 再次取应命中缓存（不再请求）。
+  // Fetching again should hit the cache (no further request).
   await client.getTenantAccessToken({ appId: 'cli_a', appSecret: 'secret_b' })
   assert.equal(tokenRequests, 1)
 })

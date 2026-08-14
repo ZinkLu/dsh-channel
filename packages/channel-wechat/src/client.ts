@@ -1,14 +1,15 @@
 import { randomBytes } from 'node:crypto'
 
 /**
- * WeChat (微信) iLink Bot API client.
+ * WeChat (WeChat) iLink Bot API client.
  *
- * 微信没有 Telegram 那样的公共 Bot API；hermes 的 weixin adapter 使用腾讯的
- * **iLink Bot API**（`https://ilinkai.weixin.qq.com`），用 `getupdates` 长轮询
- * 拉取入站消息——因此与 Telegram 的 `getUpdates` 几乎一一对应，桥接层可以完全复用
- * 同一套编排（merge / route / approval / ledger），只换 transport 与能力事实。
+ * WeChat has no public Bot API like Telegram's; hermes' weixin adapter uses Tencent's
+ * **iLink Bot API** (`https://ilinkai.weixin.qq.com`), long-polling inbound messages
+ * with `getupdates` — hence it maps almost one-to-one to Telegram's `getUpdates`, and
+ * the bridge can fully reuse the same orchestration (merge / route / approval / ledger),
+ * swapping only the transport and capability facts.
  *
- * 参考：NousResearch/hermes-agent `gateway/platforms/weixin.py`（iLink Bot API）。
+ * Reference: NousResearch/hermes-agent `gateway/platforms/weixin.py` (iLink Bot API).
  */
 
 export const DEFAULT_BASE_URL = 'https://ilinkai.weixin.qq.com'
@@ -47,7 +48,7 @@ export interface WeixinItem {
   video_item?: { media?: WeixinMediaRef }
 }
 
-/** 平台无关的媒体事实（与 dsh-channel 的 InboundMedia 同构，客户端不依赖契约包）。 */
+/** Platform-independent media facts (isomorphic to dsh-channel's InboundMedia; the client does not depend on the contract package). */
 export interface WeixinMedia {
   kind: 'image' | 'document' | 'audio' | 'video'
   fileRef: string
@@ -106,7 +107,7 @@ export class WeixinClient {
   private readonly baseUrl: string
   private readonly fetchImpl: typeof fetch
   private readonly timeoutMs: number
-  /** peer chatKey → 最近一次入站的 context_token（hermes ContextTokenStore 的内存版）。 */
+  /** peer chatKey → most recent inbound context_token (an in-memory version of hermes ContextTokenStore). */
   private readonly contextTokens = new Map<string, string>()
 
   constructor(opts: WeixinClientOptions = {}) {
@@ -120,7 +121,7 @@ export class WeixinClient {
     return text.split(token).join('<redacted>')
   }
 
-  /** 入站时把 peer 的 context_token 记下，出站回复时回显以保证会话连续。 */
+  /** Record the peer's context_token on inbound and echo it on outbound replies to keep the session continuous. */
   setContextToken(chatKey: string, token: string | undefined): void {
     if (token) this.contextTokens.set(chatKey, token)
   }
@@ -173,7 +174,7 @@ export class WeixinClient {
     }, { timeoutMs: 10_000, signal })
   }
 
-  /** 拉取 peer 的 typing ticket（sendtyping 需要；hermes 的 `_get_config` 同款）。 */
+  /** Fetch the peer's typing ticket (required by sendtyping; same as hermes' `_get_config`). */
   async getConfig(
     token: string,
     chatKey: string,
@@ -253,7 +254,7 @@ export function chatTypeOf(message: WeixinMessage, accountId: string): 'direct' 
   const roomId = String(message.room_id ?? message.chat_room_id ?? '').trim()
   if (roomId) return 'group'
   const toUserId = String(message.to_user_id ?? '').trim()
-  // hermes _guess_chat_type：to_user_id 非自己且是用户消息时视为群聊。
+  // hermes _guess_chat_type: treat as a group chat when to_user_id is not self and it is a user message.
   if (toUserId && accountId && toUserId !== accountId && message.msg_type === MSG_TYPE_USER) return 'group'
   return 'direct'
 }
@@ -274,7 +275,7 @@ export function hasMedia(message: WeixinMessage): boolean {
   return (message.item_list ?? []).some((item) => item.type !== undefined && item.type !== ITEM_TEXT)
 }
 
-/** 入站媒体事实（fileRef 为 iLink CDN 引用；v1 不下载字节，仅交接）。 */
+/** Inbound media facts (fileRef is an iLink CDN reference; v1 does not download bytes, only hands them over). */
 export function mediaFacts(message: WeixinMessage): WeixinMedia[] {
   const facts: WeixinMedia[] = []
   for (const item of message.item_list ?? []) {

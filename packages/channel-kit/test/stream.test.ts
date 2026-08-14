@@ -30,7 +30,7 @@ test('progress mode gates the draft behind the timer', () => {
   s = r.state
   r = streamReduce(s, { kind: 'tool-call', callId: 'c', name: 'Bash', arguments: '{"command":"npm test"}' }, progressCaps, 100)
   s = r.state
-  // 门控未触发：只排定时器，不建草稿。
+  // Gate not triggered: only arm the timer, no draft yet.
   assert.deepEqual(r.frames, [{ kind: 'arm-timer', at: 1600 }])
   assert.equal(s.draftStarted, false)
 

@@ -18,35 +18,35 @@ export interface RecoverableDelivery {
 }
 
 export interface ChannelStore {
-  // 入站去重（环形上限）
+  // inbound dedupe (ring cap)
   seenInbound(messageId: string): boolean
   markInbound(messageId: string): void
-  // merge 崩溃恢复
+  // merge crash recovery
   setMergeBuffer(chatKey: string, buffer: readonly string[]): void
   mergeBuffers(): Readonly<Record<string, readonly string[]>>
-  // 显式绑定（/bind 例外路径）
+  // explicit binding (/bind exception path)
   setBinding(chatKey: string, sessionId: string | undefined): void
   bindings(): Readonly<Record<string, string>>
-  // 出站 ledger
+  // outbound ledger
   recordDelivery(key: string, out: { chatKey: string; textHash: string }): void
   markAttempting(key: string): void
   markDelivered(key: string, platformMessageIds: readonly string[]): void
   markFailed(key: string, error: string): void
-  /** 启动时回收：pending=直接重投；attempting/failed=重投但带"恢复重发"标记；超限→abandoned */
+  /** Reclaim at startup: pending = redeliver directly; attempting/failed = redeliver with a "recovery resend" marker; over the limit → abandoned */
   sweepRecoverable(): Array<RecoverableDelivery>
   flush(): Promise<void>
 }
 
 export interface MemoryStoreOptions {
-  /** seen 环上限；默认 1000 */
+  /** seen ring cap; default 1000 */
   seenLimit?: number
-  /** 环裁剪时保留的条数；默认 500 */
+  /** entries to keep when trimming the ring; default 500 */
   seenTrimTo?: number
-  /** delivery 最大尝试次数；超过 sweep 时转 abandoned */
+  /** max delivery attempts; beyond this, sweep turns it abandoned */
   maxAttempts?: number
 }
 
-/** 单测与无持久化场景用的内存实现。纯数据操作 + 显式 flush。 */
+/** In-memory implementation for unit tests and non-persistent scenarios. Pure data operations + explicit flush. */
 export function createMemoryStore(opts: MemoryStoreOptions = {}): ChannelStore {
   const seenLimit = opts.seenLimit ?? 1000
   const seenTrimTo = opts.seenTrimTo ?? 500

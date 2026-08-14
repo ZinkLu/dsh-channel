@@ -36,7 +36,7 @@ test('memory store delivery ledger state machine and sweep', () => {
 
   store.markAttempting('k1')
   recoverable = store.sweepRecoverable()
-  // attempts now 2，sweep 应转 abandoned
+  // attempts now 2, sweep should turn it abandoned
   assert.equal(recoverable.length, 0)
 })
 

@@ -1,5 +1,5 @@
-# dsh-channel-feishu 装配示例（飞书 / Lark，长连接模式，无需公网地址）。
-# 注意：若宿主 harness 已加载 dsh-channel（注册表核心）或已由 bundle 自动加载，删除下面第一条 insert 即可。
+# dsh-channel-feishu wiring example (Feishu / Lark, long-connection mode, no public address required).
+# Note: if the host harness already loads dsh-channel (the registry core) or a bundle loads it automatically, delete the first insert below.
 - insert:
     - id: channel
       name: dsh-channel
@@ -7,9 +7,9 @@
     - id: channel-feishu
       name: dsh-channel-feishu
       config:
-        allowedUserIds: []           # 飞书用户 open_id（ou_ 开头）；收到私聊后从日志读 open_id 再填
+        allowedUserIds: []           # Feishu user open_id (starting with ou_); after receiving a DM, read the open_id from logs and fill it in
         provider: deepseek-official
         model: deepseek-v4-flash
-        # domain 不设 = feishu；Lark 国际版设 domain: lark
-        # cwd / agentPreset 不设 = 沿用宿主 process.cwd() + 宿主默认 preset。
-# 凭据不在此文件：dsh credentials set FEISHU_APP_ID / FEISHU_APP_SECRET（或环境变量）。
+        # domain unset = feishu; set domain: lark for Lark international
+        # cwd / agentPreset unset = inherit the host process.cwd() + host default preset.
+# Credentials are not in this file: dsh credentials set FEISHU_APP_ID / FEISHU_APP_SECRET (or environment variables).

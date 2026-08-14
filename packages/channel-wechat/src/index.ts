@@ -12,9 +12,9 @@ export const name = 'dsh-channel-wechat'
 export const inject = ['channels', 'agents', 'credentials'] as const
 
 export interface WeChatConfig {
-  /** 允许使用机器人的微信 user id（iLink 侧 from_user_id）。必填、无宽松默认。 */
+  /** WeChat user ids allowed to use the bot (iLink-side from_user_id). Required; no lenient default. */
   allowedUserIds: string[]
-  /** iLink bot 账号 id；不设则从凭据 WECHAT_ACCOUNT_ID 读取。 */
+  /** iLink bot account id; when unset, read from the WECHAT_ACCOUNT_ID credential. */
   accountId?: string
   provider: string
   model?: string

@@ -198,7 +198,7 @@ export class TelegramClient {
     return this.callApi(token, 'deleteMessage', { chat_id: chatId, message_id: messageId }, signal)
   }
 
-  /** 取 file_id 对应的文件字节（getFile 拿 file_path → 从 file 端点下载）。 */
+  /** Fetch the file bytes for a file_id (getFile returns file_path → download from the file endpoint). */
   async getFile(token: string, fileId: string, signal?: AbortSignal): Promise<{ bytes: Uint8Array; filePath: string }> {
     const file = await this.callApi<TelegramFile>(token, 'getFile', { file_id: fileId }, signal)
     if (!file.file_path) throw new TelegramApiError(TelegramClient.redactToken('telegram getFile returned no file_path', token))
@@ -219,7 +219,7 @@ export class TelegramClient {
     }
   }
 
-  /** 上传并发送一张图片（multipart/form-data）。 */
+  /** Upload and send an image (multipart/form-data). */
   async sendPhoto(
     token: string,
     chatId: string,
@@ -229,7 +229,7 @@ export class TelegramClient {
     return this.callApiMultipart<TelegramMessage>(token, 'sendPhoto', chatId, 'photo', photo, opts.fileName ?? 'photo.jpg', 'image/jpeg', opts.caption, opts.signal)
   }
 
-  /** 上传并发送一个文档（multipart/form-data）。 */
+  /** Upload and send a document (multipart/form-data). */
   async sendDocument(
     token: string,
     chatId: string,
