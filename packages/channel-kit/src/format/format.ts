@@ -43,7 +43,7 @@ export function stripToolCallMarkup(text: string): string {
  * literal; `strict` strips everywhere. Together with `stripToolCallMarkup` this is the
  * last gate that "never leaks model-internal bytes to the user".
  */
-export function stripReasoningTags(text: string, opts: { mode?: 'strict' | 'preserve'; scope?: 'all' | 'leading' } = {}): string {
+export function stripReasoningTags(text: string, opts: { mode?: 'strict' | 'preserve' } = {}): string {
   const mode = opts.mode ?? 'strict'
   const normalized = text.replace(/\r\n?/g, '\n')
   const stripped = mode === 'preserve' ? stripOutsideFences(normalized) : stripAll(normalized)
@@ -235,7 +235,13 @@ function renderHtmlInline(line: string): string {
   let text = withCodeProtected
   text = text.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
   text = text.replace(/__([^_]+)__/g, '<b>$1</b>')
-  text = text.replace(/\[([^\]]*)\]\(([^)]+)\)/g, '<a href="$2">$1</a>')
+  // `escapeHtml` deliberately leaves `"` alone (it renders fine as body text),
+  // so the href — the one place a `"` would close the attribute and let the rest
+  // of a model-authored URL become markup — is escaped here.
+  text = text.replace(
+    /\[([^\]]*)\]\(([^)]+)\)/g,
+    (_match, label: string, href: string) => `<a href="${href.replace(/"/g, '&quot;')}">${label}</a>`,
+  )
 
   // Restore inline code.
   text = text.replace(/\u0000(\d+)\u0000/g, (_, index: string) => `<code>${codeSpans[Number(index)] ?? ''}</code>`)

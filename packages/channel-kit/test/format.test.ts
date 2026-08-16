@@ -89,3 +89,12 @@ test('stripReasoningTags is a no-op for ordinary text', () => {
   const text = 'A normal answer with `code` and [link](https://e.com)'
   assert.equal(stripReasoningTags(text), text)
 })
+
+test('html link hrefs cannot break out of the attribute', () => {
+  // The URL is model-authored text; an unescaped quote would end href="..." and
+  // turn everything after it into attributes on the anchor.
+  const html = renderForTier('[click](https://x.test/" onmouseover="steal)', 'html')
+  assert.equal(html, '<a href="https://x.test/&quot; onmouseover=&quot;steal">click</a>')
+  // No second attribute escaped from the href.
+  assert.ok(!/href="[^"]*"\s+\w+=/.test(html))
+})
