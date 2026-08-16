@@ -69,6 +69,10 @@ export interface BridgeDelivery {
   chatKey: string
   markdown: string
   origin?: OutboundMessage['origin']
+  /** Deliver without notifying the user; only honored when the provider supportsSilent. */
+  silent?: boolean
+  /** True for agent output recorded in the delivery ledger; false for local notices. */
+  ledger?: boolean
 }
 
 /** One buffered merge entry: the message text and its platform ids, kept aligned with MergeState.buffer. */
@@ -170,6 +174,8 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
   private readonly disposers: Array<() => void> = []
 
   private promptSeq = 0
+  private localSeq = 0
+  private recoverPromise: Promise<void> | undefined
   private started = false
   private channelStatus: 'connecting' | 'connected' | 'disconnected' | 'fatal' = 'disconnected'
 
@@ -196,6 +202,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
       this.channelStatus = status
       if (status === 'connected') {
         for (const resolve of this.statusWaiters.splice(0)) resolve()
+        void this.recoverOnce()
       }
     }))
 
@@ -205,11 +212,9 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     await this.connect()
     // Startup recovery only runs once the provider reached `connected`, so a
     // failed-connect boot does not burn attempts for messages never once sent.
-    if (await this.waitForConnected()) {
-      await this.recover()
-    } else {
-      this.warn('channel did not reach connected status; skipping startup recovery')
-    }
+    // A provider that connects later still triggers it from the status listener.
+    if (await this.waitForConnected()) await this.recoverOnce()
+    else this.warn('channel not connected yet; startup recovery deferred to the first connect')
   }
 
   async stop(): Promise<void> {
@@ -376,6 +381,18 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     }
   }
 
+  /**
+   * Startup recovery, exactly once per boot, whether it is `start()` or a later
+   * `connected` transition that gets there first. Both await the same promise,
+   * so a slow first connect defers recovery rather than losing it.
+   */
+  private recoverOnce(): Promise<void> {
+    this.recoverPromise ??= this.recover().catch((error: unknown) => {
+      this.warn(`startup recovery failed: ${error instanceof Error ? error.message : String(error)}`)
+    })
+    return this.recoverPromise
+  }
+
   /** Execute the recovery policy's decisions against the ledger (look up text, resend/skip/abandon). */
   private async recover(): Promise<void> {
     const recoverable = this.store.sweepRecoverable()
@@ -440,7 +457,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     }
 
     if (!this.isAllowed(senderId)) {
-      await this.sendLocal(chatKey, '⚠️ You are not authorized to use this bot.')
+      this.sendLocal(chatKey, '⚠️ You are not authorized to use this bot.')
       return
     }
 
@@ -559,7 +576,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
         // Reaction failed (decorative); fall through to the text ack.
       }
     }
-    await this.sendLocal(chatKey, 'Received, working on it…')
+    this.sendLocal(chatKey, 'Received, working on it…')
   }
 
   private armMergeTimer(chatKey: string, at: number): void {
@@ -616,7 +633,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
 
     const agent = await this.ensureAgent(decision.sessionId, chatKey, decision.create)
     if (!agent) {
-      await this.sendLocal(chatKey, '⚠️ Unable to create or resume session.')
+      this.sendLocal(chatKey, '⚠️ Unable to create or resume session.')
       return
     }
 
@@ -731,7 +748,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     if (!(await settledWithin(previous, (this.config.sessionTurnTimeoutSec ?? 120) * 1000))) {
       // Reject visibly, never run unserialized.
       done()
-      await this.sendLocal(chatKey, '⚠️ The previous turn is still running; please resend your message.')
+      this.sendLocal(chatKey, '⚠️ The previous turn is still running; please resend your message.')
       return
     }
 
@@ -953,7 +970,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
         break
       case 'turn-end':
         if (input.reason !== 'completed') {
-          void this.sendLocal(chatKey, `⏹ Turn ended: ${turnEndLabel(input.reason)}`, { silent: this.channel.supportsSilent }).catch(() => {})
+          this.sendLocal(chatKey, `⏹ Turn ended: ${turnEndLabel(input.reason)}`, { silent: this.channel.supportsSilent })
         }
         // Busy-policy queue: messages buffered behind the running turn flush on turn-end.
         void this.flushBusyQueue(sessionId).catch(() => {})
@@ -1004,7 +1021,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
         void this.finalizeDraft(chatKey, sessionId, frame.editFailed).catch(() => {})
         return
       case 'status-line':
-        void this.sendLocal(chatKey, frame.text, { silent: this.channel.supportsSilent }).catch(() => {})
+        this.sendLocal(chatKey, frame.text, { silent: this.channel.supportsSilent })
         return
       case 'arm-timer':
         this.armStreamTimer(sessionId, chatKey, frame.at)
@@ -1185,7 +1202,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
       if (!opts.recover) {
         this.store.recordDelivery(key, { chatKey, textHash: hashText(chunk) })
       }
-      this.enqueueDelivery(chatKey, { key, value: { chatKey, markdown: chunk, origin: opts.origin } })
+      this.enqueueDelivery(chatKey, { key, value: { chatKey, markdown: chunk, origin: opts.origin, ledger: true } })
     }
   }
 
@@ -1228,12 +1245,16 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
   }
 
   private async performAttempt(chatKey: string, item: QueuedDelivery<BridgeDelivery>): Promise<void> {
-    // Never burn an attempt budget when the provider never connected this boot.
-    if (this.channelStatus !== 'connected') {
-      this.feedAttemptResult(chatKey, item.key, 'failed', 'channel not connected', 'transient')
-      return
+    // Never burn the ledger's attempt budget when the provider never connected
+    // this boot — three restarts would otherwise abandon a message that was
+    // never once sent. Local notices are not ledger-tracked, so they just try.
+    if (item.value.ledger) {
+      if (this.channelStatus !== 'connected') {
+        this.feedAttemptResult(chatKey, item.key, 'failed', 'channel not connected', 'transient')
+        return
+      }
+      this.store.markAttempting(item.key)
     }
-    this.store.markAttempting(item.key)
     try {
       const receipt = await this.ctx.channels.deliver({
         channel: this.channel.id,
@@ -1242,6 +1263,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
         markdown: item.value.markdown,
         deliveryKey: item.key,
         origin: item.value.origin,
+        silent: item.value.silent ? true : undefined,
       })
       if (receipt.status === 'sent') {
         this.store.markDelivered(item.key, receipt.platformMessageIds ?? [])
@@ -1303,21 +1325,22 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     this.runDeliverEffects(chatKey, result.effects)
   }
 
-  protected async sendLocal(chatKey: string, markdown: string, opts: { silent?: boolean } = {}): Promise<void> {
+  /**
+   * Bridge-authored text (command replies, status lines, warnings). It shares the
+   * chatKey's serial worker with real answers, so a `⏹ Turn ended` line can no
+   * longer slip between two chunks of the answer it follows. Not ledger-tracked:
+   * these are local notices, not agent output, so the ledger marks are no-ops.
+   */
+  protected sendLocal(chatKey: string, markdown: string, opts: { silent?: boolean } = {}): void {
     const rendered = renderForTier(markdown, this.channel.formatTier)
     const maxChars = this.channel.maxMessageChars ?? 4096
     const chunks = chunkText(rendered, { maxChars, countBy: this.chunkCountBy })
+    const seq = ++this.localSeq
     for (let i = 0; i < chunks.length; i++) {
-      const receipt = await this.ctx.channels.deliver({
-        channel: this.channel.id,
-        ...this.accountQualifier,
-        chatKey,
-        markdown: chunks[i]!,
-        deliveryKey: `local:${chatKey}:${Date.now()}:${i}`,
-        silent: opts.silent ? true : undefined,
+      this.enqueueDelivery(chatKey, {
+        key: `local:${chatKey}:${seq}:${i}`,
+        value: { chatKey, markdown: chunks[i]!, silent: opts.silent },
       })
-      this.rememberOwnSends(chatKey, receipt.platformMessageIds ?? [])
-      if (i < chunks.length - 1) await sleep(1000)
     }
   }
 
@@ -1329,7 +1352,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     const args = (match?.[2] ?? '').trim()
 
     if (command === 'start' || command === 'help') {
-      await this.sendLocal(chatKey, 'Available commands:\n/start - Get started\n/new - New session\n/status - Session status\n/bind <sessionId> - Bind session\n/help - Help')
+      this.sendLocal(chatKey, 'Available commands:\n/start - Get started\n/new - New session\n/status - Session status\n/bind <sessionId> - Bind session\n/help - Help')
       return
     }
     if (command === 'new') {
@@ -1337,28 +1360,28 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
       this.store.setBinding(chatKey, sessionId)
       this.sessionChatKeys.set(sessionId, chatKey)
       this.registerSessionBinding(sessionId, chatKey)
-      await this.sendLocal(chatKey, `✅ Created new session: ${sessionId}`)
+      this.sendLocal(chatKey, `✅ Created new session: ${sessionId}`)
       return
     }
     if (command === 'bind') {
       if (!args) {
-        await this.sendLocal(chatKey, 'Usage: /bind <sessionId>')
+        this.sendLocal(chatKey, 'Usage: /bind <sessionId>')
         return
       }
       this.store.setBinding(chatKey, args)
       this.sessionChatKeys.set(args, chatKey)
       this.registerSessionBinding(args, chatKey)
-      await this.sendLocal(chatKey, `✅ Bound to session: ${args}`)
+      this.sendLocal(chatKey, `✅ Bound to session: ${args}`)
       return
     }
     if (command === 'status') {
       const binding = this.store.bindings()[chatKey]
       const sessionId = binding ?? this.sessionIdFor(chatKey)
       const agent = this.ctx.agents.get(SessionId(sessionId))
-      await this.sendLocal(chatKey, agent ? `Session ${sessionId} status: ${agent.status}` : `Session ${sessionId} is not running.`)
+      this.sendLocal(chatKey, agent ? `Session ${sessionId} status: ${agent.status}` : `Session ${sessionId} is not running.`)
       return
     }
-    await this.sendLocal(chatKey, `Unknown command: ${command}. Use /help for help.`)
+    this.sendLocal(chatKey, `Unknown command: ${command}. Use /help for help.`)
   }
 
   // ---- approval ----
@@ -1480,13 +1503,6 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     this.resolvePrompt(reply.num, reply.answer)
     return reply.answer
   }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms)
-    timer.unref?.()
-  })
 }
 
 /** True when `promise` settled (either way) within `timeoutMs`; false on timeout. */

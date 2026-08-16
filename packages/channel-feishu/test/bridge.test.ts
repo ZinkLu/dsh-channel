@@ -120,7 +120,9 @@ test('bridge rejects non-allowlisted sender', async () => {
 
   await bridge.handleEvent(makeEvent({ sender: { sender_id: { open_id: 'ou_mallory' }, sender_type: 'user' } }))
 
-  assert.ok(sent.some((text) => text.includes('You are not authorized to use this bot')))
+  // The rejection rides the chatKey's serial delivery worker, like every other
+  // bridge-authored message, so it lands on the next turn of the loop.
+  await waitFor(() => sent.some((text) => text.includes('You are not authorized to use this bot')))
 })
 
 test('bridge observes inbound replyToMessageId from parent_id', async () => {
