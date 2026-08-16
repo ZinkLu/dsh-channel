@@ -445,6 +445,45 @@ test('bridge shows a progress draft for tool calls and finalizes it on the answe
   await bridge.stop()
 })
 
+test('bridge retains the preview instead of deleting it when edit-in-place died', async () => {
+  const root = new Context()
+  new ChannelRegistry(root)
+  const sessionId = 'channel:telegram:42'
+  const fakeAgent = { id: sessionId, status: 'idle' as const, session: { events: [] as any[] } }
+  root.provide('agents', { list: () => [], get: () => fakeAgent, resume: async () => { throw new Error('not used') }, create: async () => { throw new Error('not used') } })
+  root.provide('credentials', { resolve: async () => ({ value: 'test-token', source: 'test' }) })
+
+  const store = createMemoryStore()
+  store.setBinding('42', sessionId)
+  const client = createFakeClient([])
+  // Edit-in-place is dead: the preview holds the prefix the user already saw.
+  client.editMessageText = async () => { throw new Error('message is not modified') }
+  const channel = new TelegramChannel({ client, resolveToken: async () => 'test-token' })
+  root.channels.register(channel)
+  const bridge = new TelegramBridge(
+    root,
+    () => ({ allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 5, approvalTimeoutSec: 120 }),
+    store,
+    channel,
+    client,
+  )
+  await bridge.start()
+
+  root.emit('session/event', { id: sessionId }, { type: 'turn/start', seq: 1, time: Date.now(), data: { turn: 1 } })
+  root.emit('session/event', { id: sessionId }, { type: 'tool/call', seq: 2, time: Date.now(), data: { turn: 1, step: 1, callId: 'c1', name: 'Bash', arguments: '{"command":"npm test"}' } })
+  await waitFor(() => client.sends.some((s) => s.text.includes('Working…')), 2500)
+
+  // The follow-up draft update fails, flipping the reducer to append-tail mode.
+  root.emit('session/event', { id: sessionId }, { type: 'tool/result', seq: 3, time: Date.now(), data: { turn: 1, step: 1, message: { role: 'user', content: [{ type: 'tool-result', toolCallId: 'c1', content: [] }] } } })
+  await waitFor(() => client.sends.some((s) => s.text.includes('✅ Bash')), 3000)
+
+  root.emit('session/event', { id: sessionId }, { type: 'assistant/message', seq: 4, time: Date.now(), data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: 'done' }] } } })
+  await waitFor(() => client.sends.some((s) => s.text === 'done'), 2000)
+  await bridge.stop()
+
+  assert.deepEqual(client.deletes, [], 'the retained preview must not be deleted')
+})
+
 test('bridge registers a user-questions provider and renders an option prompt', async () => {
   const root = new Context()
   new ChannelRegistry(root)

@@ -30,6 +30,7 @@ import {
   type QueuedDelivery,
 } from '../policy/deliver-queue.js'
 import { draftThrottleReduce, emptyDraftThrottleState, type DraftThrottleState } from '../policy/draft-throttle.js'
+import { resolveFinalization } from '../policy/finalization.js'
 import { emptyMergeState, mergeReduce, type MergeEffect, type MergeState } from '../policy/merge.js'
 import { emptyOutboundEchoState, outboundEchoReduce, type OutboundEchoState } from '../policy/outbound-echo.js'
 import {
@@ -82,7 +83,7 @@ interface BusyQueuedMessage {
   text: string
   messageIds: string[]
   senderId: string
-  images: readonly import('@deepseek-ai/dsh-attachment').ImageAttachmentRef[]
+  images: readonly ImageAttachmentRef[]
 }
 
 interface ApprovalEntry extends PendingApproval {
@@ -156,6 +157,8 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
   private readonly streamTimers = new Map<string, NodeJS.Timeout>()
   private readonly draftThrottleStates = new Map<string, DraftThrottleState>()
   private readonly draftThrottleTimers = new Map<string, NodeJS.Timeout>()
+  /** Last draft text the platform *accepted*, per session — the append-tail baseline. */
+  private readonly shownDraftText = new Map<string, string>()
   protected readonly draftMessageIds = new Map<string, number>()
   private readonly toolCallNames = new Map<string, string>()
   private readonly deliverQueueStates = new Map<string, DeliverQueueState<BridgeDelivery>>()
@@ -231,6 +234,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     for (const timer of this.draftThrottleTimers.values()) clearTimeout(timer)
     this.draftThrottleTimers.clear()
     this.draftThrottleStates.clear()
+    this.shownDraftText.clear()
     this.draftMessageIds.clear()
     this.toolCallNames.clear()
     for (const timer of this.deliverQueueTimers.values()) clearTimeout(timer)
@@ -389,14 +393,11 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
         this.store.markFailed(action.item.key, `recovery: empty assistant text ${action.item.key}`)
         continue
       }
-      try {
-        await this.sendOutbound(action.item.chatKey, (action.marker ?? '') + action.text, action.item.key, {
-          origin: action.origin,
-          recover: action.item.state,
-        })
-      } catch (error) {
-        this.store.markFailed(action.item.key, error instanceof Error ? error.message : String(error))
-      }
+      // Enqueue only; the deliver queue owns the attempt and its ledger marks.
+      this.sendOutbound(action.item.chatKey, (action.marker ?? '') + action.text, action.item.key, {
+        origin: action.origin,
+        recover: action.item.state,
+      })
     }
   }
 
@@ -541,23 +542,24 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     const message = this.buildUserMessage(chatKey, text, messageIds, senderId, images)
     const action = this.resolveBusyActionFor(agent.status)
 
+    const queued: BusyQueuedMessage = { chatKey, text, messageIds, senderId, images }
     if (action === 'queue') {
-      this.queueBehindRunningTurn(agent.id, { chatKey, text, messageIds, senderId, images })
+      this.queueBehindRunningTurn(agent, queued)
       return
     }
 
-    await this.runSerializedSessionTurn(agent.id, async () => {
+    await this.runSerializedSessionTurn(agent.id, chatKey, async () => {
       if (action === 'steer') {
         // Mandatory fallback: if steer is unavailable or fails, buffer the
         // message behind the running turn — never drop it.
         try {
           const accepted = (await agent.steer(message)) as unknown
           if (accepted === false) {
-            this.queueBehindRunningTurn(agent.id, { chatKey, text, messageIds, senderId, images })
+            this.queueBehindRunningTurn(agent, queued)
             return
           }
         } catch {
-          this.queueBehindRunningTurn(agent.id, { chatKey, text, messageIds, senderId, images })
+          this.queueBehindRunningTurn(agent, queued)
           return
         }
       } else {
@@ -596,10 +598,13 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     })
   }
 
-  private queueBehindRunningTurn(sessionId: string, message: BusyQueuedMessage): void {
-    const queue = this.busyQueues.get(sessionId) ?? []
+  private queueBehindRunningTurn(agent: Agent, message: BusyQueuedMessage): void {
+    const queue = this.busyQueues.get(agent.id) ?? []
     queue.push(message)
-    this.busyQueues.set(sessionId, queue)
+    this.busyQueues.set(agent.id, queue)
+    // The turn may have ended between reading `agent.status` and queueing, in
+    // which case no turn-end is coming to flush this. Never strand a message.
+    if (agent.status !== 'running') void this.flushBusyQueue(agent.id).catch(() => {})
   }
 
   /** Flush messages queued behind a turn once that turn ends. */
@@ -608,7 +613,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     if (!queue || queue.length === 0) return
     this.busyQueues.delete(sessionId)
 
-    await this.runSerializedSessionTurn(sessionId, async () => {
+    await this.runSerializedSessionTurn(sessionId, queue[0]!.chatKey, async () => {
       const agent = this.ctx.agents.get(SessionId(sessionId))
       if (!agent) return
       for (const queued of queue) {
@@ -619,47 +624,40 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     })
   }
 
-  /** Serialize dispatch per resolved sessionId so two chats bound to one session cannot interleave turns. */
-  private async runSerializedSessionTurn(sessionId: string, run: () => Promise<void>): Promise<void> {
+  /**
+   * Serialize dispatch per resolved sessionId so two chats bound to one session
+   * cannot interleave turns (`/bind` makes chatKey→sessionId many-to-one).
+   *
+   * The gate is installed before awaiting the predecessor, so concurrent callers
+   * queue behind this turn rather than beside it. Release is identity-checked:
+   * only our own gate is resolved and only our own tail is reclaimed, so a stale
+   * unwind can never free a newer turn's guard.
+   */
+  private async runSerializedSessionTurn(sessionId: string, chatKey: string, run: () => Promise<void>): Promise<void> {
     const previous = this.sessionTurnTails.get(sessionId) ?? Promise.resolve()
     let release!: () => void
     const gate = new Promise<void>((resolve) => {
       release = resolve
     })
-    const tail = previous.catch(() => {}).then(() => gate)
+    const tail = previous.then(() => gate, () => gate)
     this.sessionTurnTails.set(sessionId, tail)
 
-    const timeoutMs = (this.config.sessionTurnTimeoutSec ?? 120) * 1000
-    let timer: NodeJS.Timeout | undefined
-    let acquired = false
-    try {
-      acquired = await Promise.race([
-        previous.catch(() => {}).then(() => true),
-        new Promise<boolean>((resolve) => {
-          timer = setTimeout(() => resolve(false), timeoutMs)
-          timer.unref?.()
-        }),
-      ])
-    } finally {
-      if (timer !== undefined) clearTimeout(timer)
+    const done = () => {
+      release()
+      if (this.sessionTurnTails.get(sessionId) === tail) this.sessionTurnTails.delete(sessionId)
     }
 
-    if (!acquired) {
-      // Reject visibly, never run unserialized. Release the gate so the next
-      // queued turn can still proceed (identity-checked release: only our own
-      // gate is resolved).
-      release()
-      const chatKey = this.sessionChatKeys.get(sessionId)
-      if (chatKey !== undefined) {
-        await this.sendLocal(chatKey, '⚠️ The previous turn is still running; please resend your message.')
-      }
+    if (!(await settledWithin(previous, (this.config.sessionTurnTimeoutSec ?? 120) * 1000))) {
+      // Reject visibly, never run unserialized.
+      done()
+      await this.sendLocal(chatKey, '⚠️ The previous turn is still running; please resend your message.')
       return
     }
 
     try {
       await run()
     } finally {
-      release()
+      done()
     }
   }
 
@@ -915,14 +913,14 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
       case 'final': {
         const seq = deliveryCtx?.seq
         const deliveryKey = seq !== undefined ? `${sessionId}:${seq}` : `stream:${sessionId}:${Date.now()}`
-        void this.sendOutbound(chatKey, frame.text, deliveryKey, { origin: { sessionId, seq } }).catch(() => {})
+        this.sendOutbound(chatKey, frame.text, deliveryKey, { origin: { sessionId, seq } })
         return
       }
       case 'draft':
         this.sendDraftThrottled(sessionId, chatKey, frame.text)
         return
       case 'draft-finalize':
-        void this.finalizeDraft(chatKey, sessionId).catch(() => {})
+        void this.finalizeDraft(chatKey, sessionId, frame.editFailed).catch(() => {})
         return
       case 'status-line':
         void this.sendLocal(chatKey, frame.text, { silent: this.channel.supportsSilent }).catch(() => {})
@@ -933,17 +931,37 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     }
   }
 
-  private async finalizeDraft(chatKey: string, sessionId: string): Promise<void> {
-    const existing = this.draftMessageIds.get(sessionId)
-    if (existing === undefined) return
+  /**
+   * Decide what happens to the preview draft now that the turn produced its
+   * final text. `resolveFinalization` is the decision; the bridge only executes
+   * it. `finalVisible` is false because v1 never renders the answer into the
+   * preview (block streaming is v2), so `preview-finalized` stays unreachable
+   * here and the live split is discard vs retain.
+   */
+  private async finalizeDraft(chatKey: string, sessionId: string, editFailed: boolean): Promise<void> {
+    const target = this.draftMessageIds.get(sessionId)
+    if (target === undefined) return
     this.draftMessageIds.delete(sessionId)
+
+    const outcome = resolveFinalization(
+      { streamingMode: this.channel.streamingMode, supportsEdit: this.channel.supportsEdit },
+      { draftStarted: true, editFailed },
+      { ok: !editFailed, finalVisible: false },
+    )
+    if (outcome === 'preview-retained') {
+      // Edit-in-place died mid-stream, so the preview still holds the prefix the
+      // user actually saw and the tail went out as separate status lines.
+      // Deleting it here would erase visible context.
+      return
+    }
+
     try {
-      await this.deleteDraft(chatKey, String(existing))
+      await this.deleteDraft(chatKey, String(target))
     } catch (error) {
       // Draft deletion is best-effort; the final answer is already sent separately.
       this.warn(`draft finalize failed: ${error instanceof Error ? error.message : String(error)}`)
     }
-    this.ctx.emit('channel/present', { kind: 'draft-finalize', channel: this.channel.id, chatKey, draftKey: `draft:${sessionId}` } satisfies PresentationFrame)
+    this.ctx.emit('channel/present', { kind: 'draft-discard', channel: this.channel.id, chatKey, draftKey: `draft:${sessionId}` } satisfies PresentationFrame)
   }
 
   private armStreamTimer(sessionId: string, chatKey: string, at: number): void {
@@ -972,6 +990,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
       this.draftThrottleTimers.delete(sessionId)
     }
     this.draftThrottleStates.delete(sessionId)
+    this.shownDraftText.delete(sessionId)
   }
 
   /** Draft edits go through the adaptive throttle: flood doubles, success resets, retry_after capped. */
@@ -997,12 +1016,14 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     if (attempt.effect.kind === 'fail-over') {
       // Server retry_after exceeded the ceiling: degrade instead of stalling the preview.
       this.warn('draft edit throttle fail-over; switching to append-tail mode')
-      this.feedStream(sessionId, chatKey, { kind: 'edit-failed', visiblePrefix: this.streamStates.get(sessionId)?.draftText })
+      this.feedStream(sessionId, chatKey, { kind: 'edit-failed', visiblePrefix: this.shownDraftText.get(sessionId) })
       return
     }
 
     void this.showDraft(chatKey, sessionId, text)
       .then(() => {
+        // Only an accepted render becomes the append-tail baseline.
+        this.shownDraftText.set(sessionId, text)
         const next = draftThrottleReduce(this.draftThrottleStates.get(sessionId) ?? emptyDraftThrottleState, { kind: 'success', now: Date.now() })
         this.draftThrottleStates.set(sessionId, next.state)
       })
@@ -1014,9 +1035,9 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
           { kind: 'failure', now: Date.now(), retryAfterMs },
         )
         this.draftThrottleStates.set(sessionId, next.state)
-        // Edit-in-place died mid-stream: record the visible prefix and flip
-        // the reducer to append-tail mode instead of repeatedly failing.
-        this.feedStream(sessionId, chatKey, { kind: 'edit-failed', visiblePrefix: this.streamStates.get(sessionId)?.draftText })
+        // Edit-in-place died mid-stream: hand the reducer what the user actually
+        // saw so it can append only the tail from here on.
+        this.feedStream(sessionId, chatKey, { kind: 'edit-failed', visiblePrefix: this.shownDraftText.get(sessionId) })
       })
   }
 
@@ -1062,12 +1083,17 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     return result.matches
   }
 
+  /**
+   * Render → chunk → record in the ledger → hand to the deliver queue. Returns
+   * once the chunks are enqueued, not once they are sent: the queue owns the
+   * attempt, its retries, and the ledger marks for every outcome.
+   */
   protected sendOutbound(
     chatKey: string,
     markdown: string,
     deliveryKey: string,
     opts: { origin?: OutboundMessage['origin']; recover?: 'pending' | 'attempting' | 'failed' } = {},
-  ): Promise<void> {
+  ): void {
     const rendered = renderForTier(markdown, this.channel.formatTier)
     const maxChars = this.channel.maxMessageChars ?? 4096
     const chunks = chunkText(rendered, { maxChars, countBy: this.chunkCountBy })
@@ -1080,7 +1106,6 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
       }
       this.enqueueDelivery(chatKey, { key, value: { chatKey, markdown: chunk, origin: opts.origin } })
     }
-    return Promise.resolve()
   }
 
   /** Chunk counting mode: Telegram counts UTF-16 code units; the default counts code points. */
@@ -1380,5 +1405,23 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     const timer = setTimeout(resolve, ms)
     timer.unref?.()
+  })
+}
+
+/** True when `promise` settled (either way) within `timeoutMs`; false on timeout. */
+function settledWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(false), timeoutMs)
+    timer.unref?.()
+    void promise.then(
+      () => {
+        clearTimeout(timer)
+        resolve(true)
+      },
+      () => {
+        clearTimeout(timer)
+        resolve(true)
+      },
+    )
   })
 }

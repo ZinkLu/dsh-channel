@@ -42,7 +42,11 @@ export type StreamInput =
   | { readonly kind: 'assistant-message'; readonly text: string }
   | { readonly kind: 'turn-end'; readonly reason: 'completed' | 'aborted' | 'blocked' | 'error' | 'max-tokens' | 'interrupted' }
   | { readonly kind: 'tick' }
-  /** The bridge feeds this when `showDraft` (edit-in-place) rejects mid-stream. */
+  /**
+   * The bridge feeds this when `showDraft` (edit-in-place) rejects mid-stream.
+   * `visiblePrefix` is the last draft text the platform *accepted*, not the one
+   * that failed.
+   */
   | { readonly kind: 'edit-failed'; readonly visiblePrefix?: string }
 
 export interface StreamState {
@@ -126,10 +130,13 @@ function reduceProgress(
       return { state: emptyStreamState, frames: [{ kind: 'noop' }] }
 
     case 'edit-failed': {
-      // Record the visible prefix (bridge supplies it; fall back to the last draft
-      // text the reducer emitted) and flip to append-tail mode permanently this turn.
-      const visiblePrefix = input.visiblePrefix ?? state.draftText
-      return { state: { ...state, visiblePrefix, editFailed: true }, frames: [{ kind: 'noop' }] }
+      // The bridge supplies what the user actually saw — the last *accepted*
+      // render, never the update that just failed (openclaw: only accepted
+      // renders may become the baseline). Flip to append-tail mode permanently
+      // this turn, and emit the failed update's own tail so its content still
+      // reaches the user instead of dying with the edit.
+      const visiblePrefix = input.visiblePrefix ?? state.visiblePrefix
+      return { state: { ...state, visiblePrefix, editFailed: true }, frames: statusLineTail(state.draftText, visiblePrefix) }
     }
 
     case 'tool-call': {

@@ -160,7 +160,8 @@ export class TelegramBridge extends ChannelBridge<TelegramBridgeConfig> {
 
     if (chat.type !== 'private') {
       // v1 group chats are not routed, but facts are still ingested (usable for policy-plugin auditing).
-      this.ingest(chatKey, senderId, message, chat.type === 'supergroup' || chat.type === 'group' ? 'group' : 'direct')
+      // Everything non-private (group/supergroup/channel) is a group fact here.
+      this.ingest(chatKey, senderId, message, 'group')
       return
     }
 
