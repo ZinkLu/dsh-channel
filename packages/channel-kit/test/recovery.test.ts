@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { defaultRecoveryPolicy, hashText, splitDeliveryKey, type ReconcileLike, type RecoverableDelivery, type RecoveryPolicy } from '../src/policy/recovery.ts'
+import { chunkDeliveryKey, chunkIndexOf, defaultRecoveryPolicy, hashText, splitDeliveryKey, type ReconcileLike, type RecoverableDelivery, type RecoveryPolicy } from '../src/policy/recovery.ts'
 
 const noReconcile: ReconcileLike = { supportsReconciliation: false, async reconcile() { return 'unknown' } }
 
@@ -59,4 +59,19 @@ test('defaultRecoveryPolicy abandons terminal send errors without a blind resend
     { channel: noReconcile, resolveText: () => 'hello' },
   )
   assert.equal(actions[0]!.kind, 'abandon')
+})
+
+test('a chunk delivery key still resolves back to its session event', () => {
+  // The sessionId contains colons of its own, so the chunk suffix uses `#`;
+  // splitting on the last `:` would otherwise yield `channel:telegram:42:7`
+  // as the sessionId and never find the event, abandoning every multi-chunk
+  // answer on recovery.
+  const key = chunkDeliveryKey('channel:telegram:42:7', 2)
+  assert.equal(key, 'channel:telegram:42:7#2')
+  assert.equal(chunkIndexOf(key), 2)
+  assert.deepEqual(splitDeliveryKey(key), { sessionId: 'channel:telegram:42', seq: 7 })
+
+  // A whole-message key is unchanged and reports no chunk index.
+  assert.equal(chunkIndexOf('channel:telegram:42:7'), undefined)
+  assert.deepEqual(splitDeliveryKey('channel:telegram:42:7'), { sessionId: 'channel:telegram:42', seq: 7 })
 })

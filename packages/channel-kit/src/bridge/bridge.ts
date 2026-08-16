@@ -41,7 +41,7 @@ import {
   type PresentationPolicy,
 } from '../policy/presentation.js'
 import { parsePromptReply, renderPrompt, type PendingPrompt, type PromptOptions } from '../policy/prompt-render.js'
-import { defaultRecoveryPolicy, hashText, type RecoveryPolicy } from '../policy/recovery.js'
+import { chunkDeliveryKey, chunkIndexOf, defaultRecoveryPolicy, hashText, type RecoveryPolicy } from '../policy/recovery.js'
 import { route, type RouteDecision } from '../policy/router.js'
 import { emptyStreamState, type StreamFrame, type StreamInput, type StreamState } from '../policy/stream.js'
 import type { ChannelStore } from './store.js'
@@ -366,10 +366,16 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     return (this.channelStatus as string) === 'connected'
   }
 
+  /**
+   * Refill the seen set by folding the session log (R7: idempotency is derived
+   * from the log; the store is only the safety net, so a lost state file must
+   * not cause re-injection). A session is ours either by an explicit `/bind` or
+   * by the `channel:<id>[:<account>]:<chatKey>` convention.
+   */
   private markSeenFromSessionLogs(): void {
+    const prefix = `channel:${this.channel.id}${this.accountSegment}:`
     for (const agent of this.ctx.agents.list()) {
-      const chatKey = this.sessionChatKeys.get(agent.id)
-      if (!chatKey) continue
+      if (!this.sessionChatKeys.has(agent.id) && !agent.id.startsWith(prefix)) continue
       for (const event of agent.session.events) {
         if (event.type !== 'user/message') continue
         const source = event.data.source as { kind?: string; channel?: string; messageIds?: readonly string[] } | undefined
@@ -508,13 +514,22 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
 
   // ---- inbound merge ----
 
+  /** Flush whatever is buffered for this chat right now (commands and media bypass the window). */
   protected async flushBuffered(chatKey: string): Promise<void> {
     const state = this.mergeStates.get(chatKey)
     if (!state || state.buffer.length === 0) return
-    const texts = state.buffer.map((entry) => entry.join(''))
+    await this.dispatchFlushed(chatKey, state.buffer.map((entry) => entry.join('')))
+  }
+
+  /**
+   * Deliver one flushed batch. The debounce window coalesces the *wait*, not the
+   * identity: each buffered message becomes its own turn, in arrival order, with
+   * its own platform message ids.
+   */
+  private async dispatchFlushed(chatKey: string, texts: readonly string[]): Promise<void> {
     const entries = this.mergeEntries.get(chatKey) ?? []
-    this.mergeStates.set(chatKey, emptyMergeState)
     this.mergeEntries.delete(chatKey)
+    this.mergeStates.set(chatKey, emptyMergeState)
     this.store.setMergeBuffer(chatKey, [])
     this.clearMergeTimer(chatKey)
     for (let i = 0; i < texts.length; i++) {
@@ -544,24 +559,17 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
       this.mergeEntries.set(chatKey, entries)
     }
     this.store.setMergeBuffer(chatKey, result.state.buffer.map((entry) => entry.join('')))
-    await this.handleMergeEffects(chatKey, result.state, result.effects, messageId)
+    await this.handleMergeEffects(chatKey, result.effects, messageId)
   }
 
-  private async handleMergeEffects(chatKey: string, _state: MergeState, effects: MergeEffect[], ackMessageId?: string): Promise<void> {
+  private async handleMergeEffects(chatKey: string, effects: MergeEffect[], ackMessageId?: string): Promise<void> {
     for (const effect of effects) {
       if (effect.kind === 'armTimer') {
         this.armMergeTimer(chatKey, effect.at)
       } else if (effect.kind === 'ack-long') {
         await this.ackLong(chatKey, ackMessageId)
       } else if (effect.kind === 'flush') {
-        const entries = this.mergeEntries.get(chatKey) ?? []
-        this.mergeEntries.delete(chatKey)
-        this.mergeStates.set(chatKey, emptyMergeState)
-        this.store.setMergeBuffer(chatKey, [])
-        this.clearMergeTimer(chatKey)
-        for (let i = 0; i < effect.texts.length; i++) {
-          await this.dispatchText(chatKey, effect.texts[i]!, entries[i]?.messageIds ?? [], entries[i]?.senderId ?? '0')
-        }
+        await this.dispatchFlushed(chatKey, effect.texts)
       }
     }
   }
@@ -603,7 +611,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     const result = mergeReduce(state, { kind: 'tick', now: Date.now() }, { windowMs: this.config.mergeWindowSec * 1000 })
     this.mergeStates.set(chatKey, result.state)
     this.store.setMergeBuffer(chatKey, result.state.buffer.map((entry) => entry.join('')))
-    await this.handleMergeEffects(chatKey, result.state, result.effects)
+    await this.handleMergeEffects(chatKey, result.effects)
   }
 
   // ---- routing and delivery ----
@@ -1196,12 +1204,20 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     const maxChars = this.channel.maxMessageChars ?? 4096
     const chunks = chunkText(rendered, { maxChars, countBy: this.chunkCountBy })
 
+    if (opts.recover) {
+      // Recovery targets exactly one ledger entry, under its existing key. A
+      // chunk key carries its own 1-based index, so only the unconfirmed part is
+      // resent and the parts that already landed are not repeated.
+      const chunk = chunks[(chunkIndexOf(deliveryKey) ?? 1) - 1]
+      if (chunk === undefined) return
+      this.enqueueDelivery(chatKey, { key: deliveryKey, value: { chatKey, markdown: chunk, origin: opts.origin, ledger: true } })
+      return
+    }
+
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i]!
-      const key = chunks.length === 1 ? deliveryKey : `${deliveryKey}:${i + 1}`
-      if (!opts.recover) {
-        this.store.recordDelivery(key, { chatKey, textHash: hashText(chunk) })
-      }
+      const key = chunks.length === 1 ? deliveryKey : chunkDeliveryKey(deliveryKey, i + 1)
+      this.store.recordDelivery(key, { chatKey, textHash: hashText(chunk) })
       this.enqueueDelivery(chatKey, { key, value: { chatKey, markdown: chunk, origin: opts.origin, ledger: true } })
     }
   }

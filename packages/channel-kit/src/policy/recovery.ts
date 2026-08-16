@@ -94,13 +94,30 @@ export function isFatalSendError(errorKind: SendErrorKind | undefined): boolean 
   return errorKind === 'too_long' || errorKind === 'bad_format' || errorKind === 'forbidden' || errorKind === 'not_found'
 }
 
-/** Parse a `${sessionId}:${seq}` delivery key back into its parts. */
+/**
+ * Delivery-key grammar: `${sessionId}:${seq}`, plus `#${chunkIndex}` (1-based)
+ * when one assistant message was split across several platform messages. `#` is
+ * used rather than another `:` because sessionIds contain colons themselves
+ * (`channel:telegram:42`), which would make the split ambiguous.
+ */
+export function chunkDeliveryKey(deliveryKey: string, chunkIndex: number): string {
+  return `${deliveryKey}#${chunkIndex}`
+}
+
+/** The 1-based chunk index of a delivery key, or undefined when it names a whole message. */
+export function chunkIndexOf(key: string): number | undefined {
+  const match = /#(\d+)$/.exec(key)
+  return match ? Number(match[1]) : undefined
+}
+
+/** Parse a delivery key back into the session event it came from. */
 export function splitDeliveryKey(key: string): { sessionId?: string; seq?: number } {
-  const sep = key.lastIndexOf(':')
+  const base = key.replace(/#\d+$/, '')
+  const sep = base.lastIndexOf(':')
   if (sep <= 0) return {}
-  const seq = Number(key.slice(sep + 1))
+  const seq = Number(base.slice(sep + 1))
   if (!Number.isInteger(seq)) return {}
-  return { sessionId: key.slice(0, sep), seq }
+  return { sessionId: base.slice(0, sep), seq }
 }
 
 /** djb2 text hash, used by the delivery ledger (textHash) and reconciliation. */
