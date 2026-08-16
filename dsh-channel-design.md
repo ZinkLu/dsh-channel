@@ -635,6 +635,7 @@ Per T7's advice, **T7's interface-call checklist is listed in the first week of 
 | M4 | Next platform (Discord / WeChat / Feishu / …) + T7; from then on **each added platform is one more reproduction of A5**, the repo keeps growing | A5 |
 | M5 | npm publish + `dsh-plugin` topic + awesome-dsh-plugin PR + an "add a new platform" tutorial (hermes's ADDING_A_PLATFORM is the style template: one table for the required surface, one for the optional surface, itemized degradation notes) | — |
 | M6 | Media (§10): contract adds `InboundMedia`/`OutboundMedia`/`supportsMedia`/`sendMedia`; Telegram `getFile` download + `sendPhoto`/`sendDocument` send | Image end-to-end (inbound lands in the log, outbound reachable) |
+| M7 ✅ | Capability hardening (§12): inbound media size cap, generic outbound retry/backpressure queue, `mentionsBot` fix, reaction-based ack; plus the configuration/settings seam (§11) | P0 hardening green; full suite (channel+kit+config+3 providers) passes |
 
 ---
 
@@ -702,6 +703,69 @@ interface OutboundMedia {
 
 - Aligned with hermes: `send_image/send_file` are **optional adapter methods + base-class degradation** (hermes defaults to "⚠️ Couldn't deliver…" and **never echoes host paths**). Adding methods only one platform can implement to `Channel` is forbidden (R6).
 - Telegram implementation: `supportsMedia = true`; `getFile` (inbound download) + `sendPhoto`/`sendDocument` (outbound); `filePath` resolution anchored to `meta.cwd`, out-of-bounds rejected.
+
+---
+
+## 11. Configuration and Settings Seam
+
+> Status: shipped (M7) · The three providers' config is consolidated into one leaf package and wired into dsh's `settings` seam.
+
+### 11.1 `dsh-channel-config` (leaf package)
+
+One source of truth for every channel config shape. It depends only on `@deepseek-ai/schemastery` (peer) and exports three things:
+
+1. Shared schema constructors — `agentRoutingSchema()` / `channelBehaviorSchema()` / `allowedUserIdsSchema(elem)`.
+2. Per-provider config schemas + their TS types — `telegramConfigSchema()`/`TelegramConfig`, `wechatConfigSchema()`/`WeChatConfig`, `feishuConfigSchema()`/`FeishuConfig`.
+3. Namespace + credential-ref string constants (`CHANNEL_TELEGRAM_NS`, `CREDENTIAL_TELEGRAM_BOT_TOKEN`, …), zero-dependency so both the host (Node) and a future client bundle can reuse them.
+
+Why not inside `dsh-channel-kit`: kit is a zero-runtime-dependency pure-function library; config schemas need schemastery. Keeping them apart preserves the one-way dependency direction `provider → config / kit / channel`.
+
+Common base shared by all three providers:
+
+| Fragment | Fields |
+|---|---|
+| Agent routing | `provider` (default `deepseek-official`), `model?`, `cwd?`, `agentPreset?` |
+| Behavior + persistence | `mergeWindowSec` (5), `approvalTimeoutSec` (120), `statePath?`, `maxInboundMediaBytes` (20 MiB) |
+| Allowlist | `allowedUserIds` (required; Telegram `number[]`, WeChat/Feishu `string[]`) |
+
+Platform differences stay per-provider: Telegram `pollingTimeoutSec` (30); WeChat `pollingTimeoutSec` + `accountId?` (iLink account); Feishu `domain: 'feishu'|'lark'` and no long-poll timeout (WebSocket).
+
+### 11.2 Settings seam (`installSettingsSection`)
+
+- Each provider registers its config as a dsh `settings` namespace (`channel-telegram` / `channel-wechat` / `channel-feishu`) via `installSettingsSection(ctx, settingsNamespace(...), Config, config, { setSource, onChange })`.
+- The resolved value layers schema defaults < composition config < user document. `setSource` swaps the bridge's config source at runtime, and bridges read config through a dynamic `source()` — live fields are getter-ized and take effect without restart; `statePath` is restart-only.
+- Secrets never enter the settings schema: tokens/app secrets stay in `ctx.credentials` (write-only, via the same `CardSecretSpec.write()` path the Models page uses).
+
+### 11.3 Current boundary (rc.6)
+
+Host-side wiring is complete, but rc.6's apiproxy only exposes a hardcoded `WEB_SETTINGS_NAMESPACES` allowlist (`agent-loop`/`shell`/`locale`/`permission`/`ui-conversation`/`ui-theme`/`web-search-deepseek`). `channel-*` namespaces are **not** in it, so the config cards do **not** appear in the web UI yet — `settings-file` still persists the user document and the CLI can read it. Exposing plugin namespaces is deferred upstream; this repo does not patch dsh core.
+
+---
+
+## 12. Capability Hardening (M7)
+
+> Status: shipped (M7) · Four P0 gaps closed: inbound media cap, generic outbound retry/backpressure, `mentionsBot`, and reaction-based ack.
+
+### 12.1 Inbound media size cap
+
+- Kit adds a pure guard `assertMediaWithinLimit(bytes, maxBytes, kind)` + `DEFAULT_MAX_INBOUND_MEDIA_BYTES` (20 MiB); config adds `maxInboundMediaBytes` (default 20 MiB) to the shared behavior fragment.
+- Telegram `getFile` reads the body incrementally: it checks `Content-Length` first, then the running byte count, and aborts **before** an oversized payload is fully buffered. WeChat/Feishu download no inbound bytes (they hand over `fileRef` facts only), so the cap applies where the download actually happens.
+
+### 12.2 Generic outbound retry + per-chatKey backpressure
+
+- Kit adds a pure reducer `deliverQueueReduce` (same style as `merge`/`stream`: state in, effects out, timers owned by the caller). One bounded queue + one serial worker per chatKey; a full queue rejects with backpressure.
+- Effects: `attempt` / `retry-after` / `give-up` / `reject-backpressure`; options `maxRetries` (3), `baseDelayMs` (1s → 1/2/4s exponential), `maxQueue` (32), `spacingMs` (1s, preserving the inter-chunk rate limit).
+- All three providers route ledger-tracked `sendOutbound` through the queue. The queue decides *when* to call `deliver()`; the `channel/deliver` waterfall still decides *what happens* on an attempt — no event-contract change.
+
+### 12.3 Reactions (cheap ack)
+
+- `Channel` gains `get supportsReactions()` (default `false`) and `async react(chatKey, messageId, emoji)` (default no-op; implementations throw so the caller can fall back).
+- Telegram (`setMessageReaction`) and Feishu (`message_reaction.create`) implement it; WeChat has no reaction API. The merge `ack-long` effect now reacts instead of sending a text `Received, working on it…`, falling back to text when unsupported or on failure.
+
+### 12.4 `mentionsBot` observation
+
+- Telegram: the bridge resolves its own identity once via `getMe`, then `ingest()` scans `message.entities` (`text_mention` → bot id, `mention` → `@username`).
+- Feishu reads `message.mentions`. WeChat's iLink payload carries no mention metadata, so it stays `false`. Still observational — v1 does not route group chats.
 
 ---
 
