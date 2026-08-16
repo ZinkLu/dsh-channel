@@ -9,7 +9,7 @@
 
 The message-channel common layer for DeepSeek Harness (dsh) plus multiple provider implementations (Telegram / WeChat / Feishu / …, with more added continuously in this repo).
 
-Split into five packages per [dsh-channel-design.md](./dsh-channel-design.md).
+Split into six packages per [dsh-channel-design.md](./dsh-channel-design.md).
 
 For the alignment baseline against dsh's own core/seam, see [docs/dsh-core-reference.md](./docs/dsh-core-reference.md)
 (full ctx seam/core table + core packages + lifecycle + tool pipeline + session log, checked line-by-line
@@ -19,8 +19,9 @@ against the rc.6 source), and [docs/dsh-core-alignment-audit.md](./docs/dsh-core
 | Package | Directory | Description |
 |---|---|---|
 | `dsh-channel` | `packages/channel` | Contract package: `ctx.channels` registry, `Channel` abstract base class, `channel/*` event vocabulary, `MessageSourceMap.channel` merging |
-| `dsh-channel-kit` | `packages/channel-kit` | Pure-function library for the six grunt-work tasks: chunk / merge / router / approval-render / store / format / promptHint |
-| `dsh-channel-telegram` | `packages/channel-telegram` | First provider: Telegram long polling, HTML rendering, inline-keyboard approval, delivery ledger |
+| `dsh-channel-kit` | `packages/channel-kit` | Pure-function library: chunk / merge / router / approval-render / store / format / prompt-render / stream / deliver-queue (retry + backpressure) / media-limit |
+| `dsh-channel-config` | `packages/channel-config` | Shared channel configuration: agent-routing/behavior/allowlist schema constructors, credential refs, and settings namespaces |
+| `dsh-channel-telegram` | `packages/channel-telegram` | First provider: Telegram long polling, HTML rendering, inline-keyboard approval, delivery ledger, reactions, inbound media size cap |
 | `dsh-channel-wechat` | `packages/channel-wechat` | WeChat (iLink Bot API): long polling, markdown pass-through, numbered-text approval |
 | `dsh-channel-feishu` | `packages/channel-feishu` | Feishu / Lark: long-lived (WebSocket) inbound, plain-text rendering, numbered-text approval |
 
@@ -30,7 +31,7 @@ against the rc.6 source), and [docs/dsh-core-alignment-audit.md](./docs/dsh-core
 
 ```bash
 npm install          # install workspace dependencies
-npm run build -ws    # build all five packages into each package's lib/
+npm run build -ws    # build all six packages into each package's lib/
 npm run test -ws     # run all tests
 npm run typecheck -ws
 ```
@@ -116,11 +117,12 @@ It loads `dsh-channel` + `dsh-agent` + `dsh-credentials-local` + `dsh-channel-te
 
 | Package | Tests | Coverage |
 |---|---|---|
-| `dsh-channel` | 6 | register/unregister, duplicate-registration rejection, deliver default, waterfall observation and short-circuit, event broadcast |
-| `dsh-channel-kit` | 65 | chunk fence padding/prefix convergence, merge three iron rules and `..`/`!!`, router decision table, approval numbering/timeout, store state machine and JSON file, format three-tier degradation and `<tool_calls>`/reasoning sanitization, prompt-render options/multi-select/free-text, tool-display, stream reducer |
-| `dsh-channel-telegram` | 10 | Telegram API calls and redaction, HTML-failure fallback to plain text, inbound routing/merge/delivery, allowlist, approval answerer timeout `next()`, `<tool_calls>` leak interception, agent preset join, progress draft, user-questions provider |
+| `dsh-channel` | 10 | register/unregister, duplicate-registration rejection, deliver default, waterfall observation and short-circuit, event broadcast, `supportsReactions`/`react` |
+| `dsh-channel-config` | 5 | shared schema defaults/required/union across telegram/wechat/feishu, numeric vs string allowlist element types, `maxInboundMediaBytes` default/override |
+| `dsh-channel-kit` | 80 | chunk fence padding/prefix convergence, merge three iron rules and `..`/`!!`, router decision table, approval numbering/timeout, store state machine and JSON file, format three-tier degradation and `<tool_calls>`/reasoning sanitization, prompt-render options/multi-select/free-text, tool-display, stream reducer, deliver-queue retry/backoff/spacing/backpressure, media size guard |
+| `dsh-channel-telegram` | 23 | Telegram API calls and redaction, HTML-failure fallback to plain text, inbound routing/merge/delivery, allowlist, approval answerer timeout `next()`, `<tool_calls>` leak interception, agent preset join, progress draft, user-questions provider, settings namespace registration, inbound media size cap (streaming + Content-Length), `getMe`/`setMessageReaction`, group `mentionsBot` observation, ack-long reaction |
 | `dsh-channel-wechat` | 5 | iLink getupdates/sendmessage calls and redaction, context_token echo, inbound routing/merge/delivery, allowlist |
-| `dsh-channel-feishu` | 11 | tenant_access_token cache, sendMessage receive_id_type parsing, protobuf frame encode/decode, inbound event routing/delivery, allowlist |
+| `dsh-channel-feishu` | 13 | tenant_access_token cache, sendMessage receive_id_type parsing, protobuf frame encode/decode, inbound event routing/delivery, allowlist, `createReaction`/`react` |
 
 ---
 
@@ -131,6 +133,7 @@ It loads `dsh-channel` + `dsh-agent` + `dsh-credentials-local` + `dsh-channel-te
 ├── packages/
 │   ├── channel/          # dsh-channel (contract)
 │   ├── channel-kit/      # dsh-channel-kit (pure-function library)
+│   ├── channel-config/   # dsh-channel-config (shared config schemas)
 │   ├── channel-telegram/ # dsh-channel-telegram
 │   ├── channel-wechat/   # dsh-channel-wechat (WeChat iLink Bot API)
 │   └── channel-feishu/   # dsh-channel-feishu (Feishu / Lark long-lived connection)
@@ -146,10 +149,15 @@ It loads `dsh-channel` + `dsh-agent` + `dsh-credentials-local` + `dsh-channel-te
 ### Notes
 
 - Media capability (design §10) is implemented in the contract: `InboundMedia`/`OutboundMedia`/`supportsMedia`/`sendMedia`. Telegram `supportsMedia=true` (inbound images `getFile`→`ctx.attachments.saveImage`→model-visible image block; outbound `sendPhoto`/`sendDocument`); WeChat/Feishu `supportsMedia=false`, inbound only carries the `fileRef` fact (no byte download).
+- Inbound media size cap: `maxInboundMediaBytes` (shared config, default 20 MiB) is enforced by Telegram's `getFile` — it checks `Content-Length` then the running byte count and aborts *before* an oversized body is fully buffered (kit `assertMediaWithinLimit`).
+- Outbound resilience: every provider routes ledger-tracked sends through a per-chatKey `deliver-queue` (kit reducer) — one serial worker, generic retry with exponential backoff (3 retries, 1/2/4s), and queue-full backpressure. The queue decides *when* to call `deliver()`; the `channel/deliver` waterfall still decides *what happens*.
+- Reactions (cheap ack): `Channel.supportsReactions`/`react()`. Telegram (via `setMessageReaction`) and Feishu (via `message_reaction.create`) support it; a long-message `ack-long` now reacts instead of sending a `Received, working on it…` text (falling back to text when unsupported or on failure). WeChat has no reaction API.
+- `mentionsBot` is now observed: Telegram inspects `entities` (`text_mention`/`mention`) against its own `getMe` identity; Feishu reads `mentions`. WeChat's iLink payload carries no mention metadata, so it stays `false`. Still observational — v1 does not route group chats.
 - v1 does not route group chats (`chatType !== 'direct'` is dropped directly).
 - The outbound delivery ledger lives in `state.json`; the in-memory `ChannelStore` implementation is available for tests.
-- Dependency direction: each provider (`dsh-channel-telegram` / `-wechat` / `-feishu`) depends only on `dsh-channel` + `dsh-channel-kit`; policy plugins depend only on `dsh-channel`.
-- Capability differences only go through "capability facts + degradation": Telegram `html`+buttons+progress, WeChat `markdown`+typing+off, Feishu `plain`+off — `dsh-channel`/`dsh-channel-kit` are unchanged (A5 verified).
+- Dependency direction: each provider (`dsh-channel-telegram` / `-wechat` / `-feishu`) depends only on `dsh-channel` + `dsh-channel-kit` + `dsh-channel-config`; policy plugins depend only on `dsh-channel`.
+- Each provider registers its config as a dsh `settings` namespace (`channel-telegram` / `channel-wechat` / `channel-feishu`) via `installSettingsSection`; the resolved value layers schema defaults < composition config < user document. Secrets stay in `ctx.credentials`. See [docs/dsh-channel-settings-design.md](./docs/dsh-channel-settings-design.md).
+- Capability differences only go through "capability facts + degradation": Telegram `html`+buttons+progress+reactions, WeChat `markdown`+typing+off, Feishu `plain`+off+reactions — `dsh-channel`/`dsh-channel-kit` hold the shared facts (`supportsReactions`/`react`), providers only fill them in (A5 verified).
 
 ---
 
@@ -158,7 +166,7 @@ It loads `dsh-channel` + `dsh-agent` + `dsh-credentials-local` + `dsh-channel-te
 
 DeepSeek Harness (dsh) 的消息渠道公共层与多个 provider 实现（Telegram / 微信 / 飞书 / …，本仓库持续新增）。
 
-按照 [dsh-channel-design.md](./dsh-channel-design.md) 拆为五个包。
+按照 [dsh-channel-design.md](./dsh-channel-design.md) 拆为六个包。
 
 对 dsh 本身核心/seam 的对齐基线，见 [docs/dsh-core-reference.md](./docs/dsh-core-reference.md)
 （ctx seam/core 全表 + 核心包 + 生命周期 + 工具流水线 + 会话日志，逐条对照 rc.6 源码），
@@ -168,8 +176,9 @@ DeepSeek Harness (dsh) 的消息渠道公共层与多个 provider 实现（Teleg
 | 包 | 目录 | 说明 |
 |---|---|---|
 | `dsh-channel` | `packages/channel` | 契约包：`ctx.channels` 注册表、`Channel` 抽象基类、`channel/*` 事件词汇表、`MessageSourceMap.channel` 归并 |
-| `dsh-channel-kit` | `packages/channel-kit` | 六件脏活的纯函数库：chunk / merge / router / approval-render / store / format / promptHint |
-| `dsh-channel-telegram` | `packages/channel-telegram` | 第一个 provider：Telegram 长轮询、HTML 渲染、inline-keyboard 审批、delivery ledger |
+| `dsh-channel-kit` | `packages/channel-kit` | 纯函数库：chunk / merge / router / approval-render / store / format / prompt-render / stream / deliver-queue（重试 + 背压）/ media-limit |
+| `dsh-channel-config` | `packages/channel-config` | 共享渠道配置：agent 路由/行为/allowlist schema 构造器、凭证 ref、settings 命名空间 |
+| `dsh-channel-telegram` | `packages/channel-telegram` | 第一个 provider：Telegram 长轮询、HTML 渲染、inline-keyboard 审批、delivery ledger、表情回应、入站媒体大小上限 |
 | `dsh-channel-wechat` | `packages/channel-wechat` | 微信（iLink Bot API）：长轮询、markdown 透传、编号文本审批 |
 | `dsh-channel-feishu` | `packages/channel-feishu` | 飞书 / Lark：长连接（WebSocket）入站、纯文本渲染、编号文本审批 |
 
@@ -179,7 +188,7 @@ DeepSeek Harness (dsh) 的消息渠道公共层与多个 provider 实现（Teleg
 
 ```bash
 npm install          # 安装 workspace 依赖
-npm run build -ws    # 构建五个包到各包 lib/
+npm run build -ws    # 构建六个包到各包 lib/
 npm run test -ws     # 运行全部测试
 npm run typecheck -ws
 ```
@@ -266,11 +275,12 @@ TELEGRAM_BOT_TOKEN='...' node scripts/run-echo-bot.mjs
 
 | 包 | 测试数 | 覆盖点 |
 |---|---|---|
-| `dsh-channel` | 6 | 注册/卸载、重复注册拒绝、deliver 缺省、waterfall 观察与短路、事件广播 |
-| `dsh-channel-kit` | 65 | chunk 围栏补齐/前缀收敛、merge 三铁律与 `..`/`!!`、router 决策表、approval 编号/超时、store 状态机与 JSON 文件、format 三档降级与 `<tool_calls>`/reasoning 净化、prompt-render 选项/多选/自由文本、tool-display、stream reducer |
-| `dsh-channel-telegram` | 10 | Telegram API 调用与脱敏、HTML 失败降级纯文本、入站路由/merge/投递、allowlist、审批 answerer 超时 `next()`、`<tool_calls>` 泄漏拦截、agent preset join、progress 草稿、user-questions provider |
+| `dsh-channel` | 10 | 注册/卸载、重复注册拒绝、deliver 缺省、waterfall 观察与短路、事件广播、`supportsReactions`/`react` |
+| `dsh-channel-config` | 5 | telegram/wechat/feishu 共享 schema 的默认值/必填/枚举、数字 vs 字符串 allowlist 元素类型、`maxInboundMediaBytes` 默认/覆盖 |
+| `dsh-channel-kit` | 80 | chunk 围栏补齐/前缀收敛、merge 三铁律与 `..`/`!!`、router 决策表、approval 编号/超时、store 状态机与 JSON 文件、format 三档降级与 `<tool_calls>`/reasoning 净化、prompt-render 选项/多选/自由文本、tool-display、stream reducer、deliver-queue 重试/退避/间隔/背压、媒体大小守卫 |
+| `dsh-channel-telegram` | 23 | Telegram API 调用与脱敏、HTML 失败降级纯文本、入站路由/merge/投递、allowlist、审批 answerer 超时 `next()`、`<tool_calls>` 泄漏拦截、agent preset join、progress 草稿、user-questions provider、settings 命名空间注册、入站媒体大小上限（流式 + Content-Length）、`getMe`/`setMessageReaction`、群聊 `mentionsBot` 观察、ack-long 表情回应 |
 | `dsh-channel-wechat` | 5 | iLink getupdates/sendmessage 调用与脱敏、context_token 回显、入站路由/merge/投递、allowlist |
-| `dsh-channel-feishu` | 11 | tenant_access_token 缓存、sendMessage receive_id_type 解析、protobuf 帧编解码、入站事件路由/投递、allowlist |
+| `dsh-channel-feishu` | 13 | tenant_access_token 缓存、sendMessage receive_id_type 解析、protobuf 帧编解码、入站事件路由/投递、allowlist、`createReaction`/`react` |
 
 ---
 
@@ -281,6 +291,7 @@ TELEGRAM_BOT_TOKEN='...' node scripts/run-echo-bot.mjs
 ├── packages/
 │   ├── channel/          # dsh-channel（契约）
 │   ├── channel-kit/      # dsh-channel-kit（纯函数库）
+│   ├── channel-config/   # dsh-channel-config（共享配置 schema）
 │   ├── channel-telegram/ # dsh-channel-telegram
 │   ├── channel-wechat/   # dsh-channel-wechat（微信 iLink Bot API）
 │   └── channel-feishu/   # dsh-channel-feishu（飞书 / Lark 长连接）
@@ -296,7 +307,12 @@ TELEGRAM_BOT_TOKEN='...' node scripts/run-echo-bot.mjs
 ### 注意事项
 
 - 媒体能力（design §10）已落地契约：`InboundMedia`/`OutboundMedia`/`supportsMedia`/`sendMedia`。Telegram `supportsMedia=true`（入站图片 `getFile`→`ctx.attachments.saveImage`→模型可见 image 块；出站 `sendPhoto`/`sendDocument`）；WeChat/Feishu `supportsMedia=false`，入站只带 `fileRef` 事实（不下载字节）。
+- 入站媒体大小上限：`maxInboundMediaBytes`（共享配置，默认 20 MiB）由 Telegram 的 `getFile` 强制——先查 `Content-Length`，再累计读取字节数，在超大 payload 被完整缓冲**之前**中止（kit 的 `assertMediaWithinLimit`）。
+- 出站韧性：每个 provider 把走 ledger 的发送都经由 per-chatKey 的 `deliver-queue`（kit reducer）——单串行 worker、通用重试（指数退避 3 次，1/2/4s）、队列满背压。队列决定**何时**调用 `deliver()`；`channel/deliver` waterfall 仍决定**这次尝试发生什么**。
+- 表情回应（廉价 ack）：`Channel.supportsReactions`/`react()`。Telegram（`setMessageReaction`）与 Feishu（`message_reaction.create`）支持；长消息的 `ack-long` 现在改为回表情而非发 `Received, working on it…`（不支持或失败时降级回文本）。WeChat 无表情 API。
+- `mentionsBot` 现为真实观察：Telegram 对照自身 `getMe` 身份扫描 `entities`（`text_mention`/`mention`）；Feishu 读 `mentions`。WeChat 的 iLink payload 无 @ 元数据，保持 `false`。仍是纯观察——v1 不路由群聊。
 - v1 不路由群聊（`chatType !== 'direct'` 直接 drop）。
 - 出站 delivery ledger 存在 `state.json` 中；进程内 `ChannelStore` 纯内存实现可用于测试。
-- 依赖方向：每个 provider（`dsh-channel-telegram` / `-wechat` / `-feishu`）只依赖 `dsh-channel` + `dsh-channel-kit`；策略插件只依赖 `dsh-channel`。
-- 能力差异只走「能力事实 + 降级」：Telegram `html`+按钮+progress、WeChat `markdown`+typing+off、Feishu `plain`+off——`dsh-channel`/`dsh-channel-kit` 零改动（A5 验证）。
+- 依赖方向：每个 provider（`dsh-channel-telegram` / `-wechat` / `-feishu`）只依赖 `dsh-channel` + `dsh-channel-kit` + `dsh-channel-config`；策略插件只依赖 `dsh-channel`。
+- 每个 provider 通过 `installSettingsSection` 把配置注册为 dsh 的 `settings` 命名空间（`channel-telegram` / `channel-wechat` / `channel-feishu`）；解析值 = schema 默认值 < 组合配置 < 用户文档。secret 仍走 `ctx.credentials`。见 [docs/dsh-channel-settings-design.md](./docs/dsh-channel-settings-design.md)。
+- 能力差异只走「能力事实 + 降级」：Telegram `html`+按钮+progress+表情、WeChat `markdown`+typing+off、Feishu `plain`+off+表情——`dsh-channel`/`dsh-channel-kit` 承载共享事实（`supportsReactions`/`react`），provider 只填充（A5 验证）。

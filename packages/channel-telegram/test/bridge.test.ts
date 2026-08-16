@@ -17,17 +17,23 @@ function createFakeClient(updates: TelegramUpdate[]): TelegramClient & {
   sends: Array<{ chatId: string; text: string }>
   edits: Array<{ chatId: string; messageId: number; text: string }>
   deletes: number[]
+  reactions: Array<{ chatId: string; messageId: number; emoji: string }>
   calls: number
 } {
   const sends: Array<{ chatId: string; text: string }> = []
   const edits: Array<{ chatId: string; messageId: number; text: string }> = []
   const deletes: number[] = []
+  const reactions: Array<{ chatId: string; messageId: number; emoji: string }> = []
   let calls = 0
   return {
     sends,
     edits,
     deletes,
+    reactions,
     calls: 0,
+    async getMe(): Promise<{ id: number; username?: string }> {
+      return { id: 777, username: 'test_bot' }
+    },
     async getUpdates(_token: string, opts: { signal?: AbortSignal } = {}): Promise<TelegramUpdate[]> {
       calls++
       if (calls === 1) return updates
@@ -54,6 +60,10 @@ function createFakeClient(updates: TelegramUpdate[]): TelegramClient & {
     async answerCallbackQuery(): Promise<boolean> {
       return true
     },
+    async setMessageReaction(_token: string, chatId: string, messageId: number, emoji: string): Promise<boolean> {
+      reactions.push({ chatId, messageId, emoji })
+      return true
+    },
     async editMessageText(_token: string, chatId: string, messageId: number, text: string): Promise<{ message_id: number }> {
       edits.push({ chatId, messageId, text })
       return { message_id: messageId }
@@ -66,6 +76,7 @@ function createFakeClient(updates: TelegramUpdate[]): TelegramClient & {
     sends: Array<{ chatId: string; text: string }>
     edits: Array<{ chatId: string; messageId: number; text: string }>
     deletes: number[]
+    reactions: Array<{ chatId: string; messageId: number; emoji: string }>
     calls: number
   }
 }
@@ -120,7 +131,7 @@ test('bridge ingests, routes, merges, and dispatches to agent', async () => {
   root.channels.register(channel)
   const bridge = new TelegramBridge(
     root,
-    { allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 0.05, approvalTimeoutSec: 120 },
+    () => ({ allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 0.05, approvalTimeoutSec: 120 }),
     createMemoryStore(),
     channel,
     client,
@@ -166,7 +177,7 @@ test('bridge rejects non-allowlisted sender with a local reply', async () => {
   root.channels.register(channel)
   const bridge = new TelegramBridge(
     root,
-    { allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 0.05, approvalTimeoutSec: 120 },
+    () => ({ allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 0.05, approvalTimeoutSec: 120 }),
     createMemoryStore(),
     channel,
     client,
@@ -213,7 +224,7 @@ test('approval answerer defers to next for non-owned agents and times out for ow
 
   const bridge = new TelegramBridge(
     root,
-    { allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 5, approvalTimeoutSec: 0.05 },
+    () => ({ allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 5, approvalTimeoutSec: 0.05 }),
     store,
     channel,
     client,
@@ -227,6 +238,49 @@ test('approval answerer defers to next for non-owned agents and times out for ow
   assert.equal(own, 'unavailable')
 
   await bridge.stop()
+})
+
+test('bridge escapes HTML specials in approval prompts before HTML delivery', async () => {
+  const root = new Context()
+  new ChannelRegistry(root)
+
+  root.provide('agents', {
+    list: () => [],
+    get: () => undefined,
+    resume: async () => { throw new Error('no persistence') },
+    create: async () => { throw new Error('not used') },
+  })
+  root.provide('credentials', { resolve: async () => ({ value: 'test-token', source: 'test' }) })
+
+  const store = createMemoryStore()
+  store.setBinding('42', 'channel:telegram:42')
+
+  const client = createFakeClient([])
+  const channel = new TelegramChannel({ client, resolveToken: async () => 'test-token' })
+  root.channels.register(channel)
+
+  const bridge = new TelegramBridge(
+    root,
+    () => ({ allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 5, approvalTimeoutSec: 0.05 }),
+    store,
+    channel,
+    client,
+  )
+  await bridge.start()
+
+  await root.waterfall(
+    'approval/request',
+    { agent: { id: 'channel:telegram:42' }, toolName: 'Bash', reason: 'run <script> && exit 1 > /dev/null' },
+    async () => 'unavailable',
+  )
+
+  await waitFor(() => client.sends.length >= 1)
+  await bridge.stop()
+
+  const sent = client.sends.map((send) => send.text).join('\n')
+  assert.ok(sent.includes('Bash'))
+  assert.ok(sent.includes('&lt;script&gt;'), `expected escaped reason, got: ${JSON.stringify(sent)}`)
+  assert.ok(!sent.includes('<script>'))
 })
 
 test('bridge strips leaked <tool_calls> markup before delivering assistant text', async () => {
@@ -252,7 +306,7 @@ test('bridge strips leaked <tool_calls> markup before delivering assistant text'
 
   const bridge = new TelegramBridge(
     root,
-    { allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 5, approvalTimeoutSec: 120 },
+    () => ({ allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 5, approvalTimeoutSec: 120 }),
     store,
     channel,
     client,
@@ -334,7 +388,7 @@ test('bridge joins the host default agent preset when creating an agent', async 
   root.channels.register(channel)
   const bridge = new TelegramBridge(
     root,
-    { allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 0.05, approvalTimeoutSec: 120 },
+    () => ({ allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 0.05, approvalTimeoutSec: 120 }),
     createMemoryStore(),
     channel,
     client,
@@ -367,7 +421,7 @@ test('bridge shows a progress draft for tool calls and finalizes it on the answe
   root.channels.register(channel)
   const bridge = new TelegramBridge(
     root,
-    { allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 5, approvalTimeoutSec: 120 },
+    () => ({ allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 5, approvalTimeoutSec: 120 }),
     store,
     channel,
     client,
@@ -420,7 +474,7 @@ test('bridge registers a user-questions provider and renders an option prompt', 
   root.channels.register(channel)
   const bridge = new TelegramBridge(
     root,
-    { allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 0.05, approvalTimeoutSec: 120 },
+    () => ({ allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 0.05, approvalTimeoutSec: 120 }),
     createMemoryStore(),
     channel,
     client,
@@ -430,7 +484,7 @@ test('bridge registers a user-questions provider and renders an option prompt', 
 
   // Agent created → provider registered; ask() renders the option prompt.
   const answerPromise = registeredProvider!.ask({
-    questions: [{ id: 'q1', question: 'pick', options: [{ label: 'A' }, { label: 'B' }] }],
+    questions: [{ id: 'q1', question: 'pick <a> or <b>', options: [{ label: 'A' }, { label: 'B' }] }],
     agent: { id: sessionId },
   })
   await waitFor(() => client.sends.some((s) => s.text.includes('pick')), 2000)
@@ -438,6 +492,9 @@ test('bridge registers a user-questions provider and renders an option prompt', 
   // Text reply "2" → parsed to the prompt → returns selected ['B'].
   // Going through a second getUpdates batch is too roundabout; here we just assert rendering completed; reply parsing is covered by kit unit tests + resolvePrompt.
   assert.ok(client.sends.some((s) => s.text.includes('pick')))
+  // Question text is LLM-generated and must be HTML-escaped before HTML delivery.
+  assert.ok(client.sends.some((s) => s.text.includes('&lt;a&gt; or &lt;b&gt;')))
+  assert.ok(!client.sends.some((s) => s.text.includes('<a> or <b>')))
   void answerPromise
   await bridge.stop()
 })
@@ -496,7 +553,7 @@ test('bridge ingests media facts and downloads an inbound photo into an image bl
   root.channels.register(channel)
   const bridge = new TelegramBridge(
     root,
-    { allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 0.05, approvalTimeoutSec: 120 },
+    () => ({ allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 0.05, approvalTimeoutSec: 120 }),
     createMemoryStore(),
     channel,
     client,
@@ -521,4 +578,96 @@ test('bridge ingests media facts and downloads an inbound photo into an image bl
   assert.equal(content[0].text, 'look at this')
   assert.equal(content[1].type, 'image')
   assert.equal(content[1].attachment.attachmentId, 'att-1')
+})
+
+test('bridge observes group mentionsBot via a text_mention entity', async () => {
+  const root = new Context()
+  new ChannelRegistry(root)
+
+  root.provide('agents', {
+    list: () => [],
+    get: () => undefined,
+    resume: async () => { throw new Error('no persistence') },
+    create: async () => { throw new Error('group chats do not create agents') },
+  })
+  root.provide('credentials', { resolve: async () => ({ value: 'test-token', source: 'test' }) })
+
+  const updates: TelegramUpdate[] = [
+    {
+      update_id: 1,
+      message: {
+        message_id: 100,
+        from: { id: 123, is_bot: false, first_name: 'Alice' },
+        chat: { id: -100, type: 'group' },
+        date: 1_700_000_000,
+        text: 'hi @bot',
+        entities: [{ type: 'text_mention', offset: 3, length: 4, user: { id: 777, is_bot: true, username: 'test_bot' } }],
+      },
+    },
+  ]
+  const client = createFakeClient(updates)
+  const channel = new TelegramChannel({ client, resolveToken: async () => 'test-token' })
+  root.channels.register(channel)
+  const bridge = new TelegramBridge(
+    root,
+    () => ({ allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 0.05, approvalTimeoutSec: 120 }),
+    createMemoryStore(),
+    channel,
+    client,
+  )
+
+  const emitted: any[] = []
+  root.on('channel/message', (msg) => { emitted.push(msg) })
+
+  await bridge.start()
+  await waitFor(() => emitted.length === 1)
+  await bridge.stop()
+
+  assert.equal(emitted[0].chatType, 'group')
+  assert.equal(emitted[0].mentionsBot, true)
+})
+
+test('bridge reacts to a long message instead of a text ack', async () => {
+  const root = new Context()
+  new ChannelRegistry(root)
+
+  const followed: any[] = []
+  const fakeAgent = { id: 'channel:telegram:42', status: 'idle' as const, session: { events: [] as any[] }, followup(m: any) { followed.push(m) }, steer(m: any) { followed.push(m) } }
+  root.provide('agents', {
+    list: () => [],
+    get: () => undefined,
+    resume: async () => { throw new Error('no persistence') },
+    create: async () => ({ agent: fakeAgent, dispose: async () => {} }),
+  })
+  root.provide('credentials', { resolve: async () => ({ value: 'test-token', source: 'test' }) })
+
+  const updates: TelegramUpdate[] = [
+    {
+      update_id: 1,
+      message: {
+        message_id: 100,
+        from: { id: 123, is_bot: false, first_name: 'Alice' },
+        chat: { id: 42, type: 'private' },
+        date: 1_700_000_000,
+        text: 'a'.repeat(4000),
+      },
+    },
+  ]
+  const client = createFakeClient(updates)
+  const channel = new TelegramChannel({ client, resolveToken: async () => 'test-token' })
+  root.channels.register(channel)
+  const bridge = new TelegramBridge(
+    root,
+    () => ({ allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 0.05, approvalTimeoutSec: 120 }),
+    createMemoryStore(),
+    channel,
+    client,
+  )
+
+  await bridge.start()
+  await waitFor(() => client.reactions.length >= 1)
+  await bridge.stop()
+
+  assert.deepEqual(client.reactions, [{ chatId: '42', messageId: 100, emoji: '👀' }])
+  assert.ok(!client.sends.some((s) => s.text.includes('Received, working on it…')))
 })

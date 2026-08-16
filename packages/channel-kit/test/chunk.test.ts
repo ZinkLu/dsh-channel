@@ -50,3 +50,28 @@ test('chunkText prefers sentence breaks but always respects maxChars', () => {
   }
   assert.ok(chunks.length >= 2)
 })
+
+test('chunkText in codepoint mode never splits a surrogate pair at the boundary', () => {
+  // '😀' (U+1F600) is two UTF-16 code units; here it straddles the maxChars cut point
+  // (maxChars = 5 lands between the high surrogate at index 4 and low surrogate at index 5).
+  const text = 'AAAA😀BB'
+  const chunks = chunkText(text, { maxChars: 5 })
+  for (const chunk of chunks) {
+    assert.ok(hasNoLoneSurrogate(chunk), `chunk contains a lone surrogate: ${JSON.stringify(chunk)}`)
+  }
+  assert.deepEqual(chunks, ['AAAA', '😀BB'])
+})
+
+function hasNoLoneSurrogate(text: string): boolean {
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i)
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = text.charCodeAt(i + 1)
+      if (next < 0xdc00 || next > 0xdfff) return false
+      i++
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return false // lone low surrogate
+    }
+  }
+  return true
+}

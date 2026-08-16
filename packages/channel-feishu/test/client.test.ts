@@ -84,3 +84,33 @@ test('FeishuChannel.send resolves credentials and returns message id', async () 
   const result = await channel.send('oc_chat1', 'hello')
   assert.equal(result.platformMessageId, 'om_1')
 })
+
+test('FeishuClient.createReaction maps the ack emoji to an emoji_type', async () => {
+  const calls: Array<{ url: string; body: unknown }> = []
+  const client = new FeishuClient({
+    domain: 'feishu',
+    fetch: (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), body: JSON.parse(String(init?.body)) })
+      return new Response(JSON.stringify({ code: 0 }), { status: 200 })
+    }) as typeof fetch,
+  })
+
+  await client.createReaction('tok', 'om_1', '👀')
+  assert.equal(calls[0]!.url, 'https://open.feishu.cn/open-apis/im/v1/messages/om_1/reactions')
+  assert.deepEqual(calls[0]!.body, { reaction_type: { emoji_type: 'ONLOOKER' } })
+})
+
+test('FeishuChannel.react resolves credentials and calls createReaction', async () => {
+  const reacted: Array<{ messageId: string; emoji: string }> = []
+  const client = {
+    async getTenantAccessToken(): Promise<string> { return 'tok' },
+    async createReaction(_token: string, messageId: string, emoji: string): Promise<void> {
+      reacted.push({ messageId, emoji })
+    },
+  } as any
+
+  const channel = new FeishuChannel({ client, resolveCredentials: async () => ({ appId: 'cli_a', appSecret: 'secret_b' }) })
+  assert.equal(channel.supportsReactions, true)
+  await channel.react('oc_chat1', 'om_1', '👀')
+  assert.deepEqual(reacted, [{ messageId: 'om_1', emoji: '👀' }])
+})

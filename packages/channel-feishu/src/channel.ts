@@ -51,6 +51,16 @@ export class FeishuChannel extends Channel {
   get supportsMultiSelect(): boolean {
     return false
   }
+  get supportsReactions(): boolean {
+    return true
+  }
+
+  async react(chatKey: string, messageId: string, emoji: string): Promise<void> {
+    const credentials = await this.opts.resolveCredentials()
+    if (!credentials) throw new Error('FEISHU_APP_ID / FEISHU_APP_SECRET are not configured')
+    const token = await this.opts.client.getTenantAccessToken(credentials)
+    await this.opts.client.createReaction(token, messageId, emoji)
+  }
 
   async send(
     chatKey: string,

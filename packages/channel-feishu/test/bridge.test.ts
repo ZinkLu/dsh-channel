@@ -74,7 +74,7 @@ test('bridge routes an inbound p2p text event to the agent', async () => {
   root.channels.register(channel)
   const bridge = new FeishuBridge(
     root,
-    { allowedUserIds: ['ou_alice'], provider: 'deepseek-official', mergeWindowSec: 0.05, approvalTimeoutSec: 120 },
+    () => ({ allowedUserIds: ['ou_alice'], provider: 'deepseek-official', mergeWindowSec: 0.05, approvalTimeoutSec: 120 }),
     createMemoryStore(),
     channel,
     client,
@@ -108,7 +108,7 @@ test('bridge rejects non-allowlisted sender', async () => {
   root.channels.register(channel)
   const bridge = new FeishuBridge(
     root,
-    { allowedUserIds: ['ou_alice'], provider: 'deepseek-official', mergeWindowSec: 0.05, approvalTimeoutSec: 120 },
+    () => ({ allowedUserIds: ['ou_alice'], provider: 'deepseek-official', mergeWindowSec: 0.05, approvalTimeoutSec: 120 }),
     createMemoryStore(),
     channel,
     client,

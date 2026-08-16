@@ -10,6 +10,9 @@ import type { InboundMedia, InboundMessage, OutboundMessage, PresentationFrame }
 import {
   chunkText,
   createMemoryStore,
+  DEFAULT_MAX_INBOUND_MEDIA_BYTES,
+  deliverQueueReduce,
+  emptyDeliverQueueState,
   emptyMergeState,
   emptyStreamState,
   mergeReduce,
@@ -24,11 +27,15 @@ import {
   stripReasoningTags,
   stripToolCallMarkup,
   type ChannelStore,
+  type DeliverQueueEffect,
+  type DeliverQueueOptions,
+  type DeliverQueueState,
   type MergeEffect,
   type MergeState,
   type PendingApproval,
   type PendingPrompt,
   type PromptOptions,
+  type QueuedDelivery,
   type RouteDecision,
   type StreamCaps,
   type StreamFrame,
@@ -48,6 +55,14 @@ export interface TelegramBridgeConfig {
   pollingTimeoutSec: number
   mergeWindowSec: number
   approvalTimeoutSec: number
+  maxInboundMediaBytes?: number
+}
+
+/** Payload carried through the deliver queue for a single chunk. */
+interface TelegramDelivery {
+  chatKey: string
+  markdown: string
+  origin?: OutboundMessage['origin']
 }
 
 interface MergeBuffered {
@@ -112,7 +127,7 @@ interface AttachmentsLike {
 
 export class TelegramBridge {
   private readonly ctx: Context
-  private readonly config: TelegramBridgeConfig
+  private readonly source: () => TelegramBridgeConfig
   private readonly store: ChannelStore
   private readonly channel: TelegramChannel
   private readonly client: TelegramClient
@@ -130,19 +145,28 @@ export class TelegramBridge {
   private readonly streamTimers = new Map<string, NodeJS.Timeout>()
   private readonly draftMessageIds = new Map<string, number>()
   private readonly toolCallNames = new Map<string, string>()
+  private readonly deliverQueueStates = new Map<string, DeliverQueueState<TelegramDelivery>>()
+  private readonly deliverQueueTimers = new Map<string, NodeJS.Timeout>()
   private readonly disposers: Array<() => void> = []
 
   private promptSeq = 0
   private pollAbort: AbortController | null = null
   private pollPromise: Promise<void> | null = null
   private started = false
+  private botIdentity: { id: number; username?: string } | undefined
+  private botIdentityPromise: Promise<{ id: number; username?: string } | undefined> | null = null
 
-  constructor(ctx: Context, config: TelegramBridgeConfig, store: ChannelStore, channel: TelegramChannel, client: TelegramClient) {
+  constructor(ctx: Context, source: () => TelegramBridgeConfig, store: ChannelStore, channel: TelegramChannel, client: TelegramClient) {
     this.ctx = ctx
-    this.config = config
+    this.source = source
     this.store = store
     this.channel = channel
     this.client = client
+  }
+
+  /** Dynamic config read: the settings seam may swap the source at runtime. */
+  private get config(): TelegramBridgeConfig {
+    return this.source()
   }
 
   async start(): Promise<void> {
@@ -156,6 +180,8 @@ export class TelegramBridge {
 
     this.ctx.emit('channel/status', 'telegram', 'connecting')
     await this.restore()
+    // Learn the bot's own id/username once up front so group `mentionsBot` can be observed accurately.
+    await this.resolveBotIdentity().catch(() => {})
     this.startPolling()
   }
 
@@ -185,6 +211,9 @@ export class TelegramBridge {
     this.streamStates.clear()
     this.draftMessageIds.clear()
     this.toolCallNames.clear()
+    for (const timer of this.deliverQueueTimers.values()) clearTimeout(timer)
+    this.deliverQueueTimers.clear()
+    this.deliverQueueStates.clear()
     for (const entry of this.pendingApprovals.values()) {
       if (entry.timer) clearTimeout(entry.timer)
       entry.resolve?.('deferred')
@@ -327,6 +356,26 @@ export class TelegramBridge {
     return resolved?.value
   }
 
+  /** Resolve (and cache) the bot's own id + username for `mentionsBot` observation. */
+  private resolveBotIdentity(): Promise<{ id: number; username?: string } | undefined> {
+    if (this.botIdentity !== undefined) return Promise.resolve(this.botIdentity)
+    if (this.botIdentityPromise !== null) return this.botIdentityPromise
+    this.botIdentityPromise = (async () => {
+      try {
+        const token = await this.resolveToken()
+        if (!token) return undefined
+        const me = await this.client.getMe(token)
+        this.botIdentity = { id: me.id, username: me.username }
+        return this.botIdentity
+      } catch {
+        return undefined
+      } finally {
+        this.botIdentityPromise = null
+      }
+    })()
+    return this.botIdentityPromise
+  }
+
   private async processUpdate(update: { update_id: number; message?: TelegramMessage; callback_query?: TelegramCallbackQuery }): Promise<void> {
     if (update.callback_query) {
       await this.processCallbackQuery(update.callback_query)
@@ -412,7 +461,7 @@ export class TelegramBridge {
     this.mergeSenderIds.set(chatKey, senderId)
     this.store.setMergeBuffer(chatKey, result.state.buffer)
 
-    await this.handleMergeEffects(chatKey, result.state, result.effects)
+    await this.handleMergeEffects(chatKey, result.state, result.effects, messageId)
     this.store.markInbound(messageId)
   }
 
@@ -429,7 +478,7 @@ export class TelegramBridge {
       timestamp: message.date * 1000,
       hasMedia: hasMedia(message),
       media,
-      mentionsBot: false,
+      mentionsBot: mentionsBotOf(message, this.botIdentity),
     }
     this.ctx.channels.ingest(inbound)
   }
@@ -443,7 +492,7 @@ export class TelegramBridge {
 
     try {
       const token = await this.requireToken()
-      const { bytes } = await this.client.getFile(token, photo.file_id)
+      const { bytes } = await this.client.getFile(token, photo.file_id, { maxBytes: this.config.maxInboundMediaBytes ?? DEFAULT_MAX_INBOUND_MEDIA_BYTES })
       const mediaType = sniffImageMediaType(bytes)
       if (!mediaType) return []
       const ref = await attachments.saveImage({ data: bytes, mediaType, name: `telegram-${photo.file_id}` })
@@ -468,12 +517,12 @@ export class TelegramBridge {
     await this.dispatchText(chatKey, text, ids, senderId)
   }
 
-  private async handleMergeEffects(chatKey: string, state: MergeState, effects: MergeEffect[]): Promise<void> {
+  private async handleMergeEffects(chatKey: string, state: MergeState, effects: MergeEffect[], ackMessageId?: string): Promise<void> {
     for (const effect of effects) {
       if (effect.kind === 'armTimer') {
         this.armMergeTimer(chatKey, effect.at)
       } else if (effect.kind === 'ack-long') {
-        await this.sendLocal(chatKey, 'Received, working on it…')
+        await this.ackLong(chatKey, ackMessageId)
       } else if (effect.kind === 'flush') {
         const ids = this.mergeMessageIds.get(chatKey) ?? []
         const senderId = this.mergeSenderIds.get(chatKey) ?? '0'
@@ -485,6 +534,19 @@ export class TelegramBridge {
         await this.dispatchText(chatKey, effect.text, ids, senderId)
       }
     }
+  }
+
+  /** ack-long: react to the inbound message when supported, otherwise fall back to a text ack. */
+  private async ackLong(chatKey: string, messageId?: string): Promise<void> {
+    if (this.channel.supportsReactions && messageId !== undefined) {
+      try {
+        await this.channel.react(chatKey, messageId, '👀')
+        return
+      } catch {
+        // Reaction failed (decorative); fall through to the text ack.
+      }
+    }
+    await this.sendLocal(chatKey, 'Received, working on it…')
   }
 
   private armMergeTimer(chatKey: string, at: number): void {
@@ -751,10 +813,11 @@ export class TelegramBridge {
     entry: PromptEntry,
   ): Promise<void> {
     const deliveryKey = `prompt:${entry.requestId}`
+    const text = renderForTier(rendered.text, this.channel.formatTier)
     const out: OutboundMessage =
       rendered.kind === 'choices'
-        ? { channel: 'telegram', chatKey, markdown: rendered.text, choices: rendered.choices.map((c) => ({ id: c.id, label: c.label })), deliveryKey }
-        : { channel: 'telegram', chatKey, markdown: rendered.text, deliveryKey }
+        ? { channel: 'telegram', chatKey, markdown: text, choices: rendered.choices.map((c) => ({ id: c.id, label: c.label })), deliveryKey }
+        : { channel: 'telegram', chatKey, markdown: text, deliveryKey }
     try {
       const receipt = await this.ctx.channels.deliver(out)
       const platformId = receipt.platformMessageIds?.[0]
@@ -890,7 +953,7 @@ export class TelegramBridge {
     await this.channel.sendTyping(chatKey)
   }
 
-  private async sendOutbound(
+  private sendOutbound(
     chatKey: string,
     markdown: string,
     deliveryKey: string,
@@ -906,28 +969,98 @@ export class TelegramBridge {
       if (!opts.recover) {
         this.store.recordDelivery(key, { chatKey, textHash: hashText(chunk) })
       }
-      this.store.markAttempting(key)
-      const receipt = await this.ctx.channels.deliver({
-        channel: 'telegram',
-        chatKey,
-        markdown: chunk,
-        deliveryKey: key,
-        origin: opts.origin,
-      })
-      if (receipt.status === 'sent') {
-        this.store.markDelivered(key, receipt.platformMessageIds ?? [])
-      } else if (receipt.status === 'suppressed') {
-        this.store.markDelivered(key, [])
-      } else {
-        this.store.markFailed(key, receipt.error ?? 'delivery failed')
-        // A chunk failure stops sending later chunks (prevents reordering).
-        return
-      }
-      if (i < chunks.length - 1) {
-        await sleepWithAbort(1000, this.pollAbort?.signal)
-        if (this.pollAbort?.signal.aborted) return
+      this.enqueueDelivery(chatKey, { key, value: { chatKey, markdown: chunk, origin: opts.origin } })
+    }
+    return Promise.resolve()
+  }
+
+  // ---- Deliver queue (serial worker + retry + backpressure per chatKey) ----
+
+  private deliverQueueOptions(): DeliverQueueOptions {
+    return { maxRetries: 3, baseDelayMs: 1000, maxQueue: 32, spacingMs: 1000 }
+  }
+
+  private enqueueDelivery(chatKey: string, item: QueuedDelivery<TelegramDelivery>): void {
+    const state = this.deliverQueueStates.get(chatKey) ?? emptyDeliverQueueState<TelegramDelivery>()
+    const result = deliverQueueReduce(state, { kind: 'enqueue', item, now: Date.now() }, this.deliverQueueOptions())
+    this.deliverQueueStates.set(chatKey, result.state)
+    this.runDeliverEffects(chatKey, result.effects)
+  }
+
+  private runDeliverEffects(chatKey: string, effects: DeliverQueueEffect<TelegramDelivery>[]): void {
+    for (const effect of effects) {
+      switch (effect.kind) {
+        case 'attempt':
+          void this.performAttempt(chatKey, effect.item)
+          break
+        case 'retry-after':
+          this.armDeliverTimer(chatKey, effect.at)
+          break
+        case 'give-up':
+          this.store.markFailed(effect.item.key, effect.error)
+          break
+        case 'reject-backpressure':
+          this.store.markFailed(effect.item.key, 'delivery queue full (backpressure)')
+          break
       }
     }
+  }
+
+  private async performAttempt(chatKey: string, item: QueuedDelivery<TelegramDelivery>): Promise<void> {
+    this.store.markAttempting(item.key)
+    try {
+      const receipt = await this.ctx.channels.deliver({
+        channel: 'telegram',
+        chatKey: item.value.chatKey,
+        markdown: item.value.markdown,
+        deliveryKey: item.key,
+        origin: item.value.origin,
+      })
+      if (receipt.status === 'sent') {
+        this.store.markDelivered(item.key, receipt.platformMessageIds ?? [])
+        this.feedAttemptResult(chatKey, item.key, 'sent')
+      } else if (receipt.status === 'suppressed') {
+        this.store.markDelivered(item.key, [])
+        this.feedAttemptResult(chatKey, item.key, 'suppressed')
+      } else {
+        this.feedAttemptResult(chatKey, item.key, 'failed', receipt.error ?? 'delivery failed')
+      }
+    } catch (error) {
+      this.feedAttemptResult(chatKey, item.key, 'failed', error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  private feedAttemptResult(chatKey: string, key: string, outcome: 'sent' | 'suppressed' | 'failed', error?: string): void {
+    const state = this.deliverQueueStates.get(chatKey) ?? emptyDeliverQueueState<TelegramDelivery>()
+    const result = deliverQueueReduce(state, { kind: 'attempt-result', key, outcome, error, now: Date.now() }, this.deliverQueueOptions())
+    this.deliverQueueStates.set(chatKey, result.state)
+    this.runDeliverEffects(chatKey, result.effects)
+  }
+
+  private armDeliverTimer(chatKey: string, at: number): void {
+    this.clearDeliverTimer(chatKey)
+    const delay = Math.max(0, at - Date.now())
+    const timer = setTimeout(() => {
+      this.deliverQueueTimers.delete(chatKey)
+      this.onDeliverTick(chatKey)
+    }, delay)
+    timer.unref?.()
+    this.deliverQueueTimers.set(chatKey, timer)
+  }
+
+  private clearDeliverTimer(chatKey: string): void {
+    const timer = this.deliverQueueTimers.get(chatKey)
+    if (timer !== undefined) {
+      clearTimeout(timer)
+      this.deliverQueueTimers.delete(chatKey)
+    }
+  }
+
+  private onDeliverTick(chatKey: string): void {
+    const state = this.deliverQueueStates.get(chatKey) ?? emptyDeliverQueueState<TelegramDelivery>()
+    const result = deliverQueueReduce(state, { kind: 'tick', now: Date.now() }, this.deliverQueueOptions())
+    this.deliverQueueStates.set(chatKey, result.state)
+    this.runDeliverEffects(chatKey, result.effects)
   }
 
   private async sendLocal(chatKey: string, markdown: string): Promise<void> {
@@ -1038,10 +1171,11 @@ export class TelegramBridge {
       { supportsChoices: this.channel.supportsChoices },
     )
     const deliveryKey = `approval:${entry.requestId}`
+    const text = renderForTier(rendered.text, this.channel.formatTier)
     const out: OutboundMessage =
       rendered.kind === 'choices'
-        ? { channel: 'telegram', chatKey: entry.chatKey, markdown: rendered.text, choices: rendered.choices, deliveryKey }
-        : { channel: 'telegram', chatKey: entry.chatKey, markdown: rendered.text, deliveryKey }
+        ? { channel: 'telegram', chatKey: entry.chatKey, markdown: text, choices: rendered.choices, deliveryKey }
+        : { channel: 'telegram', chatKey: entry.chatKey, markdown: text, deliveryKey }
 
     try {
       const receipt = await this.ctx.channels.deliver(out)
@@ -1145,6 +1279,17 @@ function mediaFacts(message: TelegramMessage): InboundMedia[] {
 function largestPhoto(photo: readonly TelegramPhotoSize[] | undefined): TelegramPhotoSize | undefined {
   if (!photo || photo.length === 0) return undefined
   return photo.reduce((a, b) => ((b.file_size ?? 0) > (a.file_size ?? 0) ? b : a))
+}
+
+/** Whether the bot was @-mentioned in a group message (text_mention → bot id, mention → `@username`). */
+function mentionsBotOf(message: TelegramMessage, bot: { id: number; username?: string } | undefined): boolean {
+  if (!bot) return false
+  const text = messageText(message)
+  for (const entity of message.entities ?? []) {
+    if (entity.type === 'text_mention' && entity.user?.id === bot.id) return true
+    if (entity.type === 'mention' && bot.username !== undefined && text.slice(entity.offset, entity.offset + entity.length) === `@${bot.username}`) return true
+  }
+  return false
 }
 
 /** Sniff the image media type from bytes (saveImage needs an exact declaration; detect by magic number). */

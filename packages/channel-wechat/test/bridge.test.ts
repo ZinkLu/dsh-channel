@@ -107,7 +107,7 @@ test('bridge ingests, routes, merges, and dispatches to agent', async () => {
   root.channels.register(channel)
   const bridge = new WeChatBridge(
     root,
-    { allowedUserIds: ['alice'], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 0.05, approvalTimeoutSec: 120 },
+    () => ({ allowedUserIds: ['alice'], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 0.05, approvalTimeoutSec: 120 }),
     createMemoryStore(),
     channel,
     client,
@@ -144,7 +144,7 @@ test('bridge rejects non-allowlisted sender with a local reply', async () => {
   root.channels.register(channel)
   const bridge = new WeChatBridge(
     root,
-    { allowedUserIds: ['alice'], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 0.05, approvalTimeoutSec: 120 },
+    () => ({ allowedUserIds: ['alice'], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 0.05, approvalTimeoutSec: 120 }),
     createMemoryStore(),
     channel,
     client,

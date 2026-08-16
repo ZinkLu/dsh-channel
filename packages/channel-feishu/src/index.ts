@@ -1,41 +1,19 @@
-import Schema from '@deepseek-ai/schemastery'
 import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
+import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { CHANNEL_FEISHU_NS, CREDENTIAL_FEISHU_APP_ID, CREDENTIAL_FEISHU_APP_SECRET, feishuConfigSchema, type FeishuConfig } from 'dsh-channel-config'
 import { createJsonFileStore } from 'dsh-channel-kit'
+import { FeishuBridge, type FeishuBridgeConfig } from './bridge.js'
 import { FeishuChannel } from './channel.js'
 import { FeishuClient, FeishuWsClient } from './client.js'
-import { FeishuBridge, type FeishuBridgeConfig } from './bridge.js'
 
 export const name = 'dsh-channel-feishu'
 export const inject = ['channels', 'agents', 'credentials'] as const
 
-export interface FeishuConfig {
-  /** Feishu user open_ids (starting with ou_) allowed to use the bot. Required, no permissive default. */
-  allowedUserIds: string[]
-  /** Feishu / Lark domain; defaults to feishu, set lark for Lark international. */
-  domain?: 'feishu' | 'lark'
-  provider: string
-  model?: string
-  cwd?: string
-  agentPreset?: string
-  mergeWindowSec: number
-  approvalTimeoutSec: number
-  statePath?: string
-}
-
-export const Config = Schema.object({
-  allowedUserIds: Schema.array(Schema.string()).required(),
-  domain: Schema.union(['feishu', 'lark'] as const).default('feishu'),
-  provider: Schema.string().default('deepseek-official'),
-  model: Schema.string(),
-  cwd: Schema.string(),
-  agentPreset: Schema.string(),
-  mergeWindowSec: Schema.number().default(5),
-  approvalTimeoutSec: Schema.number().default(120),
-  statePath: Schema.string(),
-})
+export const Config = feishuConfigSchema()
+export type { FeishuConfig } from 'dsh-channel-config'
 
 export function resolveStatePath(config: FeishuConfig): string {
   if (config.statePath) return config.statePath
@@ -47,11 +25,18 @@ export function apply(ctx: Context, config: FeishuConfig) {
   const store = createJsonFileStore(resolveStatePath(config))
   const client = new FeishuClient({ domain: config.domain })
 
+  // Settings seam: resolved value = schema defaults < base(config) < user document.
+  let source: () => FeishuConfig = () => config
+  installSettingsSection(ctx, settingsNamespace(CHANNEL_FEISHU_NS), Config, config, {
+    setSource: (current) => { source = current },
+    onChange: () => {},
+  })
+
   const channel = new FeishuChannel({
     client,
     resolveCredentials: async () => {
-      const appId = await ctx.credentials.resolve(credentialRef('FEISHU_APP_ID'))
-      const appSecret = await ctx.credentials.resolve(credentialRef('FEISHU_APP_SECRET'))
+      const appId = await ctx.credentials.resolve(credentialRef(CREDENTIAL_FEISHU_APP_ID))
+      const appSecret = await ctx.credentials.resolve(credentialRef(CREDENTIAL_FEISHU_APP_SECRET))
       if (!appId?.value || !appSecret?.value) return undefined
       return { appId: appId.value, appSecret: appSecret.value }
     },
@@ -59,7 +44,7 @@ export function apply(ctx: Context, config: FeishuConfig) {
 
   ctx.channels.register(channel)
 
-  const bridge = new FeishuBridge(ctx, config as FeishuBridgeConfig, store, channel, client)
+  const bridge = new FeishuBridge(ctx, () => source() as FeishuBridgeConfig, store, channel, client)
   ctx.effect(async () => {
     await bridge.start()
     return async () => {

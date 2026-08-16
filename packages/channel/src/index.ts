@@ -215,6 +215,10 @@ export abstract class Channel {
   get supportsMedia(): boolean {
     return false
   }
+  /** Whether reacting to an inbound message with an emoji is supported (the cheap alternative to a text ack). */
+  get supportsReactions(): boolean {
+    return false
+  }
 
   // ---- required behavior ----
 
@@ -248,6 +252,13 @@ export abstract class Channel {
   ): Promise<{ platformMessageId: string }> {
     throw new Error(`${this.id} does not support media`)
   }
+
+  /**
+   * React to an inbound message with an emoji (the ack-long UX). No-op by default;
+   * supportsReactions platforms implement it and throw on failure so the caller can
+   * fall back to a text ack.
+   */
+  async react(_chatKey: string, _messageId: string, _emoji: string): Promise<void> {}
 }
 
 /** Install the registry as a service on the current context (plugin entry point). */

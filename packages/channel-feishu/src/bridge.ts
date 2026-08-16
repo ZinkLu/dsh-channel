@@ -8,6 +8,8 @@ import type {} from '@deepseek-ai/dsh-system-prompt'
 import type { InboundMessage, OutboundMessage } from 'dsh-channel'
 import {
   chunkText,
+  deliverQueueReduce,
+  emptyDeliverQueueState,
   emptyMergeState,
   mergeReduce,
   parseApprovalReply,
@@ -20,11 +22,15 @@ import {
   stripReasoningTags,
   stripToolCallMarkup,
   type ChannelStore,
+  type DeliverQueueEffect,
+  type DeliverQueueOptions,
+  type DeliverQueueState,
   type MergeEffect,
   type MergeState,
   type PendingApproval,
   type PendingPrompt,
   type PromptOptions,
+  type QueuedDelivery,
   type RouteDecision,
 } from 'dsh-channel-kit'
 import type { FeishuChannel } from './channel.js'
@@ -40,6 +46,13 @@ export interface FeishuBridgeConfig {
   mergeWindowSec: number
   approvalTimeoutSec: number
   domain?: 'feishu' | 'lark'
+}
+
+/** Payload carried through the deliver queue for a single chunk. */
+interface FeishuDelivery {
+  chatKey: string
+  markdown: string
+  origin?: OutboundMessage['origin']
 }
 
 interface ApprovalEntry extends PendingApproval {
@@ -92,7 +105,7 @@ interface AskUserQuestionAnswerLike {
 
 export class FeishuBridge {
   private readonly ctx: Context
-  private readonly config: FeishuBridgeConfig
+  private readonly source: () => FeishuBridgeConfig
   private readonly store: ChannelStore
   private readonly channel: FeishuChannel
   private readonly client: FeishuClient
@@ -106,23 +119,30 @@ export class FeishuBridge {
   private readonly ownedHandles = new Map<string, AgentHandle>()
   private readonly pendingApprovals = new Map<number, ApprovalEntry>()
   private readonly pendingPrompts = new Map<number, PromptEntry>()
+  private readonly deliverQueueStates = new Map<string, DeliverQueueState<FeishuDelivery>>()
+  private readonly deliverQueueTimers = new Map<string, NodeJS.Timeout>()
   private readonly disposers: Array<() => void> = []
 
   private promptSeq = 0
   private started = false
 
-  constructor(ctx: Context, config: FeishuBridgeConfig, store: ChannelStore, channel: FeishuChannel, client: FeishuClient) {
+  constructor(ctx: Context, source: () => FeishuBridgeConfig, store: ChannelStore, channel: FeishuChannel, client: FeishuClient) {
     this.ctx = ctx
-    this.config = config
+    this.source = source
     this.store = store
     this.channel = channel
     this.client = client
     this.wsClient = new FeishuWsClient({
-      domain: config.domain,
+      domain: source().domain,
       resolveCredentials: () => this.resolveCredentials(),
       onEvent: (event) => void this.handleEvent(event),
       onStatus: (status, error) => this.ctx.emit('channel/status', 'feishu', status, error),
     })
+  }
+
+  /** Dynamic config read: the settings seam may swap the source at runtime. */
+  private get config(): FeishuBridgeConfig {
+    return this.source()
   }
 
   async start(): Promise<void> {
@@ -155,6 +175,9 @@ export class FeishuBridge {
 
     for (const timer of this.mergeTimers.values()) clearTimeout(timer)
     this.mergeTimers.clear()
+    for (const timer of this.deliverQueueTimers.values()) clearTimeout(timer)
+    this.deliverQueueTimers.clear()
+    this.deliverQueueStates.clear()
     for (const entry of this.pendingApprovals.values()) {
       if (entry.timer) clearTimeout(entry.timer)
       entry.resolve?.('deferred')
@@ -339,7 +362,7 @@ export class FeishuBridge {
     this.mergeSenderIds.set(chatKey, sender)
     this.store.setMergeBuffer(chatKey, result.state.buffer)
 
-    await this.handleMergeEffects(chatKey, result.state, result.effects)
+    await this.handleMergeEffects(chatKey, result.state, result.effects, messageId)
     if (messageId) this.store.markInbound(messageId)
   }
 
@@ -374,12 +397,12 @@ export class FeishuBridge {
     await this.dispatchText(chatKey, text, ids, sender)
   }
 
-  private async handleMergeEffects(chatKey: string, state: MergeState, effects: MergeEffect[]): Promise<void> {
+  private async handleMergeEffects(chatKey: string, state: MergeState, effects: MergeEffect[], ackMessageId?: string): Promise<void> {
     for (const effect of effects) {
       if (effect.kind === 'armTimer') {
         this.armMergeTimer(chatKey, effect.at)
       } else if (effect.kind === 'ack-long') {
-        await this.sendLocal(chatKey, 'Received, working on it…')
+        await this.ackLong(chatKey, ackMessageId)
       } else if (effect.kind === 'flush') {
         const ids = this.mergeMessageIds.get(chatKey) ?? []
         const sender = this.mergeSenderIds.get(chatKey) ?? ''
@@ -391,6 +414,19 @@ export class FeishuBridge {
         await this.dispatchText(chatKey, effect.text, ids, sender)
       }
     }
+  }
+
+  /** ack-long: react to the inbound message when supported, otherwise fall back to a text ack. */
+  private async ackLong(chatKey: string, messageId?: string): Promise<void> {
+    if (this.channel.supportsReactions && messageId) {
+      try {
+        await this.channel.react(chatKey, messageId, '👀')
+        return
+      } catch {
+        // Reaction failed (decorative); fall through to the text ack.
+      }
+    }
+    await this.sendLocal(chatKey, 'Received, working on it…')
   }
 
   private armMergeTimer(chatKey: string, at: number): void {
@@ -661,7 +697,7 @@ export class FeishuBridge {
     }
   }
 
-  private async sendOutbound(
+  private sendOutbound(
     chatKey: string,
     markdown: string,
     deliveryKey: string,
@@ -677,26 +713,98 @@ export class FeishuBridge {
       if (!opts.recover) {
         this.store.recordDelivery(key, { chatKey, textHash: hashText(chunk) })
       }
-      this.store.markAttempting(key)
-      const receipt = await this.ctx.channels.deliver({
-        channel: 'feishu',
-        chatKey,
-        markdown: chunk,
-        deliveryKey: key,
-        origin: opts.origin,
-      })
-      if (receipt.status === 'sent') {
-        this.store.markDelivered(key, receipt.platformMessageIds ?? [])
-      } else if (receipt.status === 'suppressed') {
-        this.store.markDelivered(key, [])
-      } else {
-        this.store.markFailed(key, receipt.error ?? 'delivery failed')
-        return
-      }
-      if (i < chunks.length - 1) {
-        await sleep(1000)
+      this.enqueueDelivery(chatKey, { key, value: { chatKey, markdown: chunk, origin: opts.origin } })
+    }
+    return Promise.resolve()
+  }
+
+  // ---- Deliver queue (serial worker + retry + backpressure per chatKey) ----
+
+  private deliverQueueOptions(): DeliverQueueOptions {
+    return { maxRetries: 3, baseDelayMs: 1000, maxQueue: 32, spacingMs: 1000 }
+  }
+
+  private enqueueDelivery(chatKey: string, item: QueuedDelivery<FeishuDelivery>): void {
+    const state = this.deliverQueueStates.get(chatKey) ?? emptyDeliverQueueState<FeishuDelivery>()
+    const result = deliverQueueReduce(state, { kind: 'enqueue', item, now: Date.now() }, this.deliverQueueOptions())
+    this.deliverQueueStates.set(chatKey, result.state)
+    this.runDeliverEffects(chatKey, result.effects)
+  }
+
+  private runDeliverEffects(chatKey: string, effects: DeliverQueueEffect<FeishuDelivery>[]): void {
+    for (const effect of effects) {
+      switch (effect.kind) {
+        case 'attempt':
+          void this.performAttempt(chatKey, effect.item)
+          break
+        case 'retry-after':
+          this.armDeliverTimer(chatKey, effect.at)
+          break
+        case 'give-up':
+          this.store.markFailed(effect.item.key, effect.error)
+          break
+        case 'reject-backpressure':
+          this.store.markFailed(effect.item.key, 'delivery queue full (backpressure)')
+          break
       }
     }
+  }
+
+  private async performAttempt(chatKey: string, item: QueuedDelivery<FeishuDelivery>): Promise<void> {
+    this.store.markAttempting(item.key)
+    try {
+      const receipt = await this.ctx.channels.deliver({
+        channel: 'feishu',
+        chatKey: item.value.chatKey,
+        markdown: item.value.markdown,
+        deliveryKey: item.key,
+        origin: item.value.origin,
+      })
+      if (receipt.status === 'sent') {
+        this.store.markDelivered(item.key, receipt.platformMessageIds ?? [])
+        this.feedAttemptResult(chatKey, item.key, 'sent')
+      } else if (receipt.status === 'suppressed') {
+        this.store.markDelivered(item.key, [])
+        this.feedAttemptResult(chatKey, item.key, 'suppressed')
+      } else {
+        this.feedAttemptResult(chatKey, item.key, 'failed', receipt.error ?? 'delivery failed')
+      }
+    } catch (error) {
+      this.feedAttemptResult(chatKey, item.key, 'failed', error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  private feedAttemptResult(chatKey: string, key: string, outcome: 'sent' | 'suppressed' | 'failed', error?: string): void {
+    const state = this.deliverQueueStates.get(chatKey) ?? emptyDeliverQueueState<FeishuDelivery>()
+    const result = deliverQueueReduce(state, { kind: 'attempt-result', key, outcome, error, now: Date.now() }, this.deliverQueueOptions())
+    this.deliverQueueStates.set(chatKey, result.state)
+    this.runDeliverEffects(chatKey, result.effects)
+  }
+
+  private armDeliverTimer(chatKey: string, at: number): void {
+    this.clearDeliverTimer(chatKey)
+    const delay = Math.max(0, at - Date.now())
+    const timer = setTimeout(() => {
+      this.deliverQueueTimers.delete(chatKey)
+      this.onDeliverTick(chatKey)
+    }, delay)
+    timer.unref?.()
+    this.deliverQueueTimers.set(chatKey, timer)
+  }
+
+  private clearDeliverTimer(chatKey: string): void {
+    const timer = this.deliverQueueTimers.get(chatKey)
+    if (timer !== undefined) {
+      clearTimeout(timer)
+      this.deliverQueueTimers.delete(chatKey)
+    }
+  }
+
+  private onDeliverTick(chatKey: string): void {
+    const state = this.deliverQueueStates.get(chatKey) ?? emptyDeliverQueueState<FeishuDelivery>()
+    const result = deliverQueueReduce(state, { kind: 'tick', now: Date.now() }, this.deliverQueueOptions())
+    this.deliverQueueStates.set(chatKey, result.state)
+    this.runDeliverEffects(chatKey, result.effects)
   }
 
   private async sendLocal(chatKey: string, markdown: string): Promise<void> {

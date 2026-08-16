@@ -1,42 +1,21 @@
-import Schema from '@deepseek-ai/schemastery'
 import type { Context } from '@deepseek-ai/cordis'
-import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
+import { credentialRef } from '@deepseek-ai/dsh-credentials'
+import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { CHANNEL_TELEGRAM_NS, CREDENTIAL_TELEGRAM_BOT_TOKEN, telegramConfigSchema, type TelegramConfig } from 'dsh-channel-config'
 import { createJsonFileStore } from 'dsh-channel-kit'
+import { TelegramBridge, type TelegramBridgeConfig } from './bridge.js'
 import { TelegramChannel } from './channel.js'
 import { TelegramClient } from './client.js'
-import { TelegramBridge, type TelegramBridgeConfig } from './bridge.js'
 
 export const name = 'dsh-channel-telegram'
 export const inject = ['channels', 'agents', 'credentials'] as const
 
-export interface TelegramConfig {
-  /** Allowed Telegram user ids. Required, no permissive default (the front door for prompt injection). */
-  allowedUserIds: number[]
-  provider: string
-  model?: string
-  cwd?: string
-  agentPreset?: string
-  pollingTimeoutSec: number
-  mergeWindowSec: number
-  approvalTimeoutSec: number
-  statePath?: string
-}
-
-export const Config = Schema.object({
-  allowedUserIds: Schema.array(Schema.number()).required(),
-  provider: Schema.string().default('deepseek-official'),
-  model: Schema.string(),
-  cwd: Schema.string(),
-  agentPreset: Schema.string(),
-  pollingTimeoutSec: Schema.number().default(30),
-  mergeWindowSec: Schema.number().default(5),
-  approvalTimeoutSec: Schema.number().default(120),
-  statePath: Schema.string(),
-})
+export const Config = telegramConfigSchema()
+export type { TelegramConfig } from 'dsh-channel-config'
 
 export function resolveStatePath(config: TelegramConfig): string {
   if (config.statePath) return config.statePath
@@ -48,10 +27,18 @@ export function apply(ctx: Context, config: TelegramConfig) {
   const store = createJsonFileStore(resolveStatePath(config))
   const client = new TelegramClient()
   const cwd = config.cwd ?? process.cwd()
+
+  // Settings seam: resolved value = schema defaults < base(config) < user document.
+  let source: () => TelegramConfig = () => config
+  installSettingsSection(ctx, settingsNamespace(CHANNEL_TELEGRAM_NS), Config, config, {
+    setSource: (current) => { source = current },
+    onChange: () => {},
+  })
+
   const channel = new TelegramChannel({
     client,
     resolveToken: async () => {
-      const resolved = await ctx.credentials.resolve(credentialRef('TELEGRAM_BOT_TOKEN'))
+      const resolved = await ctx.credentials.resolve(credentialRef(CREDENTIAL_TELEGRAM_BOT_TOKEN))
       return resolved?.value
     },
     readImage: async (ref: ImageAttachmentRef) => {
@@ -73,7 +60,7 @@ export function apply(ctx: Context, config: TelegramConfig) {
 
   ctx.channels.register(channel)
 
-  const bridge = new TelegramBridge(ctx, config as TelegramBridgeConfig, store, channel, client)
+  const bridge = new TelegramBridge(ctx, () => source() as TelegramBridgeConfig, store, channel, client)
   ctx.effect(async () => {
     await bridge.start()
     return async () => {

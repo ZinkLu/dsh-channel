@@ -85,6 +85,30 @@ class MediaChannel extends FakeChannel {
   }
 }
 
+test('Channel supportsReactions defaults to false and react is a no-op', async () => {
+  const channel = new FakeChannel()
+  assert.equal(channel.supportsReactions, false)
+  // The base no-op must never throw.
+  await assert.doesNotReject(() => channel.react('42', 'm1', '👀'))
+})
+
+class ReactChannel extends FakeChannel {
+  readonly reacted: Array<{ chatKey: string; messageId: string; emoji: string }> = []
+  get supportsReactions(): boolean {
+    return true
+  }
+  async react(chatKey: string, messageId: string, emoji: string): Promise<void> {
+    this.reacted.push({ chatKey, messageId, emoji })
+  }
+}
+
+test('supportsReactions platform implements react with chatKey/messageId/emoji', async () => {
+  const channel = new ReactChannel()
+  assert.equal(channel.supportsReactions, true)
+  await channel.react('42', 'm1', '👀')
+  assert.deepEqual(channel.reacted, [{ chatKey: '42', messageId: 'm1', emoji: '👀' }])
+})
+
 test('ChannelRegistry.deliver sends media via sendMedia when supported', async () => {
   const root = new Context()
   new ChannelRegistry(root)

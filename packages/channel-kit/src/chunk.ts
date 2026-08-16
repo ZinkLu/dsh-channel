@@ -202,12 +202,12 @@ function hardSplitText(text: string, maxChars: number, countBy: 'codepoint' | 'u
     if (splitAt <= 0) {
       // When no preferred break point is found, truncate by code unit
       splitAt = maxChars
-      // avoid splitting a surrogate pair (utf16 mode)
-      if (countBy === 'utf16') {
-        const code = rest.charCodeAt(splitAt - 1)
-        if (code >= 0xd800 && code <= 0xdbff && splitAt < rest.length) {
-          splitAt--
-        }
+      // Avoid splitting a surrogate pair. The slice index is always a UTF-16 code
+      // unit regardless of countBy (which only changes how the budget is counted),
+      // so this guard must apply in both 'utf16' and 'codepoint' modes.
+      const code = rest.charCodeAt(splitAt - 1)
+      if (code >= 0xd800 && code <= 0xdbff && splitAt < rest.length) {
+        splitAt--
       }
     }
     pieces.push(rest.slice(0, splitAt).trimEnd())

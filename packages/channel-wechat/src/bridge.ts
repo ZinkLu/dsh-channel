@@ -8,6 +8,8 @@ import type {} from '@deepseek-ai/dsh-system-prompt'
 import type { InboundMessage, OutboundMessage } from 'dsh-channel'
 import {
   chunkText,
+  deliverQueueReduce,
+  emptyDeliverQueueState,
   emptyMergeState,
   mergeReduce,
   parseApprovalReply,
@@ -19,11 +21,15 @@ import {
   stripReasoningTags,
   stripToolCallMarkup,
   type ChannelStore,
+  type DeliverQueueEffect,
+  type DeliverQueueOptions,
+  type DeliverQueueState,
   type MergeEffect,
   type MergeState,
   type PendingApproval,
   type PendingPrompt,
   type PromptOptions,
+  type QueuedDelivery,
   type RouteDecision,
 } from 'dsh-channel-kit'
 import type { WeChatChannel } from './channel.js'
@@ -40,6 +46,13 @@ export interface WeChatBridgeConfig {
   pollingTimeoutSec: number
   mergeWindowSec: number
   approvalTimeoutSec: number
+}
+
+/** Payload carried through the deliver queue for a single chunk. */
+interface WeChatDelivery {
+  chatKey: string
+  markdown: string
+  origin?: OutboundMessage['origin']
 }
 
 interface ApprovalEntry extends PendingApproval {
@@ -92,7 +105,7 @@ interface AskUserQuestionAnswerLike {
 
 export class WeChatBridge {
   private readonly ctx: Context
-  private readonly config: WeChatBridgeConfig
+  private readonly source: () => WeChatBridgeConfig
   private readonly store: ChannelStore
   private readonly channel: WeChatChannel
   private readonly client: WeixinClient
@@ -106,6 +119,8 @@ export class WeChatBridge {
   private readonly pendingApprovals = new Map<number, ApprovalEntry>()
   private readonly pendingPrompts = new Map<number, PromptEntry>()
   private readonly typingTickets = new Map<string, string>()
+  private readonly deliverQueueStates = new Map<string, DeliverQueueState<WeChatDelivery>>()
+  private readonly deliverQueueTimers = new Map<string, NodeJS.Timeout>()
   private readonly disposers: Array<() => void> = []
 
   private promptSeq = 0
@@ -113,12 +128,17 @@ export class WeChatBridge {
   private pollPromise: Promise<void> | null = null
   private started = false
 
-  constructor(ctx: Context, config: WeChatBridgeConfig, store: ChannelStore, channel: WeChatChannel, client: WeixinClient) {
+  constructor(ctx: Context, source: () => WeChatBridgeConfig, store: ChannelStore, channel: WeChatChannel, client: WeixinClient) {
     this.ctx = ctx
-    this.config = config
+    this.source = source
     this.store = store
     this.channel = channel
     this.client = client
+  }
+
+  /** Dynamic config read: the settings seam may swap the source at runtime. */
+  private get config(): WeChatBridgeConfig {
+    return this.source()
   }
 
   async start(): Promise<void> {
@@ -156,6 +176,9 @@ export class WeChatBridge {
 
     for (const timer of this.mergeTimers.values()) clearTimeout(timer)
     this.mergeTimers.clear()
+    for (const timer of this.deliverQueueTimers.values()) clearTimeout(timer)
+    this.deliverQueueTimers.clear()
+    this.deliverQueueStates.clear()
     for (const entry of this.pendingApprovals.values()) {
       if (entry.timer) clearTimeout(entry.timer)
       entry.resolve?.('deferred')
@@ -407,6 +430,7 @@ export class WeChatBridge {
       timestamp: Date.now(),
       hasMedia: hasMedia(message),
       media: mediaFacts(message),
+      // iLink messages carry no mention/at metadata, so group mentions are not observable here (unlike Telegram/Feishu).
       mentionsBot: false,
     }
     this.ctx.channels.ingest(inbound)
@@ -715,7 +739,7 @@ export class WeChatBridge {
     }
   }
 
-  private async sendOutbound(
+  private sendOutbound(
     chatKey: string,
     markdown: string,
     deliveryKey: string,
@@ -730,27 +754,98 @@ export class WeChatBridge {
       if (!opts.recover) {
         this.store.recordDelivery(key, { chatKey, textHash: hashText(chunk) })
       }
-      this.store.markAttempting(key)
-      const receipt = await this.ctx.channels.deliver({
-        channel: 'wechat',
-        chatKey,
-        markdown: chunk,
-        deliveryKey: key,
-        origin: opts.origin,
-      })
-      if (receipt.status === 'sent') {
-        this.store.markDelivered(key, receipt.platformMessageIds ?? [])
-      } else if (receipt.status === 'suppressed') {
-        this.store.markDelivered(key, [])
-      } else {
-        this.store.markFailed(key, receipt.error ?? 'delivery failed')
-        return
-      }
-      if (i < chunks.length - 1) {
-        await sleepWithAbort(1000, this.pollAbort?.signal)
-        if (this.pollAbort?.signal.aborted) return
+      this.enqueueDelivery(chatKey, { key, value: { chatKey, markdown: chunk, origin: opts.origin } })
+    }
+    return Promise.resolve()
+  }
+
+  // ---- Deliver queue (serial worker + retry + backpressure per chatKey) ----
+
+  private deliverQueueOptions(): DeliverQueueOptions {
+    return { maxRetries: 3, baseDelayMs: 1000, maxQueue: 32, spacingMs: 1000 }
+  }
+
+  private enqueueDelivery(chatKey: string, item: QueuedDelivery<WeChatDelivery>): void {
+    const state = this.deliverQueueStates.get(chatKey) ?? emptyDeliverQueueState<WeChatDelivery>()
+    const result = deliverQueueReduce(state, { kind: 'enqueue', item, now: Date.now() }, this.deliverQueueOptions())
+    this.deliverQueueStates.set(chatKey, result.state)
+    this.runDeliverEffects(chatKey, result.effects)
+  }
+
+  private runDeliverEffects(chatKey: string, effects: DeliverQueueEffect<WeChatDelivery>[]): void {
+    for (const effect of effects) {
+      switch (effect.kind) {
+        case 'attempt':
+          void this.performAttempt(chatKey, effect.item)
+          break
+        case 'retry-after':
+          this.armDeliverTimer(chatKey, effect.at)
+          break
+        case 'give-up':
+          this.store.markFailed(effect.item.key, effect.error)
+          break
+        case 'reject-backpressure':
+          this.store.markFailed(effect.item.key, 'delivery queue full (backpressure)')
+          break
       }
     }
+  }
+
+  private async performAttempt(chatKey: string, item: QueuedDelivery<WeChatDelivery>): Promise<void> {
+    this.store.markAttempting(item.key)
+    try {
+      const receipt = await this.ctx.channels.deliver({
+        channel: 'wechat',
+        chatKey: item.value.chatKey,
+        markdown: item.value.markdown,
+        deliveryKey: item.key,
+        origin: item.value.origin,
+      })
+      if (receipt.status === 'sent') {
+        this.store.markDelivered(item.key, receipt.platformMessageIds ?? [])
+        this.feedAttemptResult(chatKey, item.key, 'sent')
+      } else if (receipt.status === 'suppressed') {
+        this.store.markDelivered(item.key, [])
+        this.feedAttemptResult(chatKey, item.key, 'suppressed')
+      } else {
+        this.feedAttemptResult(chatKey, item.key, 'failed', receipt.error ?? 'delivery failed')
+      }
+    } catch (error) {
+      this.feedAttemptResult(chatKey, item.key, 'failed', error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  private feedAttemptResult(chatKey: string, key: string, outcome: 'sent' | 'suppressed' | 'failed', error?: string): void {
+    const state = this.deliverQueueStates.get(chatKey) ?? emptyDeliverQueueState<WeChatDelivery>()
+    const result = deliverQueueReduce(state, { kind: 'attempt-result', key, outcome, error, now: Date.now() }, this.deliverQueueOptions())
+    this.deliverQueueStates.set(chatKey, result.state)
+    this.runDeliverEffects(chatKey, result.effects)
+  }
+
+  private armDeliverTimer(chatKey: string, at: number): void {
+    this.clearDeliverTimer(chatKey)
+    const delay = Math.max(0, at - Date.now())
+    const timer = setTimeout(() => {
+      this.deliverQueueTimers.delete(chatKey)
+      this.onDeliverTick(chatKey)
+    }, delay)
+    timer.unref?.()
+    this.deliverQueueTimers.set(chatKey, timer)
+  }
+
+  private clearDeliverTimer(chatKey: string): void {
+    const timer = this.deliverQueueTimers.get(chatKey)
+    if (timer !== undefined) {
+      clearTimeout(timer)
+      this.deliverQueueTimers.delete(chatKey)
+    }
+  }
+
+  private onDeliverTick(chatKey: string): void {
+    const state = this.deliverQueueStates.get(chatKey) ?? emptyDeliverQueueState<WeChatDelivery>()
+    const result = deliverQueueReduce(state, { kind: 'tick', now: Date.now() }, this.deliverQueueOptions())
+    this.deliverQueueStates.set(chatKey, result.state)
+    this.runDeliverEffects(chatKey, result.effects)
   }
 
   private async sendLocal(chatKey: string, markdown: string): Promise<void> {

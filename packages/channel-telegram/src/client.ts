@@ -1,3 +1,5 @@
+import { assertMediaWithinLimit } from 'dsh-channel-kit'
+
 export interface TelegramUser {
   id: number
   is_bot?: boolean
@@ -144,6 +146,10 @@ export class TelegramClient {
     return text.split(token).join('<redacted>')
   }
 
+  async getMe(token: string, signal?: AbortSignal): Promise<TelegramUser> {
+    return this.callApi(token, 'getMe', undefined, signal)
+  }
+
   async getUpdates(token: string, opts: { offset?: number; timeoutSec?: number; allowedUpdates?: readonly string[]; signal?: AbortSignal } = {}): Promise<TelegramUpdate[]> {
     const query = new URLSearchParams()
     if (opts.offset !== undefined) query.set('offset', String(opts.offset))
@@ -198,24 +204,44 @@ export class TelegramClient {
     return this.callApi(token, 'deleteMessage', { chat_id: chatId, message_id: messageId }, signal)
   }
 
-  /** Fetch the file bytes for a file_id (getFile returns file_path → download from the file endpoint). */
-  async getFile(token: string, fileId: string, signal?: AbortSignal): Promise<{ bytes: Uint8Array; filePath: string }> {
-    const file = await this.callApi<TelegramFile>(token, 'getFile', { file_id: fileId }, signal)
+  /**
+   * React to a message with an emoji (Telegram setMessageReaction).
+   */
+  async setMessageReaction(token: string, chatId: string, messageId: number, emoji: string, signal?: AbortSignal): Promise<boolean> {
+    return this.callApi(token, 'setMessageReaction', {
+      chat_id: chatId,
+      message_id: messageId,
+      reaction: [{ type: 'emoji', emoji }],
+    }, signal)
+  }
+
+  /**
+   * Fetch the file bytes for a file_id (getFile returns file_path → download from the file endpoint).
+   * The body is read incrementally and aborted as soon as it exceeds `opts.maxBytes`
+   * (Content-Length first, then the running byte count) so an oversized payload is
+   * rejected before it is fully buffered.
+   */
+  async getFile(
+    token: string,
+    fileId: string,
+    opts: { maxBytes?: number; signal?: AbortSignal } = {},
+  ): Promise<{ bytes: Uint8Array; filePath: string }> {
+    const file = await this.callApi<TelegramFile>(token, 'getFile', { file_id: fileId }, opts.signal)
     if (!file.file_path) throw new TelegramApiError(TelegramClient.redactToken('telegram getFile returned no file_path', token))
     const url = `${this.baseUrl}/file/bot${token}/${file.file_path}`
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(new Error(`telegram download timeout after ${this.timeoutMs}ms`)), this.timeoutMs)
     timer.unref?.()
-    const onOuterAbort = () => controller.abort(signal?.reason)
-    signal?.addEventListener('abort', onOuterAbort, { once: true })
+    const onOuterAbort = () => controller.abort(opts.signal?.reason)
+    opts.signal?.addEventListener('abort', onOuterAbort, { once: true })
     try {
       const response = await this.fetchImpl(url, { signal: controller.signal })
       if (!response.ok) throw new TelegramApiError(TelegramClient.redactToken(`telegram download failed: HTTP ${response.status}`, token))
-      const bytes = new Uint8Array(await response.arrayBuffer())
+      const bytes = await readBodyWithLimit(response, opts.maxBytes ?? 0, 'telegram media')
       return { bytes, filePath: file.file_path }
     } finally {
       clearTimeout(timer)
-      signal?.removeEventListener('abort', onOuterAbort)
+      opts.signal?.removeEventListener('abort', onOuterAbort)
     }
   }
 
@@ -318,6 +344,40 @@ export class TelegramClient {
       signal?.removeEventListener('abort', onOuterAbort)
     }
   }
+}
+
+/** Stream a response body into bytes, aborting as soon as it exceeds `maxBytes` (0/undefined = no limit). */
+async function readBodyWithLimit(response: Response, maxBytes: number, kind: string): Promise<Uint8Array> {
+  const contentLength = Number(response.headers.get('content-length') ?? '')
+  if (Number.isFinite(contentLength) && contentLength > 0) {
+    assertMediaWithinLimit(contentLength, maxBytes, kind)
+  }
+  if (response.body === null) {
+    const bytes = new Uint8Array(await response.arrayBuffer())
+    assertMediaWithinLimit(bytes.length, maxBytes, kind)
+    return bytes
+  }
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      total += value.byteLength
+      assertMediaWithinLimit(total, maxBytes, kind)
+      chunks.push(value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  const bytes = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return bytes
 }
 
 export function toChatKey(chat: TelegramChat): string {

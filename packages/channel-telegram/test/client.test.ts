@@ -73,6 +73,80 @@ test('TelegramClient.getFile downloads bytes via file endpoint', async () => {
   assert.equal(urls[1], 'https://example.test/file/bottok/photos/1.jpg')
 })
 
+test('TelegramClient.getFile aborts when the streamed body exceeds maxBytes', async () => {
+  const client = new TelegramClient({
+    baseUrl: 'https://example.test',
+    fetch: (async (url: string | URL | Request) => {
+      if (String(url).includes('/getFile')) {
+        return new Response(JSON.stringify({ ok: true, result: { file_id: 'f1', file_path: 'photos/big.jpg' } }), { status: 200 })
+      }
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array([1, 2, 3, 4, 5]))
+          controller.close()
+        },
+      })
+      return new Response(body, { status: 200 })
+    }) as typeof fetch,
+  })
+
+  await assert.rejects(() => client.getFile('tok', 'f1', { maxBytes: 3 }), /exceeds the media size limit/)
+})
+
+test('TelegramClient.getFile aborts early via Content-Length when over the cap', async () => {
+  const client = new TelegramClient({
+    baseUrl: 'https://example.test',
+    fetch: (async (url: string | URL | Request) => {
+      if (String(url).includes('/getFile')) {
+        return new Response(JSON.stringify({ ok: true, result: { file_id: 'f1', file_path: 'photos/big.jpg' } }), { status: 200 })
+      }
+      return new Response(new Uint8Array([1, 2, 3]), { status: 200, headers: { 'content-length': '999999' } })
+    }) as typeof fetch,
+  })
+
+  await assert.rejects(() => client.getFile('tok', 'f1', { maxBytes: 10 }), /exceeds the media size limit/)
+})
+
+test('TelegramClient.getFile allows a body within the cap', async () => {
+  const client = new TelegramClient({
+    baseUrl: 'https://example.test',
+    fetch: (async (url: string | URL | Request) => {
+      if (String(url).includes('/getFile')) {
+        return new Response(JSON.stringify({ ok: true, result: { file_id: 'f1', file_path: 'photos/small.jpg' } }), { status: 200 })
+      }
+      return new Response(new Uint8Array([1, 2, 3]), { status: 200 })
+    }) as typeof fetch,
+  })
+
+  const { bytes } = await client.getFile('tok', 'f1', { maxBytes: 1024 })
+  assert.deepEqual([...bytes], [1, 2, 3])
+})
+
+test('TelegramClient.getMe returns the bot identity', async () => {
+  const client = new TelegramClient({
+    baseUrl: 'https://example.test',
+    fetch: (async () => new Response(JSON.stringify({ ok: true, result: { id: 777, is_bot: true, username: 'my_bot' } }), { status: 200 })) as typeof fetch,
+  })
+  const me = await client.getMe('tok')
+  assert.equal(me.id, 777)
+  assert.equal(me.username, 'my_bot')
+})
+
+test('TelegramClient.setMessageReaction posts an emoji reaction', async () => {
+  const calls: Array<{ url: string; body: unknown }> = []
+  const client = new TelegramClient({
+    baseUrl: 'https://example.test',
+    fetch: (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), body: JSON.parse(String(init?.body)) })
+      return new Response(JSON.stringify({ ok: true, result: true }), { status: 200 })
+    }) as typeof fetch,
+  })
+
+  await client.setMessageReaction('tok', '42', 7, '👀')
+  assert.equal(calls[0]!.url, 'https://example.test/bottok/setMessageReaction')
+  assert.deepEqual(calls[0]!.body, { chat_id: '42', message_id: 7, reaction: [{ type: 'emoji', emoji: '👀' }] })
+})
+
 test('TelegramClient.sendPhoto posts multipart form', async () => {
   let body: unknown
   const client = new TelegramClient({
