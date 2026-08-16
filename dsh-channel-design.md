@@ -437,8 +437,10 @@ Establish the rule first (§4: "prefer deriving from the session log; don't buil
 ```ts
 export interface ChannelStore {
   // inbound dedupe (ring cap, im-bridge's 1000/500 pruning strategy)
+  // inbound dedupe (TTL map with an outcome; see §13.2)
   seenInbound(messageId: string): boolean
-  markInbound(messageId: string): void
+  inboundOutcome(messageId: string): 'handling' | 'done' | 'failed' | undefined
+  markInbound(messageId: string, outcome?: 'handling' | 'done' | 'failed'): void
   // merge crash recovery
   setMergeBuffer(chatKey: string, buffer: readonly string[]): void
   mergeBuffers(): Readonly<Record<string, readonly string[]>>
@@ -451,7 +453,8 @@ export interface ChannelStore {
   markDelivered(key: string, platformMessageIds: readonly string[]): void
   markFailed(key: string, error: string): void
   /** recovered at startup: pending = redeliver directly; attempting/failed = redeliver with a "recovered resend" marker; over limit → abandoned */
-  sweepRecoverable(): Array<{ key: string; state: 'pending' | 'attempting' | 'failed'; chatKey: string }>
+  /** Abandons only when BOTH the attempt cap is reached AND the entry is old enough (§13.2). */
+  sweepRecoverable(opts?: { now?: number; minAgeMs?: number }): Array<{ key: string; state: 'pending' | 'attempting' | 'failed'; chatKey: string; attempts?: number; errorKind?: SendErrorKind }>
   flush(): Promise<void>
 }
 export function createJsonFileStore(path: string): ChannelStore   // tmp+rename atomic write, 500ms debounce (im-bridge)
@@ -636,6 +639,8 @@ Per T7's advice, **T7's interface-call checklist is listed in the first week of 
 | M5 | npm publish + `dsh-plugin` topic + awesome-dsh-plugin PR + an "add a new platform" tutorial (hermes's ADDING_A_PLATFORM is the style template: one table for the required surface, one for the optional surface, itemized degradation notes) | — |
 | M6 | Media (§10): contract adds `InboundMedia`/`OutboundMedia`/`supportsMedia`/`sendMedia`; Telegram `getFile` download + `sendPhoto`/`sendDocument` send | Image end-to-end (inbound lands in the log, outbound reachable) |
 | M7 ✅ | Capability hardening (§12): inbound media size cap, generic outbound retry/backpressure queue, `mentionsBot` fix, reaction-based ack; plus the configuration/settings seam (§11) | P0 hardening green; full suite (channel+kit+config+3 providers) passes |
+| M8–M10 ✅ | Capability reach: multi-account, reconciliation seam, reply/thread/silent delivery, pairing-login interface, outbound proxy (`docs/dsh-channel-capability-roadmap.md`) | Contract additive only; A5 re-checked |
+| M11–M14 ✅ | Mechanism hardening + the `ChannelBridge` handler layer (§13); M14 audits M11–M13 against the tree (`docs/dsh-channel-mechanism-roadmap.md` §10) | Conformance suite + capability proofs per provider; providers hold transport only |
 
 ---
 
@@ -766,6 +771,58 @@ Host-side wiring is complete, but rc.6's apiproxy only exposes a hardcoded `WEB_
 
 - Telegram: the bridge resolves its own identity once via `getMe`, then `ingest()` scans `message.entities` (`text_mention` → bot id, `mention` → `@username`).
 - Feishu reads `message.mentions`. WeChat's iLink payload carries no mention metadata, so it stays `false`. Still observational — v1 does not route group chats.
+
+---
+
+## 13. The `ChannelBridge` Handler Layer (M11–M14)
+
+> Status: shipped · Architecture: `docs/dsh-channel-policy-abstraction.md` · Mechanisms and the
+> post-M13 audit: `docs/dsh-channel-mechanism-roadmap.md` §10.
+
+§5.2/§5.3 describe the inbound and outbound orchestration as Telegram's. It is no longer:
+`dsh-channel-kit`'s `ChannelBridge` is that orchestration, written once, and the providers are
+transport only. This does not change any contract in §3 — A5 still holds, and adding a platform
+still touches no line of `dsh-channel`/`dsh-channel-kit`.
+
+### 13.1 What is shared, and what stays per-platform
+
+Everything in §5.2's wiring order and §5.3's outbound pipeline lives on the base class, including
+the two orderings that are load-bearing: **approval/prompt answers resolve before merge/router**
+(so a "yes" can never queue behind the turn that is blocked waiting for it), and **commands and
+media flush the merge buffer first** (so neither is delayed by the debounce window nor welded onto
+an attachment's batch).
+
+A provider implements: `connect`/`disconnect`, `isAllowed`, a private `normalize()` from its
+transport payload to `InboundMessage`, and — only if the platform supports them —
+`downloadInboundImages`, `showDraft`, `deleteDraft`. Everything else degrades from capability
+facts, so Feishu/WeChat get `final`-only presentation with no per-platform branching.
+
+### 13.2 Store contract refinements (§4.5)
+
+Two changes to the §4.5 interface, both from the mechanism roadmap's §2.3/§2.4:
+
+- **Dedupe carries an outcome**, not a boolean: `handling | done | failed` — the three different
+  correct responses to a webhook redelivery. Backed by a TTL map with amortized pruning.
+- **Abandoning requires both an attempt cap and a minimum age.** Attempts alone discard a message
+  during a short platform outage; age alone never gives up on a poisoned payload. Relatedly, the
+  attempt budget is only spent by ledger-tracked deliveries once the provider reports `connected`,
+  so a failed-connect boot cannot abandon a message that was never once sent.
+
+Settled (`delivered`/`abandoned`) entries are pruned after a retention window; the ledger is a
+handoff log, not an archive.
+
+### 13.3 Delivery-key grammar
+
+`${sessionId}:${seq}`, plus `#${chunkIndex}` (1-based) when one assistant message is split across
+several platform messages. The chunk suffix uses `#` rather than another `:` because sessionIds
+contain colons of their own (`channel:telegram:42`), which would make the split back to
+(sessionId, seq) ambiguous — and silently so, since the wrong parse resolves to no event.
+
+### 13.4 One serial worker per chatKey
+
+Both agent output (`sendOutbound`, ledger-tracked) and bridge-authored text (`sendLocal`: command
+replies, `⏹ Turn ended`, warnings) enqueue onto the same per-chatKey queue from §12.2. Sending
+either one inline would let a status line land between two chunks of the answer it follows.
 
 ---
 

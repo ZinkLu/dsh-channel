@@ -1,6 +1,10 @@
 # dsh-channel Handler & Policy Abstraction (slim)
 
-> Status: design proposal · revises the earlier draft of this document, which proposed a
+> Status: **implemented** · §5's five migration steps have all landed, most recently
+> step 3–4's inbound half: `ChannelBridge.handleInbound` now owns the pipeline the
+> three providers used to each carry a copy of. §3's hook list has been reconciled
+> with the shipped surface (see the notes under it).
+> Originally a design proposal · revises the earlier draft of this document, which proposed a
 > three-package split plus a seven-policy strategy object. That version was judged
 > over-engineered; this one keeps ~30% of the surface area for ~80% of the value.
 > Goal: (1) make the "handler" (what to send, how to handle thinking / tool events /
@@ -180,25 +184,43 @@ export abstract class ChannelBridge<TCfg> {
   async start(): Promise<void>   // subscribe session/event + approval/request; restore(); connect()
   async stop(): Promise<void>    // dispose listeners/timers; settle pending; flush store
 
-  // ---- inbound (shared: merge window, router, approval/prompt reply priority) ----
-  protected async handleInboundText(chatKey: string, text: string, messageIds: string[], senderId: string, images: ImageAttachmentRef[]): Promise<void>
-  protected async handleInboundReply(input: { text?: string; choiceId?: string }): Promise<boolean>
+  // ---- inbound: the whole pipeline, in the order the design pins down ----
+  // group drop → allowlist → echo suppression → dedupe → approval/prompt reply
+  // → ingest → command → media → merge. `raw` is the untouched platform payload,
+  // handed back to downloadInboundImages.
+  protected async handleInbound(inbound: InboundMessage, raw?: unknown): Promise<void>
+  protected async handleInboundReply(text: string): Promise<boolean>
 
   // ---- outbound (shared: project → reduce → executeFrame, deliver queue, recovery) ----
   protected onSessionEvent(session: Session, event: SessionEvent): void
-  protected executeFrame(sessionId: string, chatKey: string, frame: StreamFrame, deliveryCtx?: { seq?: number }): void
-  protected sendOutbound(chatKey: string, markdown: string, deliveryKey: string, opts?: SendOpts): Promise<void>
-  protected sendLocal(chatKey: string, markdown: string, opts?: { silent?: boolean }): Promise<void>
+  protected executeStreamFrame(sessionId: string, chatKey: string, frame: StreamFrame, deliveryCtx?: { seq?: number }): void
+  // Both enqueue onto the chatKey's single serial worker rather than sending
+  // inline, so bridge-authored text cannot interleave with agent output.
+  protected sendOutbound(chatKey: string, markdown: string, deliveryKey: string, opts?: SendOpts): void
+  protected sendLocal(chatKey: string, markdown: string, opts?: { silent?: boolean }): void
 
   // ---- abstract transport hooks (the ONLY per-platform surface) ----
-  protected abstract connect(signal: AbortSignal): Promise<void>
-  protected abstract normalize(update: unknown): InboundMessage | null
-  protected abstract downloadInboundImages(msg: unknown): Promise<ImageAttachmentRef[]>
-  protected abstract showDraft(chatKey: string, sessionId: string, text: string): Promise<void>
-  protected abstract editDraft(chatKey: string, target: string, text: string): Promise<void>
-  protected abstract deleteDraft(chatKey: string, target: string): Promise<void>
+  protected abstract connect(): Promise<void>
+  protected abstract disconnect(): Promise<void>
+  protected abstract isAllowed(senderId: string): boolean
+  // Optional, with degrading defaults rather than `abstract`: a provider that
+  // downloads no media or cannot stream drafts simply does not override them.
+  protected async downloadInboundImages(raw: unknown): Promise<ImageAttachmentRef[]>
+  protected async showDraft(chatKey: string, sessionId: string, text: string): Promise<void>
+  protected async deleteDraft(chatKey: string, target: string): Promise<void>
 }
 ```
+
+Two shape notes against the sketch above, decided while implementing it:
+
+- **`normalize` is not on the base.** Its return type is the only thing the base
+  needs, and its input is by definition per-platform, so each provider keeps a
+  private `normalize()` and passes the result to `handleInbound`. Making it
+  abstract would have forced a `unknown` parameter on every provider for no gain.
+- **There is no separate `editDraft` hook.** `showDraft` creates the draft on
+  first call and edits it thereafter, because the provider already owns the
+  "do I have a draft message id for this session?" branch. A platform that
+  streams append-only is the case that would split the hook.
 
 What this buys:
 

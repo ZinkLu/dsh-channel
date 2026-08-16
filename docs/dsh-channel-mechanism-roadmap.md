@@ -1,6 +1,7 @@
 # dsh-channel Mechanism Gap Analysis & Roadmap
 
-> Status: proposal · Date: 2026-08-16 · Baseline: post-refactor `81a49e2` (ChannelBridge + policy seams)
+> Status: M11–M13 shipped, then audited against the tree — see §10 (M14) for what the audit
+> found and closed · Date: 2026-08-16 · Baseline: post-refactor `81a49e2` (ChannelBridge + policy seams)
 > Companion to: `dsh-channel-capability-roadmap.md` (capability *facts* — what the contract exposes; M7–M10
 > shipped) · this document covers capability *mechanisms* — how the shared layer behaves under
 > concurrency, failure, and recovery. · Architecture upstream: `docs/dsh-channel-policy-abstraction.md`
@@ -195,7 +196,7 @@ pure-state-machine additions:
 |---|---|---|---|
 | 1 | **Edit-failure → append-tail degradation.** When edit-in-place dies mid-stream, record the visible prefix, flip to append mode permanently, send only the tail — one continuous answer instead of a duplicate or a frozen draft | hermes `stream_consumer.py:1305-1317` (`_visible_prefix`/`_continuation_text`), `:2275-2298` ("already visible" short-circuit suppresses the duplicate final send) | `StreamState` gains `visiblePrefix` + an `edit-failed` input; on it, emit `send-tail` frames thereafter. The bridge feeds `edit-failed` from `showDraft` rejection instead of only warning |
 | 2 | **Adaptive edit throttle with strike reset.** Flood → interval doubles; any success → strikes reset to zero (self-healing, not permanently degraded); server `retry_after` honored only up to a ceiling (~5s) — beyond that, fail over rather than stall the user | hermes `stream_consumer.py:2328-2367`, `:2270-2271` (reset), `:260` (ceiling) | Options + two fields on the draft-edit path (kit reducer); the ceiling also belongs in `deliver-queue.ts`'s retry handling once §5.1 gives it a `rate_limited` kind to react to |
-| 3 | **Draft finalization as an explicit decision.** Today the bridge always deletes the draft and sends the final fresh (`bridge.ts:752-763`). openclaw models finalize-in-place vs discard-and-send as a four-outcome decision (`normal-delivered / normal-skipped / preview-finalized / preview-retained`) including the `retain` branch for "the edit may or may not have landed" and the invariant that a finalized text preview must not silently swallow accompanying media | openclaw `message/live.ts:117-236` | A pure `resolveFinalization(caps, draftState, editResult)` in `policy/`; providers whose edit is cheap (Telegram) finalize in place — one message instead of delete+send, which also stops the notification double-buzz |
+| 3 | **Draft finalization as an explicit decision.** Today the bridge always deletes the draft and sends the final fresh (`bridge.ts:752-763`). openclaw models finalize-in-place vs discard-and-send as a four-outcome decision (`normal-delivered / normal-skipped / preview-finalized / preview-retained`) including the `retain` branch for "the edit may or may not have landed" and the invariant that a finalized text preview must not silently swallow accompanying media | openclaw `message/live.ts:117-236` | A pure `resolveFinalization(caps, draftState, editResult)` in `policy/`; providers whose edit is cheap (Telegram) finalize in place — one message instead of delete+send, which also stops the notification double-buzz. **See §10.1**: the function shipped in M13 but was never called, and `preview-finalized` turns out to be unreachable until block streaming (v2) |
 
 Related invariant to record (openclaw `progress-draft-compositor.ts:227-247`): if/when draft updates
 gain change-detection, **only accepted renders may become the dedupe baseline** — a policy-suppressed
@@ -239,6 +240,9 @@ dsh-channel's three provider packages share).
 parts that made it, plus `failedAtChunk?: number`; the per-chunk delivery keys
 (`${deliveryKey}:${i}`, `bridge.ts:805`) already give the ledger the granularity — recovery then
 resends only unconfirmed chunks.
+
+> Shipped in M13, but the `:${i}` key shape was not parseable back to its session event — sessionIds
+> contain colons themselves. See §10.2; chunk keys use `#${i}` and recovery resends only the named chunk.
 
 ### 5.3 `unknown` is not `failed`
 
@@ -346,10 +350,68 @@ Continues the capability roadmap's numbering (M7–M10 shipped there):
 | **M11 — Safety net + P0 defects** | §6 conformance suite + capability proofs + trace goldens; then §2.1–§2.4 fixes landed against that net | The four §2 fixes all touch merge/store/deliver-queue semantics — exactly what the goldens exist to guard; building the net first makes every later milestone cheaper | shipped |
 | **M12 — Busy-turn seam** | §3.1 busy decision function + steer fallback, §3.2 sessionId serialization guard, §3.4 approval-ordering invariant + fail-fast on undeliverable prompt | These three interlock (all sit on the `dispatchText` path) and should be designed together | shipped |
 | **M13 — Failure-path hardening** | §5.1 error taxonomy + §5.2 partial delivery + §5.4 echo suppression; §4.1–§4.3 streaming degradation | Taxonomy first — §4's throttle and §5.3's policies both consume the kinds | shipped |
+| **M14 — Post-M13 audit** | Verify M11–M13 against the tree rather than the commit messages; close what the audit turned up (§10) | Three milestones landed back to back; the claims deserved a read | shipped |
 | **Deferred** | §3.3 two-phase ownership (vocabulary only now), §5.3 notice-on-unknown policy, §7 residue items | Each has a named trigger (durable inbound queue / operator demand / prompt-retry UX) | deferred |
 
 Per the base design's discipline, each milestone re-runs T2 (dependency direction) and T7
 (add-a-platform, zero contract changes); M11's suite makes T7 executable instead of aspirational.
+
+---
+
+## 10. M14 — post-M13 audit
+
+M11–M13 landed in quick succession and this document marked them shipped. Reading
+the tree against the claims found one adoption that was written but never wired,
+and several defects in code the milestones had touched. All are closed; each is
+recorded here so the roadmap describes the tree rather than the intent.
+
+### 10.1 Claimed but not wired
+
+**§4.3 draft finalization.** `resolveFinalization` existed in `policy/` with unit
+tests for all four outcomes, but no caller: `finalizeDraft` deleted the preview
+unconditionally. The bridge now runs the decision. `preview-finalized` is
+unreachable in v1 and is documented as such at the call site instead of being
+faked — nothing renders the answer into the preview until block streaming (v2),
+so `finalVisible` is always false. The live split is discard vs **retain**, and
+retain was the branch that mattered: in append-tail mode the preview holds the
+prefix the user saw, so deleting it erased visible context and orphaned the tail
+status lines.
+
+Two further defects on the same path, both of which made §4.1's degradation a
+no-op in practice:
+
+- On edit failure the reducer flipped to append-tail mode but **dropped the update
+  that failed**, so its content reached the user by no route at all.
+- The bridge passed the *failed* draft text as `visiblePrefix` — precisely the one
+  thing the user had not seen — which made every computed tail empty. The
+  baseline is now the last render the platform *accepted*, which is also the
+  openclaw invariant this document already recorded under §4 ("only accepted
+  renders may become the dedupe baseline"). `draft-finalize` carries the
+  edit-failure fact, since the reducer resets its state in the same step.
+
+### 10.2 Defects found in milestone code
+
+| Where | Defect |
+|---|---|
+| §5.2 per-chunk keys | Chunk keys were `${sessionId}:${seq}:${i}`, but sessionIds contain colons (`channel:telegram:42`), so `splitDeliveryKey`'s last-colon split resolved to no event and the recovery policy abandoned **every multi-chunk answer** as "session event unavailable". Chunk keys now use `#N`, and recovery resends only the chunk the key names |
+| §2.3 attempt budget | The not-connected guard was applied to all deliveries, not just ledger-tracked ones, so local notices (including "you are not authorized") were silently dropped whenever the bridge had not reached `connected` |
+| §2.3 recovery gate | Recovery ran only if `connected` arrived within 15s of `start()`; a slower first connect skipped it for the process lifetime. It is now memoized and also triggered by the status listener |
+| §2.4 dedupe outcomes | `markInbound(id, 'failed')` was in the interface and never produced by any caller; a throw mid-pipeline now records it |
+| R7 log folding | `markSeenFromSessionLogs` folded only `/bind`-reached sessions, so a chat on the default sessionId convention — the common case — was never folded, leaving the store as the only dedupe |
+| Ordering | `sendLocal` bypassed the deliver queue, so a `⏹ Turn ended` line could land *between* two chunks of the answer it followed. Both paths now share the chatKey's serial worker |
+| `chunk.ts` | `hardSplitText` scanned from index `maxChars` and split *after* it, emitting `maxChars + 1` characters — a 4096-char Telegram message became 4097 and was rejected |
+| `format.ts` | HTML link hrefs were substituted unescaped into `href="…"`; `escapeHtml` leaves `"` alone by design, so a model-authored URL containing a quote escaped the attribute |
+| Build | `npm run build --workspaces` walks `packages/` alphabetically, so `channel-feishu` compiled against whatever `channel-kit` was left in `lib/`. A clean tree could not build |
+
+### 10.3 Handler consolidation
+
+The policy-abstraction doc's shared `handleInboundText` had never been written, so
+all three providers carried their own copy of the same eleven-step inbound
+sequence — and had drifted (Telegram dispatched media with images and an empty
+caption; the other two dropped it). `ChannelBridge.handleInbound` now owns it,
+with §3.4's approval-before-merge invariant and §2.1's flush-before-command/media
+rules stated where they are enforced. Providers keep `normalize()` plus their own
+loopback guards: 769 → 610 lines across the three.
 
 ---
 
