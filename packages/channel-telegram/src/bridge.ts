@@ -170,11 +170,13 @@ export class TelegramBridge extends ChannelBridge<TelegramBridgeConfig> {
     }
 
     const messageId = String(message.message_id)
+    if (this.isOwnEcho(chatKey, messageId)) return
     if (this.store.seenInbound(messageId)) return
+    this.store.markInbound(messageId, 'handling')
 
     // Approval/prompt replies take priority over merge/router (openclaw control-command iron rule).
     if (await this.handleInboundReply(messageText(message))) {
-      this.store.markInbound(messageId)
+      this.store.markInbound(messageId, 'done')
       return
     }
 
@@ -186,7 +188,7 @@ export class TelegramBridge extends ChannelBridge<TelegramBridgeConfig> {
     if (isCommand) {
       await this.flushBuffered(chatKey)
       await this.handleCommand(text.trim(), chatKey)
-      this.store.markInbound(messageId)
+      this.store.markInbound(messageId, 'done')
       return
     }
 
@@ -197,17 +199,17 @@ export class TelegramBridge extends ChannelBridge<TelegramBridgeConfig> {
       if (text.trim() !== '' || images.length > 0) {
         await this.dispatchText(chatKey, text, [messageId], senderId, images)
       }
-      this.store.markInbound(messageId)
+      this.store.markInbound(messageId, 'done')
       return
     }
 
     if (text.trim() === '') {
-      this.store.markInbound(messageId)
+      this.store.markInbound(messageId, 'done')
       return
     }
 
     await this.mergeMessage(chatKey, text, messageId, senderId)
-    this.store.markInbound(messageId)
+    this.store.markInbound(messageId, 'done')
   }
 
   private ingest(chatKey: string, senderId: string, message: TelegramMessage, chatType: 'direct' | 'group'): void {

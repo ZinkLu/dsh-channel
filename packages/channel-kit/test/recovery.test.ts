@@ -6,8 +6,8 @@ const noReconcile: ReconcileLike = { supportsReconciliation: false, async reconc
 
 test('defaultRecoveryPolicy abandons unparseable keys and resends recoverable ones', async () => {
   const entries: RecoverableDelivery[] = [
-    { key: 'not-a-delivery-key', state: 'failed', chatKey: 'c' },
-    { key: 'sess:1', state: 'failed', chatKey: 'c' },
+    { key: 'not-a-delivery-key', state: 'failed', chatKey: 'c', attempts: 0 },
+    { key: 'sess:1', state: 'failed', chatKey: 'c', attempts: 0 },
   ]
   const actions = await defaultRecoveryPolicy.sweep(entries, {
     channel: noReconcile,
@@ -23,7 +23,7 @@ test('defaultRecoveryPolicy abandons unparseable keys and resends recoverable on
 test('defaultRecoveryPolicy skips when reconcile reports confirmed-sent', async () => {
   const channel: ReconcileLike = { supportsReconciliation: true, async reconcile() { return 'confirmed-sent' } }
   const actions = await defaultRecoveryPolicy.sweep(
-    [{ key: 'sess:1', state: 'attempting', chatKey: 'c' }],
+    [{ key: 'sess:1', state: 'attempting', chatKey: 'c', attempts: 0 }],
     { channel, resolveText: () => 'hello' },
   )
   assert.equal(actions[0]!.kind, 'skip')
@@ -36,7 +36,7 @@ test('a custom RecoveryPolicy is adopted verbatim', async () => {
     },
   }
   const actions = await atMostOnce.sweep(
-    [{ key: 'sess:1', state: 'failed', chatKey: 'c' }],
+    [{ key: 'sess:1', state: 'failed', chatKey: 'c', attempts: 0 }],
     { channel: noReconcile, resolveText: () => 'x' },
   )
   assert.deepEqual(actions.map((action) => action.kind), ['abandon'])
@@ -51,4 +51,12 @@ test('splitDeliveryKey parses sessionId:seq and rejects malformed keys', () => {
 test('hashText is stable', () => {
   assert.equal(hashText('hello'), hashText('hello'))
   assert.notEqual(hashText('hello'), hashText('world'))
+})
+
+test('defaultRecoveryPolicy abandons terminal send errors without a blind resend', async () => {
+  const actions = await defaultRecoveryPolicy.sweep(
+    [{ key: 'sess:1', state: 'failed', chatKey: 'c', attempts: 1, errorKind: 'forbidden' }],
+    { channel: noReconcile, resolveText: () => 'hello' },
+  )
+  assert.equal(actions[0]!.kind, 'abandon')
 })

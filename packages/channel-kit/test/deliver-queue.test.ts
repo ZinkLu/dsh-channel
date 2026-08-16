@@ -134,3 +134,22 @@ test('suppressed counts as a terminal success and does not retry', () => {
   assert.equal(result.state.inFlight, null)
   assert.deepEqual(result.effects, [])
 })
+
+test('fatal error kind gives up immediately without retry', () => {
+  const state = deliverQueueReduce(emptyDeliverQueueState<P>(), { kind: 'enqueue', item: item('k1'), now: 0 }).state
+  const result = deliverQueueReduce(state, { kind: 'attempt-result', key: 'k1', outcome: 'failed', error: 'blocked', errorKind: 'forbidden', now: 10 })
+  assert.deepEqual(result.state.inFlight, null)
+  assert.deepEqual(result.effects, [{ kind: 'give-up', item: item('k1'), error: 'blocked', errorKind: 'forbidden' }])
+})
+
+test('rate_limited honors retryAfterMs up to the ceiling', () => {
+  const state = deliverQueueReduce(emptyDeliverQueueState<P>(), { kind: 'enqueue', item: item('k1'), now: 100 }).state
+  const result = deliverQueueReduce(state, { kind: 'attempt-result', key: 'k1', outcome: 'failed', error: 'flood', errorKind: 'rate_limited', retryAfterMs: 20_000, now: 100 }, { maxRetryAfterMs: 5000 })
+  assert.equal(result.state.retryAt, 5100)
+})
+
+test('injectable classifier can make an unknown error fatal', () => {
+  const state = deliverQueueReduce(emptyDeliverQueueState<P>(), { kind: 'enqueue', item: item('k1'), now: 0 }, { classify: () => 'fatal' }).state
+  const result = deliverQueueReduce(state, { kind: 'attempt-result', key: 'k1', outcome: 'failed', error: 'mystery', now: 10 }, { classify: () => 'fatal' })
+  assert.deepEqual(result.effects, [{ kind: 'give-up', item: item('k1'), error: 'mystery', errorKind: undefined }])
+})

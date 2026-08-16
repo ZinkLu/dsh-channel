@@ -15,11 +15,12 @@ import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-user-approval'
 import type {} from '@deepseek-ai/dsh-system-prompt'
-import type { Channel, OutboundMessage, PresentationFrame } from 'dsh-channel'
+import type { Channel, OutboundMessage, PresentationFrame, SendErrorKind } from 'dsh-channel'
 import { chunkText } from '../format/chunk.js'
 import { renderForTier } from '../format/format.js'
 import { promptHint } from '../format/prompt-hint.js'
 import { parseApprovalReply, renderApproval, type PendingApproval } from '../policy/approval-render.js'
+import { resolveBusyAction, type BusyAction } from '../policy/busy.js'
 import {
   deliverQueueReduce,
   emptyDeliverQueueState,
@@ -28,7 +29,9 @@ import {
   type DeliverQueueState,
   type QueuedDelivery,
 } from '../policy/deliver-queue.js'
+import { draftThrottleReduce, emptyDraftThrottleState, type DraftThrottleState } from '../policy/draft-throttle.js'
 import { emptyMergeState, mergeReduce, type MergeEffect, type MergeState } from '../policy/merge.js'
+import { emptyOutboundEchoState, outboundEchoReduce, type OutboundEchoState } from '../policy/outbound-echo.js'
 import {
   assistantMessageText,
   defaultPresentationPolicy,
@@ -50,6 +53,8 @@ export interface BridgeConfig {
   readonly agentPreset?: string
   readonly mergeWindowSec: number
   readonly approvalTimeoutSec: number
+  /** Max wait to acquire the per-sessionId turn guard before a visible rejection. Default 120. */
+  readonly sessionTurnTimeoutSec?: number
 }
 
 /** The two policy seams; each defaults to today's behavior. */
@@ -63,6 +68,21 @@ export interface BridgeDelivery {
   chatKey: string
   markdown: string
   origin?: OutboundMessage['origin']
+}
+
+/** One buffered merge entry: the message text and its platform ids, kept aligned with MergeState.buffer. */
+interface MergeEntry {
+  messageIds: string[]
+  senderId: string
+}
+
+/** A message queued behind a running turn (busy policy fallback). */
+interface BusyQueuedMessage {
+  chatKey: string
+  text: string
+  messageIds: string[]
+  senderId: string
+  images: readonly import('@deepseek-ai/dsh-attachment').ImageAttachmentRef[]
 }
 
 interface ApprovalEntry extends PendingApproval {
@@ -125,8 +145,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
   protected abstract readonly config: TCfg
 
   private readonly mergeStates = new Map<string, MergeState>()
-  private readonly mergeMessageIds = new Map<string, string[]>()
-  private readonly mergeSenderIds = new Map<string, string>()
+  private readonly mergeEntries = new Map<string, MergeEntry[]>()
   private readonly mergeTimers = new Map<string, NodeJS.Timeout>()
   private readonly sessionChatKeys = new Map<string, string>()
   private readonly ownedHandles = new Map<string, AgentHandle>()
@@ -135,14 +154,21 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
   private readonly lastTypingAt = new Map<string, number>()
   private readonly streamStates = new Map<string, StreamState>()
   private readonly streamTimers = new Map<string, NodeJS.Timeout>()
+  private readonly draftThrottleStates = new Map<string, DraftThrottleState>()
+  private readonly draftThrottleTimers = new Map<string, NodeJS.Timeout>()
   protected readonly draftMessageIds = new Map<string, number>()
   private readonly toolCallNames = new Map<string, string>()
   private readonly deliverQueueStates = new Map<string, DeliverQueueState<BridgeDelivery>>()
   private readonly deliverQueueTimers = new Map<string, NodeJS.Timeout>()
+  private readonly outboundEchoStates = new Map<string, OutboundEchoState>()
+  private readonly busyQueues = new Map<string, BusyQueuedMessage[]>()
+  private readonly sessionTurnTails = new Map<string, Promise<void>>()
+  private readonly statusWaiters: Array<() => void> = []
   private readonly disposers: Array<() => void> = []
 
   private promptSeq = 0
   private started = false
+  private channelStatus: 'connecting' | 'connected' | 'disconnected' | 'fatal' = 'disconnected'
 
   constructor(ctx: Context, channel: Channel, store: ChannelStore, policies?: BridgePolicyOverrides) {
     this.ctx = ctx
@@ -162,10 +188,25 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
       this.onSessionEvent(session, event)
     }))
     this.disposers.push(this.ctx.on('approval/request', async (req, next) => this.onApprovalRequest(req, next)))
+    this.disposers.push(this.ctx.on('channel/status', (channelId: string, status: 'connecting' | 'connected' | 'disconnected' | 'fatal') => {
+      if (channelId !== this.channel.id) return
+      this.channelStatus = status
+      if (status === 'connected') {
+        for (const resolve of this.statusWaiters.splice(0)) resolve()
+      }
+    }))
 
+    this.channelStatus = 'connecting'
     this.ctx.emit('channel/status', this.channel.id, 'connecting')
     await this.restore()
     await this.connect()
+    // Startup recovery only runs once the provider reached `connected`, so a
+    // failed-connect boot does not burn attempts for messages never once sent.
+    if (await this.waitForConnected()) {
+      await this.recover()
+    } else {
+      this.warn('channel did not reach connected status; skipping startup recovery')
+    }
   }
 
   async stop(): Promise<void> {
@@ -187,11 +228,18 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     for (const timer of this.streamTimers.values()) clearTimeout(timer)
     this.streamTimers.clear()
     this.streamStates.clear()
+    for (const timer of this.draftThrottleTimers.values()) clearTimeout(timer)
+    this.draftThrottleTimers.clear()
+    this.draftThrottleStates.clear()
     this.draftMessageIds.clear()
     this.toolCallNames.clear()
     for (const timer of this.deliverQueueTimers.values()) clearTimeout(timer)
     this.deliverQueueTimers.clear()
     this.deliverQueueStates.clear()
+    this.busyQueues.clear()
+    this.sessionTurnTails.clear()
+    this.outboundEchoStates.clear()
+    for (const resolve of this.statusWaiters.splice(0)) resolve()
     for (const entry of this.pendingApprovals.values()) {
       if (entry.timer) clearTimeout(entry.timer)
       entry.resolve?.('deferred')
@@ -266,8 +314,12 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     const now = Date.now()
     const buffers = this.store.mergeBuffers()
     for (const [chatKey, buffer] of Object.entries(buffers)) {
-      this.mergeStates.set(chatKey, { buffer, deadline: now + this.config.mergeWindowSec * 1000 })
-      this.mergeMessageIds.set(chatKey, [])
+      this.mergeStates.set(chatKey, {
+        buffer: buffer.map((text) => [text]),
+        deadline: now + this.config.mergeWindowSec * 1000,
+        firstAt: now,
+      })
+      this.mergeEntries.set(chatKey, buffer.map(() => ({ messageIds: [], senderId: '0' })))
       this.armMergeTimer(chatKey, now + this.config.mergeWindowSec * 1000)
     }
 
@@ -281,7 +333,25 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     }
 
     this.markSeenFromSessionLogs()
-    await this.recover()
+  }
+
+  /** Resolve once `channel/status` reaches connected, or after a bounded fallback (never hang start). */
+  private async waitForConnected(): Promise<boolean> {
+    if (this.channelStatus === 'connected') return true
+    const timeoutMs = 15_000
+    await new Promise<void>((resolve) => {
+      let settled = false
+      const done = () => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve()
+      }
+      const timer = setTimeout(done, timeoutMs)
+      timer.unref?.()
+      this.statusWaiters.push(done)
+    })
+    return (this.channelStatus as string) === 'connected'
   }
 
   private markSeenFromSessionLogs(): void {
@@ -342,29 +412,39 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
   protected async flushBuffered(chatKey: string): Promise<void> {
     const state = this.mergeStates.get(chatKey)
     if (!state || state.buffer.length === 0) return
-    const text = state.buffer.join('\n')
-    const ids = this.mergeMessageIds.get(chatKey) ?? []
-    const senderId = this.mergeSenderIds.get(chatKey) ?? '0'
+    const texts = state.buffer.map((entry) => entry.join(''))
+    const entries = this.mergeEntries.get(chatKey) ?? []
     this.mergeStates.set(chatKey, emptyMergeState)
-    this.mergeMessageIds.set(chatKey, [])
-    this.mergeSenderIds.delete(chatKey)
+    this.mergeEntries.delete(chatKey)
     this.store.setMergeBuffer(chatKey, [])
     this.clearMergeTimer(chatKey)
-    await this.dispatchText(chatKey, text, ids, senderId)
+    for (let i = 0; i < texts.length; i++) {
+      await this.dispatchText(chatKey, texts[i]!, entries[i]?.messageIds ?? [], entries[i]?.senderId ?? '0')
+    }
   }
 
   /** Feed one (non-command, non-media) text message through the merge reducer. */
   protected async mergeMessage(chatKey: string, text: string, messageId?: string, senderId = '0'): Promise<void> {
     const oldState = this.mergeStates.get(chatKey) ?? emptyMergeState
+    const oldLen = oldState.buffer.length
     const result = mergeReduce(
       oldState,
       { kind: 'message', text, hasMedia: false, isCommand: false, now: Date.now() },
       { windowMs: this.config.mergeWindowSec * 1000 },
     )
     this.mergeStates.set(chatKey, result.state)
-    this.mergeMessageIds.set(chatKey, [...(this.mergeMessageIds.get(chatKey) ?? []), ...(messageId ? [messageId] : [])])
-    this.mergeSenderIds.set(chatKey, senderId)
-    this.store.setMergeBuffer(chatKey, result.state.buffer)
+
+    // Keep the bridge's per-message ids/sender aligned with the reducer's buffer
+    // entries. A message that only re-arms the window (empty `..` payload) does
+    // not create a buffer entry.
+    const entries = this.mergeEntries.get(chatKey) ?? []
+    const grew = result.state.buffer.length > oldLen
+    const flushedImmediately = result.state.buffer.length === 0 && result.effects.some((effect) => effect.kind === 'flush')
+    if (grew || (flushedImmediately && text.trim() !== '')) {
+      entries.push({ messageIds: messageId ? [messageId] : [], senderId })
+      this.mergeEntries.set(chatKey, entries)
+    }
+    this.store.setMergeBuffer(chatKey, result.state.buffer.map((entry) => entry.join('')))
     await this.handleMergeEffects(chatKey, result.state, result.effects, messageId)
   }
 
@@ -375,14 +455,14 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
       } else if (effect.kind === 'ack-long') {
         await this.ackLong(chatKey, ackMessageId)
       } else if (effect.kind === 'flush') {
-        const ids = this.mergeMessageIds.get(chatKey) ?? []
-        const senderId = this.mergeSenderIds.get(chatKey) ?? '0'
-        this.mergeMessageIds.set(chatKey, [])
-        this.mergeSenderIds.delete(chatKey)
+        const entries = this.mergeEntries.get(chatKey) ?? []
+        this.mergeEntries.delete(chatKey)
         this.mergeStates.set(chatKey, emptyMergeState)
         this.store.setMergeBuffer(chatKey, [])
         this.clearMergeTimer(chatKey)
-        await this.dispatchText(chatKey, effect.text, ids, senderId)
+        for (let i = 0; i < effect.texts.length; i++) {
+          await this.dispatchText(chatKey, effect.texts[i]!, entries[i]?.messageIds ?? [], entries[i]?.senderId ?? '0')
+        }
       }
     }
   }
@@ -423,7 +503,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     const state = this.mergeStates.get(chatKey) ?? emptyMergeState
     const result = mergeReduce(state, { kind: 'tick', now: Date.now() }, { windowMs: this.config.mergeWindowSec * 1000 })
     this.mergeStates.set(chatKey, result.state)
-    this.store.setMergeBuffer(chatKey, result.state.buffer)
+    this.store.setMergeBuffer(chatKey, result.state.buffer.map((entry) => entry.join('')))
     await this.handleMergeEffects(chatKey, result.state, result.effects)
   }
 
@@ -458,11 +538,53 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
       return
     }
 
+    const message = this.buildUserMessage(chatKey, text, messageIds, senderId, images)
+    const action = this.resolveBusyActionFor(agent.status)
+
+    if (action === 'queue') {
+      this.queueBehindRunningTurn(agent.id, { chatKey, text, messageIds, senderId, images })
+      return
+    }
+
+    await this.runSerializedSessionTurn(agent.id, async () => {
+      if (action === 'steer') {
+        // Mandatory fallback: if steer is unavailable or fails, buffer the
+        // message behind the running turn — never drop it.
+        try {
+          const accepted = (await agent.steer(message)) as unknown
+          if (accepted === false) {
+            this.queueBehindRunningTurn(agent.id, { chatKey, text, messageIds, senderId, images })
+            return
+          }
+        } catch {
+          this.queueBehindRunningTurn(agent.id, { chatKey, text, messageIds, senderId, images })
+          return
+        }
+      } else {
+        agent.followup(message)
+      }
+      this.sessionChatKeys.set(agent.id, chatKey)
+    })
+  }
+
+  private resolveBusyActionFor(agentStatus: string): BusyAction {
+    // The channel bridge supports steer and queue (turn-end flush), so both
+    // capability gates are true; the decision reduces to the agent status.
+    return resolveBusyAction(agentStatus, 'text', { supportsSteer: true, supportsQueue: true })
+  }
+
+  private buildUserMessage(
+    chatKey: string,
+    text: string,
+    messageIds: string[],
+    senderId: string,
+    images: readonly ImageAttachmentRef[],
+  ): UserMessage {
     const content: Array<{ type: 'text'; text: string } | { type: 'image'; attachment: ImageAttachmentRef }> = []
     if (text !== '') content.push({ type: 'text', text })
     for (const attachment of images) content.push({ type: 'image', attachment })
 
-    const message: UserMessage = createUserMessage({
+    return createUserMessage({
       content,
       source: {
         kind: 'channel' as const,
@@ -472,13 +594,73 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
         messageIds: [...messageIds],
       },
     })
+  }
 
-    if (agent.status === 'running') {
-      agent.steer(message)
-    } else {
-      agent.followup(message)
+  private queueBehindRunningTurn(sessionId: string, message: BusyQueuedMessage): void {
+    const queue = this.busyQueues.get(sessionId) ?? []
+    queue.push(message)
+    this.busyQueues.set(sessionId, queue)
+  }
+
+  /** Flush messages queued behind a turn once that turn ends. */
+  private async flushBusyQueue(sessionId: string): Promise<void> {
+    const queue = this.busyQueues.get(sessionId)
+    if (!queue || queue.length === 0) return
+    this.busyQueues.delete(sessionId)
+
+    await this.runSerializedSessionTurn(sessionId, async () => {
+      const agent = this.ctx.agents.get(SessionId(sessionId))
+      if (!agent) return
+      for (const queued of queue) {
+        const message = this.buildUserMessage(queued.chatKey, queued.text, queued.messageIds, queued.senderId, queued.images)
+        agent.followup(message)
+        this.sessionChatKeys.set(sessionId, queued.chatKey)
+      }
+    })
+  }
+
+  /** Serialize dispatch per resolved sessionId so two chats bound to one session cannot interleave turns. */
+  private async runSerializedSessionTurn(sessionId: string, run: () => Promise<void>): Promise<void> {
+    const previous = this.sessionTurnTails.get(sessionId) ?? Promise.resolve()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const tail = previous.catch(() => {}).then(() => gate)
+    this.sessionTurnTails.set(sessionId, tail)
+
+    const timeoutMs = (this.config.sessionTurnTimeoutSec ?? 120) * 1000
+    let timer: NodeJS.Timeout | undefined
+    let acquired = false
+    try {
+      acquired = await Promise.race([
+        previous.catch(() => {}).then(() => true),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), timeoutMs)
+          timer.unref?.()
+        }),
+      ])
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
     }
-    this.sessionChatKeys.set(agent.id, chatKey)
+
+    if (!acquired) {
+      // Reject visibly, never run unserialized. Release the gate so the next
+      // queued turn can still proceed (identity-checked release: only our own
+      // gate is resolved).
+      release()
+      const chatKey = this.sessionChatKeys.get(sessionId)
+      if (chatKey !== undefined) {
+        await this.sendLocal(chatKey, '⚠️ The previous turn is still running; please resend your message.')
+      }
+      return
+    }
+
+    try {
+      await run()
+    } finally {
+      release()
+    }
   }
 
   private async ensureAgent(sessionId: string, chatKey: string, create: boolean): Promise<Agent | undefined> {
@@ -657,6 +839,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
       const receipt = await this.ctx.channels.deliver(out)
       const platformId = receipt.platformMessageIds?.[0]
       if (platformId && entry) entry.messageId = Number(platformId)
+      this.rememberOwnSends(chatKey, receipt.platformMessageIds ?? [])
     } catch {
       // Prompt send failed: the answerer fails closed after timeout (empty answer); never default to allowing.
     }
@@ -677,6 +860,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
   private handleStreamInput(sessionId: string, chatKey: string, input: StreamInput, seq: number): void {
     switch (input.kind) {
       case 'turn-start':
+        this.clearDraftThrottle(sessionId)
         void this.onTurnStart(chatKey).catch(() => {})
         break
       case 'assistant-message':
@@ -692,6 +876,8 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
         if (input.reason !== 'completed') {
           void this.sendLocal(chatKey, `⏹ Turn ended: ${turnEndLabel(input.reason)}`, { silent: this.channel.supportsSilent }).catch(() => {})
         }
+        // Busy-policy queue: messages buffered behind the running turn flush on turn-end.
+        void this.flushBusyQueue(sessionId).catch(() => {})
         break
       case 'step-start':
       case 'step-end':
@@ -733,9 +919,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
         return
       }
       case 'draft':
-        void this.showDraft(chatKey, sessionId, frame.text).catch((error: unknown) => {
-          this.warn(`draft presentation failed: ${error instanceof Error ? error.message : String(error)}`)
-        })
+        this.sendDraftThrottled(sessionId, chatKey, frame.text)
         return
       case 'draft-finalize':
         void this.finalizeDraft(chatKey, sessionId).catch(() => {})
@@ -781,6 +965,61 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     }
   }
 
+  private clearDraftThrottle(sessionId: string): void {
+    const timer = this.draftThrottleTimers.get(sessionId)
+    if (timer !== undefined) {
+      clearTimeout(timer)
+      this.draftThrottleTimers.delete(sessionId)
+    }
+    this.draftThrottleStates.delete(sessionId)
+  }
+
+  /** Draft edits go through the adaptive throttle: flood doubles, success resets, retry_after capped. */
+  private sendDraftThrottled(sessionId: string, chatKey: string, text: string): void {
+    const now = Date.now()
+    const state = this.draftThrottleStates.get(sessionId) ?? emptyDraftThrottleState
+    const attempt = draftThrottleReduce(state, { kind: 'attempt', now })
+    this.draftThrottleStates.set(sessionId, attempt.state)
+
+    if (attempt.effect.kind === 'delay') {
+      const existing = this.draftThrottleTimers.get(sessionId)
+      if (existing !== undefined) clearTimeout(existing)
+      const delay = Math.max(0, attempt.effect.at - now)
+      const timer = setTimeout(() => {
+        this.draftThrottleTimers.delete(sessionId)
+        this.sendDraftThrottled(sessionId, chatKey, text)
+      }, delay)
+      timer.unref?.()
+      this.draftThrottleTimers.set(sessionId, timer)
+      return
+    }
+
+    if (attempt.effect.kind === 'fail-over') {
+      // Server retry_after exceeded the ceiling: degrade instead of stalling the preview.
+      this.warn('draft edit throttle fail-over; switching to append-tail mode')
+      this.feedStream(sessionId, chatKey, { kind: 'edit-failed', visiblePrefix: this.streamStates.get(sessionId)?.draftText })
+      return
+    }
+
+    void this.showDraft(chatKey, sessionId, text)
+      .then(() => {
+        const next = draftThrottleReduce(this.draftThrottleStates.get(sessionId) ?? emptyDraftThrottleState, { kind: 'success', now: Date.now() })
+        this.draftThrottleStates.set(sessionId, next.state)
+      })
+      .catch((error: unknown) => {
+        this.warn(`draft presentation failed: ${error instanceof Error ? error.message : String(error)}`)
+        const retryAfterMs = (error as { retryAfterMs?: number }).retryAfterMs
+        const next = draftThrottleReduce(
+          this.draftThrottleStates.get(sessionId) ?? emptyDraftThrottleState,
+          { kind: 'failure', now: Date.now(), retryAfterMs },
+        )
+        this.draftThrottleStates.set(sessionId, next.state)
+        // Edit-in-place died mid-stream: record the visible prefix and flip
+        // the reducer to append-tail mode instead of repeatedly failing.
+        this.feedStream(sessionId, chatKey, { kind: 'edit-failed', visiblePrefix: this.streamStates.get(sessionId)?.draftText })
+      })
+  }
+
   private async onTurnStart(chatKey: string): Promise<void> {
     if (!this.channel.supportsTyping) return
     const now = Date.now()
@@ -788,6 +1027,39 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     if (now - last < 5000) return
     this.lastTypingAt.set(chatKey, now)
     await this.channel.sendTyping(chatKey)
+  }
+
+  /** Remember our own platform message ids for outbound-echo suppression (30s TTL, bounded). */
+  private rememberOwnSends(chatKey: string, platformMessageIds: readonly string[]): void {
+    let state = this.outboundEchoStates.get(chatKey) ?? emptyOutboundEchoState
+    for (const messageId of platformMessageIds) {
+      if (messageId === '') continue
+      state = outboundEchoReduce(state, {
+        kind: 'sent',
+        channel: this.channel.id,
+        accountId: this.channel.accountId,
+        chatKey,
+        messageId,
+        now: Date.now(),
+      }).state
+    }
+    this.outboundEchoStates.set(chatKey, state)
+  }
+
+  /** True when an inbound platform message is an echo of one of our own recent sends. */
+  protected isOwnEcho(chatKey: string, messageId: string): boolean {
+    if (messageId === '') return false
+    const state = this.outboundEchoStates.get(chatKey) ?? emptyOutboundEchoState
+    const result = outboundEchoReduce(state, {
+      kind: 'inbound',
+      channel: this.channel.id,
+      accountId: this.channel.accountId,
+      chatKey,
+      messageId,
+      now: Date.now(),
+    })
+    this.outboundEchoStates.set(chatKey, result.state)
+    return result.matches
   }
 
   protected sendOutbound(
@@ -839,16 +1111,22 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
           this.armDeliverTimer(chatKey, effect.at)
           break
         case 'give-up':
-          this.store.markFailed(effect.item.key, effect.error)
+          this.store.markFailed(effect.item.key, effect.error, effect.errorKind)
           break
         case 'reject-backpressure':
-          this.store.markFailed(effect.item.key, 'delivery queue full (backpressure)')
+          // Distinguishable in the ledger: backpressure is retryable, not terminal.
+          this.store.markFailed(effect.item.key, 'delivery queue full (backpressure)', 'transient')
           break
       }
     }
   }
 
   private async performAttempt(chatKey: string, item: QueuedDelivery<BridgeDelivery>): Promise<void> {
+    // Never burn an attempt budget when the provider never connected this boot.
+    if (this.channelStatus !== 'connected') {
+      this.feedAttemptResult(chatKey, item.key, 'failed', 'channel not connected', 'transient')
+      return
+    }
     this.store.markAttempting(item.key)
     try {
       const receipt = await this.ctx.channels.deliver({
@@ -861,21 +1139,34 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
       })
       if (receipt.status === 'sent') {
         this.store.markDelivered(item.key, receipt.platformMessageIds ?? [])
+        this.rememberOwnSends(item.value.chatKey, receipt.platformMessageIds ?? [])
         this.feedAttemptResult(chatKey, item.key, 'sent')
       } else if (receipt.status === 'suppressed') {
         this.store.markDelivered(item.key, [])
         this.feedAttemptResult(chatKey, item.key, 'suppressed')
       } else {
-        this.feedAttemptResult(chatKey, item.key, 'failed', receipt.error ?? 'delivery failed')
+        this.feedAttemptResult(chatKey, item.key, 'failed', receipt.error ?? 'delivery failed', receipt.errorKind, receipt.retryAfterMs)
       }
     } catch (error) {
-      this.feedAttemptResult(chatKey, item.key, 'failed', error instanceof Error ? error.message : String(error))
+      const classified = error as Error & { errorKind?: SendErrorKind; retryAfterMs?: number }
+      this.feedAttemptResult(chatKey, item.key, 'failed', error instanceof Error ? error.message : String(error), classified.errorKind, classified.retryAfterMs)
     }
   }
 
-  private feedAttemptResult(chatKey: string, key: string, outcome: 'sent' | 'suppressed' | 'failed', error?: string): void {
+  private feedAttemptResult(
+    chatKey: string,
+    key: string,
+    outcome: 'sent' | 'suppressed' | 'failed',
+    error?: string,
+    errorKind?: SendErrorKind,
+    retryAfterMs?: number,
+  ): void {
     const state = this.deliverQueueStates.get(chatKey) ?? emptyDeliverQueueState<BridgeDelivery>()
-    const result = deliverQueueReduce(state, { kind: 'attempt-result', key, outcome, error, now: Date.now() }, this.deliverQueueOptions())
+    const result = deliverQueueReduce(
+      state,
+      { kind: 'attempt-result', key, outcome, error, errorKind, retryAfterMs, now: Date.now() },
+      this.deliverQueueOptions(),
+    )
     this.deliverQueueStates.set(chatKey, result.state)
     this.runDeliverEffects(chatKey, result.effects)
   }
@@ -911,7 +1202,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     const maxChars = this.channel.maxMessageChars ?? 4096
     const chunks = chunkText(rendered, { maxChars, countBy: this.chunkCountBy })
     for (let i = 0; i < chunks.length; i++) {
-      await this.ctx.channels.deliver({
+      const receipt = await this.ctx.channels.deliver({
         channel: this.channel.id,
         ...this.accountQualifier,
         chatKey,
@@ -919,6 +1210,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
         deliveryKey: `local:${chatKey}:${Date.now()}:${i}`,
         silent: opts.silent ? true : undefined,
       })
+      this.rememberOwnSends(chatKey, receipt.platformMessageIds ?? [])
       if (i < chunks.length - 1) await sleep(1000)
     }
   }
@@ -1033,8 +1325,14 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
       const receipt = await this.ctx.channels.deliver(out)
       const platformId = receipt.platformMessageIds?.[0]
       if (platformId) entry.messageId = Number(platformId)
+      this.rememberOwnSends(entry.chatKey, receipt.platformMessageIds ?? [])
     } catch {
-      // When the approval prompt fails to send, the answerer calls next() after timeout; never default to allowing.
+      // Fail-fast: if the prompt cannot be delivered the user demonstrably
+      // cannot answer, so resolve `deferred` immediately instead of waiting
+      // out approvalTimeoutSec (hermes approval.py:3504-3510).
+      this.pendingApprovals.delete(entry.num)
+      if (entry.timer) clearTimeout(entry.timer)
+      entry.resolve?.('deferred')
     }
   }
 

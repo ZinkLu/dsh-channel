@@ -93,12 +93,16 @@ export class FeishuBridge extends ChannelBridge<FeishuBridgeConfig> {
       return
     }
 
-    if (messageId && this.store.seenInbound(messageId)) return
+    if (messageId) {
+      if (this.isOwnEcho(chatKey, messageId)) return
+      if (this.store.seenInbound(messageId)) return
+      this.store.markInbound(messageId, 'handling')
+    }
 
     // Approval/question replies take precedence over merge/router (openclaw control-command iron rule).
     const text = messageText(messageEvent)
     if (await this.handleInboundReply(text)) {
-      if (messageId) this.store.markInbound(messageId)
+      if (messageId) this.store.markInbound(messageId, 'done')
       return
     }
 
@@ -109,7 +113,7 @@ export class FeishuBridge extends ChannelBridge<FeishuBridgeConfig> {
     if (isCommand) {
       await this.flushBuffered(chatKey)
       await this.handleCommand(text.trim(), chatKey)
-      if (messageId) this.store.markInbound(messageId)
+      if (messageId) this.store.markInbound(messageId, 'done')
       return
     }
 
@@ -118,17 +122,17 @@ export class FeishuBridge extends ChannelBridge<FeishuBridgeConfig> {
       if (text.trim() !== '') {
         await this.dispatchText(chatKey, text, [messageId].filter(Boolean), sender)
       }
-      if (messageId) this.store.markInbound(messageId)
+      if (messageId) this.store.markInbound(messageId, 'done')
       return
     }
 
     if (text.trim() === '') {
-      if (messageId) this.store.markInbound(messageId)
+      if (messageId) this.store.markInbound(messageId, 'done')
       return
     }
 
     await this.mergeMessage(chatKey, text, messageId, sender)
-    if (messageId) this.store.markInbound(messageId)
+    if (messageId) this.store.markInbound(messageId, 'done')
   }
 
   private ingest(messageEvent: FeishuMessageEvent, chatKey: string, chatType: 'direct' | 'group'): void {

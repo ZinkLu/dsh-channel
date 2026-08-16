@@ -135,7 +135,11 @@ export class WeChatBridge extends ChannelBridge<WeChatBridgeConfig> {
       return
     }
 
-    if (messageId && this.store.seenInbound(messageId)) return
+    if (messageId) {
+      if (this.isOwnEcho(chatKey, messageId)) return
+      if (this.store.seenInbound(messageId)) return
+      this.store.markInbound(messageId, 'handling')
+    }
 
     // context_token echo + typing ticket warm-up (hermes ContextTokenStore / _maybe_fetch_typing_ticket).
     const contextToken = message.context_token
@@ -145,7 +149,7 @@ export class WeChatBridge extends ChannelBridge<WeChatBridgeConfig> {
     // Approval/prompt answers take priority over merge/router (openclaw control-command iron rule).
     const text = messageText(message)
     if (await this.handleInboundReply(text)) {
-      if (messageId) this.store.markInbound(messageId)
+      if (messageId) this.store.markInbound(messageId, 'done')
       return
     }
 
@@ -156,7 +160,7 @@ export class WeChatBridge extends ChannelBridge<WeChatBridgeConfig> {
     if (isCommand) {
       await this.flushBuffered(chatKey)
       await this.handleCommand(text.trim(), chatKey)
-      if (messageId) this.store.markInbound(messageId)
+      if (messageId) this.store.markInbound(messageId, 'done')
       return
     }
 
@@ -165,17 +169,17 @@ export class WeChatBridge extends ChannelBridge<WeChatBridgeConfig> {
       if (text.trim() !== '') {
         await this.dispatchText(chatKey, text, [messageId].filter(Boolean), sender)
       }
-      if (messageId) this.store.markInbound(messageId)
+      if (messageId) this.store.markInbound(messageId, 'done')
       return
     }
 
     if (text.trim() === '') {
-      if (messageId) this.store.markInbound(messageId)
+      if (messageId) this.store.markInbound(messageId, 'done')
       return
     }
 
     await this.mergeMessage(chatKey, text, messageId, sender)
-    if (messageId) this.store.markInbound(messageId)
+    if (messageId) this.store.markInbound(messageId, 'done')
   }
 
   private async warmTypingTicket(chatKey: string, contextToken?: string): Promise<void> {

@@ -1,6 +1,6 @@
 import { Channel, type ChatType, type OutboundChoice, type OutboundMedia, type PresentationLimits } from 'dsh-channel'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
-import type { TelegramClient } from './client.js'
+import { classifyTelegramSendError, TelegramApiError, type TelegramClient } from './client.js'
 
 export interface TelegramChannelOptions {
   /** Re-resolve the token on every send; caching across operations is forbidden. */
@@ -148,8 +148,12 @@ export class TelegramChannel extends Channel {
       return { platformMessageId: String(sent.message_id) }
     } catch (htmlError) {
       const plain = plainTextFallback(text)
-      const sent = await this.opts.client.sendMessage(token, chatKey, plain, { ...sendOpts, parseMode: undefined })
-      return { platformMessageId: String(sent.message_id) }
+      try {
+        const sent = await this.opts.client.sendMessage(token, chatKey, plain, { ...sendOpts, parseMode: undefined })
+        return { platformMessageId: String(sent.message_id) }
+      } catch (plainError) {
+        throw classifySendError(plainError)
+      }
     }
   }
 
@@ -176,4 +180,14 @@ function plainTextFallback(html: string): string {
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&amp;/g, '&')
+}
+
+function classifySendError(error: unknown): unknown {
+  if (error instanceof TelegramApiError) {
+    const classified = classifyTelegramSendError(error)
+    const tagged = error as TelegramApiError & { errorKind?: string; retryAfterMs?: number }
+    tagged.errorKind = classified.errorKind
+    if (classified.retryAfterMs !== undefined) tagged.retryAfterMs = classified.retryAfterMs
+  }
+  return error
 }

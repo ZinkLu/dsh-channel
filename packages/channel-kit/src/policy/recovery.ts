@@ -10,6 +10,8 @@
  * returned actions (looks up the text, resends, and marks the ledger accordingly).
  */
 
+import type { SendErrorKind } from 'dsh-channel'
+
 /** The full delivery-ledger state machine (shared with the store). */
 export type DeliveryState = 'pending' | 'attempting' | 'delivered' | 'failed' | 'abandoned'
 
@@ -18,6 +20,8 @@ export interface RecoverableDelivery {
   key: string
   state: 'pending' | 'attempting' | 'failed'
   chatKey: string
+  attempts?: number
+  errorKind?: SendErrorKind
 }
 
 /** Minimal structural view of a Channel, just enough for reconciliation. */
@@ -51,6 +55,11 @@ export const defaultRecoveryPolicy: RecoveryPolicy = {
   async sweep(entries, ctx) {
     const actions: RecoveryAction[] = []
     for (const item of entries) {
+      // Never blind-resend a terminal platform rejection; those are abandoned on sight.
+      if (isFatalSendError(item.errorKind)) {
+        actions.push({ kind: 'abandon', item, reason: `recovery: terminal send error ${item.errorKind ?? ''}`.trim() })
+        continue
+      }
       const { sessionId, seq } = splitDeliveryKey(item.key)
       if (sessionId === undefined || seq === undefined) {
         actions.push({ kind: 'abandon', item, reason: `recovery: cannot parse delivery key ${item.key}` })
@@ -81,6 +90,11 @@ export const defaultRecoveryPolicy: RecoveryPolicy = {
 }
 
 /** Parse a `${sessionId}:${seq}` delivery key back into its parts. */
+/** Terminal send errors are never retried by the recovery policy (hermes taxonomy day-one rule). */
+export function isFatalSendError(errorKind: SendErrorKind | undefined): boolean {
+  return errorKind === 'too_long' || errorKind === 'bad_format' || errorKind === 'forbidden' || errorKind === 'not_found'
+}
+
 export function splitDeliveryKey(key: string): { sessionId?: string; seq?: number } {
   const sep = key.lastIndexOf(':')
   if (sep <= 0) return {}

@@ -1,3 +1,4 @@
+import type { SendErrorKind } from 'dsh-channel'
 import { assertMediaWithinLimit, proxiedFetch } from 'dsh-channel-kit'
 
 export interface TelegramUser {
@@ -393,6 +394,56 @@ async function readBodyWithLimit(response: Response, maxBytes: number, kind: str
     offset += chunk.byteLength
   }
   return bytes
+}
+
+export interface ClassifiedSendError {
+  errorKind: SendErrorKind
+  retryAfterMs?: number
+}
+
+/**
+ * Telegram send-error classification table (hermes platforms/base.py:2484-2520,
+ * adapted to Bot API error_code + description). `not_found` is split by blast
+ * radius in the caller when it has both a chat and an edit target.
+ */
+export function classifyTelegramSendError(error: TelegramApiError): ClassifiedSendError {
+  const code = error.errorCode
+  const description = (error.description ?? error.message).toLowerCase()
+
+  if (code === 429 || description.includes('retry after') || description.includes('too many requests')) {
+    return { errorKind: 'rate_limited', retryAfterMs: parseRetryAfterMs(error.message) }
+  }
+  if (code === 403 || description.includes('forbidden') || description.includes('bot was blocked') || description.includes('user is deactivated') || description.includes('bot was kicked')) {
+    return { errorKind: 'forbidden' }
+  }
+  if (code === 401) {
+    return { errorKind: 'forbidden' }
+  }
+  if (code === 400) {
+    if (description.includes('chat not found') || description.includes('message not found') || description.includes('message to edit not found') || description.includes('message_id not found') || description.includes("message can't be deleted")) {
+      return { errorKind: 'not_found' }
+    }
+    if (description.includes('too long') || description.includes('too many characters')) {
+      return { errorKind: 'too_long' }
+    }
+    if (description.includes('parse') || description.includes('format') || description.includes("can't use this syntax") || description.includes('unsupported parse')) {
+      return { errorKind: 'bad_format' }
+    }
+    if (description.includes('not enough rights') || description.includes('have no rights')) {
+      return { errorKind: 'forbidden' }
+    }
+  }
+  if (code !== undefined && code >= 500) {
+    return { errorKind: 'transient' }
+  }
+  return { errorKind: 'unknown' }
+}
+
+function parseRetryAfterMs(message: string): number | undefined {
+  const match = /retry after (\d+)/i.exec(message)
+  if (!match) return undefined
+  const seconds = Number(match[1])
+  return Number.isFinite(seconds) ? seconds * 1000 : undefined
 }
 
 export function toChatKey(chat: TelegramChat): string {

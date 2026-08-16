@@ -42,6 +42,8 @@ export type StreamInput =
   | { readonly kind: 'assistant-message'; readonly text: string }
   | { readonly kind: 'turn-end'; readonly reason: 'completed' | 'aborted' | 'blocked' | 'error' | 'max-tokens' | 'interrupted' }
   | { readonly kind: 'tick' }
+  /** The bridge feeds this when `showDraft` (edit-in-place) rejects mid-stream. */
+  | { readonly kind: 'edit-failed'; readonly visiblePrefix?: string }
 
 export interface StreamState {
   readonly bufferedText: string
@@ -50,6 +52,12 @@ export interface StreamState {
   readonly gateDeadline: number | undefined
   /** Whether a thinking status line was already emitted this turn (coalesces the 'stream' tier). */
   readonly thinkingShown: boolean
+  /** Last draft text emitted this turn (the visible prefix for edit-failure degradation). */
+  readonly draftText: string
+  /** What the user already saw when edit-in-place died; subsequent updates send only the tail. */
+  readonly visiblePrefix: string
+  /** True once edit-in-place failed this turn; append-tail mode, never edit again this turn. */
+  readonly editFailed: boolean
 }
 
 export const emptyStreamState: StreamState = {
@@ -58,6 +66,9 @@ export const emptyStreamState: StreamState = {
   draftStarted: false,
   gateDeadline: undefined,
   thinkingShown: false,
+  draftText: '',
+  visiblePrefix: '',
+  editFailed: false,
 }
 
 export type StreamFrame =
@@ -99,9 +110,22 @@ function resolveMode(caps: StreamCaps): 'off' | 'progress' {
 
 function reduceOff(state: StreamState, input: StreamInput): { state: StreamState; frames: StreamFrame[] } {
   if (input.kind === 'assistant-message') {
-    return { state: { ...state, bufferedText: '', thinkingShown: false }, frames: [{ kind: 'final', text: input.text }] }
+    return { state: resetStreamState(), frames: [{ kind: 'final', text: input.text }] }
   }
   return { state, frames: [{ kind: 'noop' }] }
+}
+
+function resetStreamState(): StreamState {
+  return {
+    bufferedText: '',
+    toolLines: [],
+    draftStarted: false,
+    gateDeadline: undefined,
+    thinkingShown: false,
+    draftText: '',
+    visiblePrefix: '',
+    editFailed: false,
+  }
 }
 
 function reduceProgress(
@@ -113,13 +137,24 @@ function reduceProgress(
 ): { state: StreamState; frames: StreamFrame[] } {
   switch (input.kind) {
     case 'turn-start':
-      return { state: { bufferedText: '', toolLines: [], draftStarted: false, gateDeadline: undefined, thinkingShown: false }, frames: [{ kind: 'noop' }] }
+      return { state: resetStreamState(), frames: [{ kind: 'noop' }] }
+
+    case 'edit-failed': {
+      // Record the visible prefix (bridge supplies it; fall back to the last draft
+      // text the reducer emitted) and flip to append-tail mode permanently this turn.
+      const visiblePrefix = input.visiblePrefix ?? state.draftText
+      return { state: { ...state, visiblePrefix, editFailed: true }, frames: [{ kind: 'noop' }] }
+    }
 
     case 'tool-call': {
       const line = render.renderToolCall(input.name, input.arguments)
       const toolLines = [...state.toolLines, line]
+      const full = composeDraft(toolLines)
+      if (state.editFailed) {
+        return { state: { ...state, toolLines, draftText: full }, frames: statusLineTail(full, state.visiblePrefix) }
+      }
       if (state.draftStarted) {
-        return { state: { ...state, toolLines }, frames: [{ kind: 'draft', text: composeDraft(toolLines) }] }
+        return { state: { ...state, toolLines, draftText: full }, frames: [{ kind: 'draft', text: full }] }
       }
       if (state.gateDeadline === undefined) {
         const at = now + PROGRESS_GATE_MS
@@ -129,28 +164,42 @@ function reduceProgress(
     }
 
     case 'tool-result': {
-      if (!state.draftStarted) return { state, frames: [{ kind: 'noop' }] }
+      if (!state.draftStarted && !state.editFailed) return { state, frames: [{ kind: 'noop' }] }
       const line = render.renderToolResult(input.name, { ok: input.ok, durationMs: input.durationMs, summary: input.summary })
       const toolLines = [...state.toolLines, line]
-      return { state: { ...state, toolLines }, frames: [{ kind: 'draft', text: composeDraft(toolLines) }] }
+      const full = composeDraft(toolLines)
+      if (state.editFailed) {
+        return { state: { ...state, toolLines, draftText: full }, frames: statusLineTail(full, state.visiblePrefix) }
+      }
+      return { state: { ...state, toolLines, draftText: full }, frames: [{ kind: 'draft', text: full }] }
     }
 
     case 'assistant-message': {
       const frames: StreamFrame[] = []
       if (state.draftStarted) frames.push({ kind: 'draft-finalize' })
       frames.push({ kind: 'final', text: input.text })
-      return { state: { bufferedText: '', toolLines: [], draftStarted: false, gateDeadline: undefined, thinkingShown: false }, frames }
+      return { state: resetStreamState(), frames }
     }
 
     case 'turn-end': {
-      const next = { bufferedText: '', toolLines: [], draftStarted: false, gateDeadline: undefined, thinkingShown: false }
+      const next = resetStreamState()
       return state.draftStarted ? { state: next, frames: [{ kind: 'draft-finalize' }] } : { state: next, frames: [{ kind: 'noop' }] }
     }
 
     case 'tick': {
       if (state.gateDeadline === undefined) return { state, frames: [{ kind: 'noop' }] }
       if (now >= state.gateDeadline) {
-        return { state: { ...state, draftStarted: true, gateDeadline: undefined }, frames: [{ kind: 'draft', text: composeDraft(state.toolLines) }] }
+        const full = composeDraft(state.toolLines)
+        if (state.editFailed) {
+          return {
+            state: { ...state, draftStarted: true, gateDeadline: undefined, draftText: full },
+            frames: statusLineTail(full, state.visiblePrefix),
+          }
+        }
+        return {
+          state: { ...state, draftStarted: true, gateDeadline: undefined, draftText: full },
+          frames: [{ kind: 'draft', text: full }],
+        }
       }
       return { state, frames: [{ kind: 'arm-timer', at: state.gateDeadline }] }
     }
@@ -171,6 +220,18 @@ function reduceProgress(
     case 'step-end':
       return { state, frames: [{ kind: 'noop' }] }
   }
+}
+
+function statusLineTail(full: string, visiblePrefix: string): StreamFrame[] {
+  const tail = tailAfter(full, visiblePrefix)
+  return tail === '' ? [{ kind: 'noop' }] : [{ kind: 'status-line', text: tail }]
+}
+
+function tailAfter(full: string, visiblePrefix: string): string {
+  if (visiblePrefix !== '' && full.startsWith(visiblePrefix)) {
+    return full.slice(visiblePrefix.length).replace(/^\n+/, '')
+  }
+  return full
 }
 
 function composeDraft(lines: readonly string[]): string {

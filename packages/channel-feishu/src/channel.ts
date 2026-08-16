@@ -1,5 +1,5 @@
 import { Channel, type ChatType, type OutboundChoice } from 'dsh-channel'
-import type { FeishuClient, FeishuCredentials } from './client.js'
+import { classifyFeishuSendError, FeishuApiError, type FeishuClient, type FeishuCredentials } from './client.js'
 
 export interface FeishuChannelOptions {
   /** Re-resolve app credentials on every send; caching across operations is forbidden. */
@@ -79,10 +79,24 @@ export class FeishuChannel extends Channel {
     if (!credentials) throw new Error('FEISHU_APP_ID / FEISHU_APP_SECRET are not configured')
 
     const token = await this.opts.client.getTenantAccessToken(credentials)
-    const messageId =
-      opts?.replyTo !== undefined
-        ? await this.opts.client.replyMessage(token, opts.replyTo, text, { signal: opts?.signal })
-        : await this.opts.client.sendMessage(token, chatKey, text, { signal: opts?.signal })
-    return { platformMessageId: messageId }
+    try {
+      const messageId =
+        opts?.replyTo !== undefined
+          ? await this.opts.client.replyMessage(token, opts.replyTo, text, { signal: opts?.signal })
+          : await this.opts.client.sendMessage(token, chatKey, text, { signal: opts?.signal })
+      return { platformMessageId: messageId }
+    } catch (error) {
+      throw classifySendError(error)
+    }
   }
+}
+
+function classifySendError(error: unknown): unknown {
+  if (error instanceof FeishuApiError) {
+    const classified = classifyFeishuSendError(error)
+    const tagged = error as FeishuApiError & { errorKind?: string; retryAfterMs?: number }
+    tagged.errorKind = classified.errorKind
+    if (classified.retryAfterMs !== undefined) tagged.retryAfterMs = classified.retryAfterMs
+  }
+  return error
 }

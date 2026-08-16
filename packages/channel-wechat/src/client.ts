@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto'
+import type { SendErrorKind } from 'dsh-channel'
 import { proxiedFetch } from 'dsh-channel-kit'
 
 /**
@@ -104,6 +105,29 @@ export class WeixinApiError extends Error {
     this.errcode = errcode
     this.errmsg = errmsg
   }
+}
+
+export interface ClassifiedSendError {
+  errorKind: SendErrorKind
+  retryAfterMs?: number
+}
+
+/** iLink/WeChat send-error classification. Conservative: unknown codes stay unknown (retryable). */
+export function classifyWeChatSendError(error: WeixinApiError): ClassifiedSendError {
+  const code = error.errcode
+  if (code === 40001 || code === 40014 || code === 42001 || code === 40003) {
+    return { errorKind: 'forbidden' }
+  }
+  if (code === 45009 || code === 45008 || code === 45006) {
+    return { errorKind: 'rate_limited' }
+  }
+  if (code === 10001 || code === 10002 || code === 10003) {
+    return { errorKind: 'too_long' }
+  }
+  if (code === -1 || code === 40097) {
+    return { errorKind: 'transient' }
+  }
+  return { errorKind: 'unknown' }
 }
 
 export class WeixinClient {

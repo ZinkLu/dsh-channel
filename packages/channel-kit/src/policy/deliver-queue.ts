@@ -1,3 +1,5 @@
+import type { SendErrorKind } from 'dsh-channel'
+
 /**
  * Outbound delivery queue reducer (pure; timers and IO live outside, like merge.ts / stream.ts).
  *
@@ -17,6 +19,29 @@ export interface QueuedDelivery<T = unknown> {
   readonly value: T
 }
 
+/** The reducer's view of a failed attempt, passed to the injectable classifier. */
+export interface DeliveryFailure {
+  readonly errorKind?: SendErrorKind
+  readonly error: string
+  readonly retryAfterMs?: number
+}
+
+/** Classify a failed attempt as retryable or fatal. Defaults off the SendErrorKind taxonomy. */
+export type DeliveryErrorClassifier = (failure: DeliveryFailure) => 'retryable' | 'fatal'
+
+/** Default classifier: terminal payload/permission errors are fatal; the rest retry. */
+export function classifyDeliveryError(failure: DeliveryFailure): 'retryable' | 'fatal' {
+  switch (failure.errorKind) {
+    case 'too_long':
+    case 'bad_format':
+    case 'forbidden':
+    case 'not_found':
+      return 'fatal'
+    default:
+      return 'retryable'
+  }
+}
+
 export interface DeliverQueueState<T> {
   /** Item currently being attempted (the single in-flight worker), or null when idle. */
   readonly inFlight: QueuedDelivery<T> | null
@@ -34,13 +59,21 @@ export function emptyDeliverQueueState<T>(): DeliverQueueState<T> {
 
 export type DeliverQueueInput<T> =
   | { readonly kind: 'enqueue'; readonly item: QueuedDelivery<T>; readonly now: number }
-  | { readonly kind: 'attempt-result'; readonly key: string; readonly outcome: 'sent' | 'suppressed' | 'failed'; readonly error?: string; readonly now: number }
+  | {
+      readonly kind: 'attempt-result'
+      readonly key: string
+      readonly outcome: 'sent' | 'suppressed' | 'failed'
+      readonly error?: string
+      readonly errorKind?: SendErrorKind
+      readonly retryAfterMs?: number
+      readonly now: number
+    }
   | { readonly kind: 'tick'; readonly now: number }
 
 export type DeliverQueueEffect<T> =
   | { readonly kind: 'attempt'; readonly item: QueuedDelivery<T> }
   | { readonly kind: 'retry-after'; readonly at: number; readonly item: QueuedDelivery<T> }
-  | { readonly kind: 'give-up'; readonly item: QueuedDelivery<T>; readonly error: string }
+  | { readonly kind: 'give-up'; readonly item: QueuedDelivery<T>; readonly error: string; readonly errorKind?: SendErrorKind }
   | { readonly kind: 'reject-backpressure'; readonly item: QueuedDelivery<T> }
 
 export interface DeliverQueueOptions {
@@ -52,6 +85,10 @@ export interface DeliverQueueOptions {
   maxQueue?: number
   /** Minimum spacing between successive deliveries (rate-limit guard, preserves the old 1s inter-chunk sleep). Default 1000. */
   spacingMs?: number
+  /** Server retry_after is honored only up to this ceiling. Default 5000. */
+  maxRetryAfterMs?: number
+  /** Injectable classifier; defaults to `classifyDeliveryError` (off the SendErrorKind). */
+  classify?: DeliveryErrorClassifier
 }
 
 export function deliverQueueReduce<T>(
@@ -63,10 +100,12 @@ export function deliverQueueReduce<T>(
   const baseDelayMs = opts.baseDelayMs ?? 1000
   const maxQueue = opts.maxQueue ?? 32
   const spacingMs = opts.spacingMs ?? 1000
+  const maxRetryAfterMs = opts.maxRetryAfterMs ?? 5000
+  const classify = opts.classify ?? classifyDeliveryError
 
   if (input.kind === 'tick') return onTick(state, input.now)
   if (input.kind === 'enqueue') return onEnqueue(state, input, maxQueue)
-  return onAttemptResult(state, input, maxRetries, baseDelayMs, spacingMs)
+  return onAttemptResult(state, input, maxRetries, baseDelayMs, spacingMs, maxRetryAfterMs, classify)
 }
 
 function onEnqueue<T>(
@@ -89,10 +128,19 @@ function onEnqueue<T>(
 
 function onAttemptResult<T>(
   state: DeliverQueueState<T>,
-  input: { readonly key: string; readonly outcome: 'sent' | 'suppressed' | 'failed'; readonly error?: string; readonly now: number },
+  input: {
+    readonly key: string
+    readonly outcome: 'sent' | 'suppressed' | 'failed'
+    readonly error?: string
+    readonly errorKind?: SendErrorKind
+    readonly retryAfterMs?: number
+    readonly now: number
+  },
   maxRetries: number,
   baseDelayMs: number,
   spacingMs: number,
+  maxRetryAfterMs: number,
+  classify: DeliveryErrorClassifier,
 ): { state: DeliverQueueState<T>; effects: DeliverQueueEffect<T>[] } {
   // Stale result for an item that is no longer in flight: ignore (defensive).
   if (state.inFlight === null || input.key !== state.inFlight.key) {
@@ -103,12 +151,21 @@ function onAttemptResult<T>(
     return advanceToNext(state, input.now, spacingMs, [])
   }
 
+  // Terminal errors never retry (forbidden / not_found / bad_format / too_long).
+  if (classify({ errorKind: input.errorKind, error: input.error ?? 'delivery failed', retryAfterMs: input.retryAfterMs }) === 'fatal') {
+    const giveUpEffects: DeliverQueueEffect<T>[] = [
+      { kind: 'give-up', item: state.inFlight, error: input.error ?? 'delivery failed', errorKind: input.errorKind },
+    ]
+    return advanceToNext(state, input.now, spacingMs, giveUpEffects)
+  }
+
   // Failed attempt: retry with exponential backoff, or give up once retries are exhausted.
   const totalAllowed = maxRetries + 1
   if (state.attempts < totalAllowed) {
     const nextAttempts = state.attempts + 1
     const backoff = baseDelayMs * 2 ** (state.attempts - 1)
-    const at = input.now + backoff
+    const retryAfter = input.retryAfterMs !== undefined ? Math.min(input.retryAfterMs, maxRetryAfterMs) : backoff
+    const at = input.now + retryAfter
     return {
       state: { ...state, attempts: nextAttempts, retryAt: at },
       effects: [{ kind: 'retry-after', at, item: state.inFlight }],
@@ -116,7 +173,7 @@ function onAttemptResult<T>(
   }
 
   const giveUpEffects: DeliverQueueEffect<T>[] = [
-    { kind: 'give-up', item: state.inFlight, error: input.error ?? 'delivery failed' },
+    { kind: 'give-up', item: state.inFlight, error: input.error ?? 'delivery failed', errorKind: input.errorKind },
   ]
   return advanceToNext(state, input.now, spacingMs, giveUpEffects)
 }

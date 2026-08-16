@@ -1,3 +1,4 @@
+import type { SendErrorKind } from 'dsh-channel'
 import { decodeFrame, encodeFrame } from './proto.js'
 import { proxiedFetch } from 'dsh-channel-kit'
 
@@ -36,6 +37,30 @@ export class FeishuApiError extends Error {
     this.code = code
     this.msg = msg
   }
+}
+
+export interface ClassifiedSendError {
+  errorKind: SendErrorKind
+  retryAfterMs?: number
+}
+
+/**
+ * Feishu send-error classification. Codes kept conservative: unknown stays
+ * unknown (retryable). Known Feishu ranges are mapped from their open-api docs.
+ */
+export function classifyFeishuSendError(error: FeishuApiError): ClassifiedSendError {
+  const code = error.code
+  const msg = (error.msg ?? error.message).toLowerCase()
+  if (code === 99991672 || code === 230001) return { errorKind: 'too_long' }
+  if (code === 99991663 || code === 99991664 || code === 99991665 || code === 99991666) return { errorKind: 'forbidden' }
+  if (code === 99991668 || code === 99991669) return { errorKind: 'rate_limited' }
+  if (code === 99991670 || code === 99991671) return { errorKind: 'not_found' }
+  if (code !== undefined && code >= 100_000_000) return { errorKind: 'transient' }
+  if (msg.includes('too long') || msg.includes('text length') || msg.includes('exceeds')) return { errorKind: 'too_long' }
+  if (msg.includes('permission') || msg.includes('forbidden') || msg.includes('denied')) return { errorKind: 'forbidden' }
+  if (msg.includes('rate') || msg.includes('too many') || msg.includes('frequency')) return { errorKind: 'rate_limited' }
+  if (msg.includes('not found') || msg.includes('not exist')) return { errorKind: 'not_found' }
+  return { errorKind: 'unknown' }
 }
 
 export function domainBase(domain: FeishuDomain = 'feishu'): string {

@@ -1,21 +1,23 @@
 import { mkdir, rename, writeFile } from 'node:fs/promises'
 import { readFileSync, renameSync } from 'node:fs'
 import { dirname } from 'node:path'
+import type { SendErrorKind } from 'dsh-channel'
 import type { RecoverableDelivery } from '../../policy/recovery.js'
-import type { ChannelStore, DeliveryRecord } from '../store.js'
+import type { ChannelStore, DeliveryRecord, InboundOutcome } from '../store.js'
 
 const WRITE_DEBOUNCE_MS = 500
 
 interface JsonFileData {
   version: 1
   seenInbound: string[]
+  inboundOutcomes: Record<string, InboundOutcome>
   mergeBuffers: Record<string, string[]>
   bindings: Record<string, string>
   deliveries: Record<string, DeliveryRecord>
 }
 
 function emptyData(): JsonFileData {
-  return { version: 1, seenInbound: [], mergeBuffers: {}, bindings: {}, deliveries: {} }
+  return { version: 1, seenInbound: [], inboundOutcomes: {}, mergeBuffers: {}, bindings: {}, deliveries: {} }
 }
 
 function normalize(data: Partial<JsonFileData> | null | undefined): JsonFileData {
@@ -23,6 +25,7 @@ function normalize(data: Partial<JsonFileData> | null | undefined): JsonFileData
   return {
     version: 1,
     seenInbound: Array.isArray(data.seenInbound) ? data.seenInbound.filter((x): x is string => typeof x === 'string') : [],
+    inboundOutcomes: normalizeOutcomes(data.inboundOutcomes),
     mergeBuffers: normalizeStringArrayRecord(data.mergeBuffers),
     bindings: normalizeStringRecord(data.bindings),
     deliveries: normalizeDeliveries(data.deliveries),
@@ -47,6 +50,15 @@ function normalizeStringRecord(record: unknown): Record<string, string> {
   )
 }
 
+function normalizeOutcomes(record: unknown): Record<string, InboundOutcome> {
+  if (!record || typeof record !== 'object') return {}
+  const result: Record<string, InboundOutcome> = {}
+  for (const [key, value] of Object.entries(record as Record<string, unknown>)) {
+    if (value === 'handling' || value === 'done' || value === 'failed') result[key] = value
+  }
+  return result
+}
+
 function normalizeDeliveries(record: unknown): Record<string, DeliveryRecord> {
   if (!record || typeof record !== 'object') return {}
   const result: Record<string, DeliveryRecord> = {}
@@ -61,6 +73,7 @@ function normalizeDeliveries(record: unknown): Record<string, DeliveryRecord> {
       attempts: typeof item.attempts === 'number' ? item.attempts : 0,
       platformMessageIds: Array.isArray(item.platformMessageIds) ? [...item.platformMessageIds] : undefined,
       error: typeof item.error === 'string' ? item.error : undefined,
+      errorKind: item.errorKind,
       createdAt: typeof item.createdAt === 'number' ? item.createdAt : Date.now(),
       updatedAt: typeof item.updatedAt === 'number' ? item.updatedAt : Date.now(),
     }
@@ -77,9 +90,11 @@ export function createJsonFileStore(path: string): ChannelStore {
   const seenLimit = 1000
   const seenTrimTo = 500
   const maxAttempts = 3
+  const abandonMinAgeMs = 24 * 60 * 60 * 1000
 
   const seen = new Set<string>()
   const seenOrder: string[] = []
+  const inboundOutcomes = new Map<string, InboundOutcome>()
   const mergeBuffers = new Map<string, string[]>()
   const bindings = new Map<string, string>()
   const deliveries = new Map<string, DeliveryRecord>()
@@ -114,6 +129,7 @@ export function createJsonFileStore(path: string): ChannelStore {
         if (!seen.has(id)) {
           seen.add(id)
           seenOrder.push(id)
+          inboundOutcomes.set(id, data.inboundOutcomes[id] ?? 'done')
         }
       }
       trimSeen()
@@ -132,6 +148,7 @@ export function createJsonFileStore(path: string): ChannelStore {
   const snapshot = (): JsonFileData => ({
     version: 1,
     seenInbound: [...seenOrder],
+    inboundOutcomes: Object.fromEntries(inboundOutcomes),
     mergeBuffers: Object.fromEntries([...mergeBuffers.entries()].map(([k, v]) => [k, [...v]])),
     bindings: Object.fromEntries(bindings),
     deliveries: Object.fromEntries(
@@ -159,10 +176,20 @@ export function createJsonFileStore(path: string): ChannelStore {
     seenInbound(messageId: string) {
       return seen.has(messageId)
     },
-    markInbound(messageId: string) {
-      if (seen.has(messageId)) return
+    inboundOutcome(messageId: string) {
+      return seen.has(messageId) ? (inboundOutcomes.get(messageId) ?? 'done') : undefined
+    },
+    markInbound(messageId: string, outcome: InboundOutcome = 'done') {
+      if (messageId === '') return
+      if (seen.has(messageId)) {
+        const existing = inboundOutcomes.get(messageId) ?? 'done'
+        if (existing === 'handling' || outcome !== 'handling') inboundOutcomes.set(messageId, outcome)
+        scheduleWrite()
+        return
+      }
       seen.add(messageId)
       seenOrder.push(messageId)
+      inboundOutcomes.set(messageId, outcome)
       trimSeen()
       scheduleWrite()
     },
@@ -216,25 +243,28 @@ export function createJsonFileStore(path: string): ChannelStore {
       record.updatedAt = Date.now()
       scheduleWrite()
     },
-    markFailed(key: string, error: string) {
+    markFailed(key: string, error: string, errorKind?: SendErrorKind) {
       const record = deliveries.get(key)
       if (!record) return
       record.state = 'failed'
       record.error = error
+      if (errorKind !== undefined) record.errorKind = errorKind
       record.updatedAt = Date.now()
       scheduleWrite()
     },
-    sweepRecoverable(): RecoverableDelivery[] {
+    sweepRecoverable(opts: { now?: number; minAgeMs?: number } = {}): RecoverableDelivery[] {
+      const now = opts.now ?? Date.now()
+      const minAgeMs = opts.minAgeMs ?? abandonMinAgeMs
       const result: RecoverableDelivery[] = []
       for (const [key, record] of deliveries) {
         if (record.state === 'pending' || record.state === 'attempting' || record.state === 'failed') {
-          if (record.attempts >= maxAttempts) {
+          if (record.attempts >= maxAttempts && now - record.createdAt >= minAgeMs) {
             record.state = 'abandoned'
-            record.updatedAt = Date.now()
+            record.updatedAt = now
             scheduleWrite()
             continue
           }
-          result.push({ key, state: record.state, chatKey: record.chatKey })
+          result.push({ key, state: record.state, chatKey: record.chatKey, attempts: record.attempts, errorKind: record.errorKind })
         }
       }
       return result

@@ -70,3 +70,24 @@ test('quick turn never starts a draft (no tick before assistant-message)', () =>
   assert.ok(!fs.some((f) => f.kind === 'draft'))
   assert.deepEqual(fs.filter((f) => f.kind === 'final'), [{ kind: 'final', text: 'fast' }])
 })
+
+test('edit-failed flips to append-tail status lines and resets on final', () => {
+  let s = emptyStreamState
+  s = streamReduce(s, { kind: 'turn-start' }, progressCaps, 0).state
+  s = streamReduce(s, { kind: 'tool-call', callId: 'c', name: 'Bash', arguments: '{}' }, progressCaps, 0).state
+  s = streamReduce(s, { kind: 'tick' }, progressCaps, 2000).state
+  assert.equal(s.draftText, 'Working…\n🛠️ Bash')
+  assert.equal(s.editFailed, false)
+
+  const failed = streamReduce(s, { kind: 'edit-failed', visiblePrefix: 'Working…\n🛠️ Bash' }, progressCaps, 2100)
+  s = failed.state
+  assert.equal(s.editFailed, true)
+  assert.equal(s.visiblePrefix, 'Working…\n🛠️ Bash')
+
+  const tail = streamReduce(s, { kind: 'tool-result', callId: 'c', name: 'Bash', ok: true, durationMs: 400 }, progressCaps, 2200)
+  assert.deepEqual(tail.frames, [{ kind: 'status-line', text: '✅ Bash · 400ms' }])
+
+  const final = streamReduce(tail.state, { kind: 'assistant-message', text: 'done' }, progressCaps, 2300)
+  assert.deepEqual(final.frames, [{ kind: 'draft-finalize' }, { kind: 'final', text: 'done' }])
+  assert.equal(final.state.editFailed, false)
+})

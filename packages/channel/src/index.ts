@@ -122,11 +122,28 @@ export interface OutboundChoice {
   readonly label: string
 }
 
+/** Machine-readable outbound send error taxonomy (hermes base.py:2484-2520).
+ *  Provider clients classify platform error codes into one of these kinds. */
+export type SendErrorKind =
+  | 'too_long'
+  | 'bad_format'
+  | 'forbidden'
+  | 'not_found'
+  | 'rate_limited'
+  | 'transient'
+  | 'unknown'
+
 export interface DeliveryReceipt {
   readonly status: 'sent' | 'suppressed' | 'failed'
-  /** Platform-side message id (multiple when split) */
+  /** Platform-side message id (multiple when split). On a failed multi-part send this keeps the ids of parts that did make it. */
   readonly platformMessageIds?: readonly string[]
   readonly error?: string
+  /** Machine-readable error kind, populated by provider clients from platform error codes. */
+  readonly errorKind?: SendErrorKind
+  /** Platform retry-after hint (ms); providers should honor it only up to the deliver-queue ceiling. */
+  readonly retryAfterMs?: number
+  /** 1-based index of the part that failed in a multi-part send, when known. */
+  readonly failedAtChunk?: number
 }
 
 /** Presentation intent: final message / new draft / edit existing draft / status line. */
@@ -423,8 +440,9 @@ export class ChannelRegistry extends Service {
         const label = out.accountId && out.accountId !== 'default' ? `${out.channel}:${out.accountId}` : out.channel
         return { status: 'failed', error: `no channel "${label}"` }
       }
+      const platformMessageIds: string[] = []
+      let part = 1
       try {
-        const platformMessageIds: string[] = []
         // text (empty text is not sent out; when media-only, don't send an empty bubble).
         if (out.markdown !== '') {
           const result = await channel.send(out.chatKey, out.markdown, {
@@ -444,10 +462,20 @@ export class ChannelRegistry extends Service {
             const result = await channel.send(out.chatKey, mediaUnsupportedText(media.kind))
             platformMessageIds.push(result.platformMessageId)
           }
+          part += 1
         }
         return { status: 'sent', platformMessageIds }
       } catch (error) {
-        return { status: 'failed', error: error instanceof Error ? error.message : String(error) }
+        const classified = error as Error & { errorKind?: SendErrorKind; retryAfterMs?: number }
+        // A failed multi-part send keeps the ids of parts that made it, so the ledger can retry only the remainder.
+        return {
+          status: 'failed',
+          error: error instanceof Error ? error.message : String(error),
+          ...(classified.errorKind !== undefined ? { errorKind: classified.errorKind } : {}),
+          ...(classified.retryAfterMs !== undefined ? { retryAfterMs: classified.retryAfterMs } : {}),
+          ...(platformMessageIds.length > 0 ? { platformMessageIds } : {}),
+          ...(part !== undefined && platformMessageIds.length > 0 ? { failedAtChunk: platformMessageIds.length + 1 } : {}),
+        }
       }
     })
   }

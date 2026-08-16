@@ -1,5 +1,5 @@
 import { Channel, type ChatType, type OutboundChoice } from 'dsh-channel'
-import type { WeixinClient } from './client.js'
+import { classifyWeChatSendError, WeixinApiError, type WeixinClient } from './client.js'
 
 export interface WeChatChannelOptions {
   /** Resolve the token on every send; caching across operations is forbidden. */
@@ -66,8 +66,12 @@ export class WeChatChannel extends Channel {
     const token = await this.opts.resolveToken()
     if (!token) throw new Error('WECHAT_TOKEN is not configured')
 
-    const sent = await this.opts.client.sendMessage(token, chatKey, text, { signal: _opts?.signal })
-    return { platformMessageId: sent.client_id ?? sent.message_id ?? '' }
+    try {
+      const sent = await this.opts.client.sendMessage(token, chatKey, text, { signal: _opts?.signal })
+      return { platformMessageId: sent.client_id ?? sent.message_id ?? '' }
+    } catch (error) {
+      throw classifySendError(error)
+    }
   }
 
   async sendTyping(chatKey: string): Promise<void> {
@@ -81,4 +85,14 @@ export class WeChatChannel extends Channel {
       // typing is a decorative action; its failure does not affect the main flow.
     }
   }
+}
+
+function classifySendError(error: unknown): unknown {
+  if (error instanceof WeixinApiError) {
+    const classified = classifyWeChatSendError(error)
+    const tagged = error as WeixinApiError & { errorKind?: string; retryAfterMs?: number }
+    tagged.errorKind = classified.errorKind
+    if (classified.retryAfterMs !== undefined) tagged.retryAfterMs = classified.retryAfterMs
+  }
+  return error
 }

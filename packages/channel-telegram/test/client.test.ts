@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { TelegramApiError, TelegramClient } from '../src/client.ts'
+import { classifyTelegramSendError, TelegramApiError, TelegramClient } from '../src/client.ts'
 import { TelegramChannel } from '../src/channel.ts'
 
 test('TelegramClient calls getUpdates with expected body', async () => {
@@ -228,4 +228,12 @@ test('TelegramChannel.sendMedia sends image via readImage and document via readF
   assert.equal(doc.platformMessageId, '2')
   assert.equal(sends[1]!.kind, 'document')
   assert.deepEqual(sends[1]!.bytes, [4, 5, 6])
+})
+
+test('classifyTelegramSendError maps flood control and forbidden to the taxonomy', () => {
+  assert.equal(classifyTelegramSendError(new TelegramApiError('retry after 7', 'too many requests', 429)).errorKind, 'rate_limited')
+  assert.equal(classifyTelegramSendError(new TelegramApiError('blocked', 'bot was blocked by the user', 403)).errorKind, 'forbidden')
+  assert.equal(classifyTelegramSendError(new TelegramApiError('missing', 'chat not found', 400)).errorKind, 'not_found')
+  assert.equal(classifyTelegramSendError(new TelegramApiError('long', 'message is too long', 400)).errorKind, 'too_long')
+  assert.equal(classifyTelegramSendError(new TelegramApiError('parse', "can't parse entities", 400)).errorKind, 'bad_format')
 })
