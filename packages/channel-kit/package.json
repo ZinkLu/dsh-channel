@@ -1,7 +1,7 @@
 {
   "name": "dsh-channel-kit",
   "version": "0.1.0-rc.0",
-  "description": "Pure-function toolkit for DSH channel providers: chunk, merge, router, approval-render, store, format, and platform prompt hints.",
+  "description": "Shared toolkit for DSH channel providers: pure presentation/formatting utilities, the policy seams (presentation + recovery), and the ChannelBridge handler base.",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -26,7 +26,33 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {},
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-agent": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-attachment": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-llm": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-session": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-system-prompt": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-user-approval": "^0.1.0-rc.6",
+    "dsh-channel": "0.1.0-rc.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-system-prompt": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-user-approval": {
+      "optional": true
+    }
+  },
   "devDependencies": {
-    "@types/node": "^24.0.0"
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-agent": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-attachment": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-llm": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-session": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-system-prompt": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-user-approval": "^0.1.0-rc.6",
+    "@types/node": "^24.0.0",
+    "dsh-channel": "0.1.0-rc.0"
   }
 }

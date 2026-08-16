@@ -7,7 +7,7 @@ import {
   type DeliverQueueOptions,
   type DeliverQueueState,
   type QueuedDelivery,
-} from '../src/deliver-queue.ts'
+} from '../src/policy/deliver-queue.ts'
 
 interface P { chatKey: string; markdown: string }
 

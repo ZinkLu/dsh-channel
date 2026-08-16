@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { emptyMergeState, mergeReduce } from '../src/merge.ts'
+import { emptyMergeState, mergeReduce } from '../src/policy/merge.ts'
 
 test('normal messages merge and flush on tick after deadline', () => {
   let state = emptyMergeState

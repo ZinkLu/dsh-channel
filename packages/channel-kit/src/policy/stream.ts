@@ -8,13 +8,14 @@
  * fires, so quick answers produce zero noise. block (text-chunk editing) v1 degrades to
  * terminal-state delivery.
  */
+import { renderThinking, type ThinkingLevel } from './thinking.js'
 import { formatToolLine, formatToolResultLine, resolveToolDisplay } from './tool-display.js'
 
 export interface StreamCaps {
   streamingMode: 'off' | 'block' | 'progress'
   supportsEdit: boolean
   supportsStatusText: boolean
-  supportsThinking: boolean
+  thinkingLevel: ThinkingLevel
 }
 
 export type StreamInput =
@@ -48,6 +49,7 @@ export type StreamFrame =
   | { readonly kind: 'final'; readonly text: string }
   | { readonly kind: 'draft'; readonly text: string }
   | { readonly kind: 'draft-finalize' }
+  | { readonly kind: 'status-line'; readonly text: string }
   | { readonly kind: 'arm-timer'; readonly at: number }
 
 const PROGRESS_GATE_MS = 1500
@@ -56,7 +58,7 @@ const DRAFT_HEADER = 'Working…'
 export function streamReduce(state: StreamState, input: StreamInput, caps: StreamCaps, now: number): { state: StreamState; frames: StreamFrame[] } {
   const mode = resolveMode(caps)
   if (mode === 'off') return reduceOff(state, input)
-  return reduceProgress(state, input, now)
+  return reduceProgress(state, input, caps, now)
 }
 
 function resolveMode(caps: StreamCaps): 'off' | 'progress' {
@@ -73,7 +75,7 @@ function reduceOff(state: StreamState, input: StreamInput): { state: StreamState
   return { state, frames: [{ kind: 'noop' }] }
 }
 
-function reduceProgress(state: StreamState, input: StreamInput, now: number): { state: StreamState; frames: StreamFrame[] } {
+function reduceProgress(state: StreamState, input: StreamInput, caps: StreamCaps, now: number): { state: StreamState; frames: StreamFrame[] } {
   switch (input.kind) {
     case 'turn-start':
       return { state: { bufferedText: '', toolLines: [], draftStarted: false, gateDeadline: undefined }, frames: [{ kind: 'noop' }] }
@@ -122,7 +124,11 @@ function reduceProgress(state: StreamState, input: StreamInput, now: number): { 
     case 'text-delta':
       return { state: { ...state, bufferedText: state.bufferedText + input.text }, frames: [{ kind: 'noop' }] }
 
-    case 'reasoning-delta':
+    case 'reasoning-delta': {
+      const line = renderThinking({ kind: 'delta', text: input.text }, caps.thinkingLevel)
+      return line === null ? { state, frames: [{ kind: 'noop' }] } : { state, frames: [{ kind: 'status-line', text: line }] }
+    }
+
     case 'step-start':
     case 'step-end':
       return { state, frames: [{ kind: 'noop' }] }

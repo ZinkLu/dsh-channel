@@ -1,4 +1,4 @@
-export type DeliveryState = 'pending' | 'attempting' | 'delivered' | 'failed' | 'abandoned'
+import type { DeliveryState, RecoverableDelivery } from '../policy/recovery.js'
 
 export interface DeliveryRecord {
   state: DeliveryState
@@ -9,12 +9,6 @@ export interface DeliveryRecord {
   error?: string
   createdAt: number
   updatedAt: number
-}
-
-export interface RecoverableDelivery {
-  key: string
-  state: 'pending' | 'attempting' | 'failed'
-  chatKey: string
 }
 
 export interface ChannelStore {

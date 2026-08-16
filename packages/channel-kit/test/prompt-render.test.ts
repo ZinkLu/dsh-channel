@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { parsePromptReply, renderPrompt, type PendingPrompt } from '../src/prompt-render.ts'
+import { parsePromptReply, renderPrompt, type PendingPrompt } from '../src/policy/prompt-render.ts'
 
 const caps = { supportsChoices: true, supportsMultiSelect: false }
 

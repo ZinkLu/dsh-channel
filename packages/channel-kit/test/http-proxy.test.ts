@@ -3,7 +3,7 @@ import { createServer as createHttpServer, request as httpRequest } from 'node:h
 import { createServer as createHttpsServer } from 'node:https'
 import { connect as netConnect } from 'node:net'
 import { test } from 'node:test'
-import { proxiedFetch } from '../src/http-proxy.ts'
+import { proxiedFetch } from '../src/format/http-proxy.ts'
 
 // Self-signed cert for localhost (long-lived; generated for the proxy test only).
 const TEST_KEY = `-----BEGIN PRIVATE KEY-----

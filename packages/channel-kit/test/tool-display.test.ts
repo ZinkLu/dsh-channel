@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { formatToolLine, formatToolResultLine, resolveToolDisplay } from '../src/tool-display.ts'
+import { formatToolLine, formatToolResultLine, resolveToolDisplay } from '../src/policy/tool-display.ts'
 
 test('resolveToolDisplay maps known tools to emoji+label', () => {
   assert.deepEqual(resolveToolDisplay('Bash', '{"command":"npm test"}'), { emoji: '🛠️', label: 'Bash', detail: 'npm test' })

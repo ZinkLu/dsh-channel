@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { route } from '../src/router.ts'
+import { route } from '../src/policy/router.ts'
 
 const ctx = {
   channel: 'telegram',

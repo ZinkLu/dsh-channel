@@ -219,9 +219,13 @@ export abstract class Channel {
   get supportsStatusText(): boolean {
     return false
   }
-  /** Whether to hand reasoning/thinking content down to the channel; default false (don't leak the chain of thought). */
+  /** Thinking presentation level. 'off' = never hand thinking down (default); 'on' = fold the final block into a status line; 'stream' = status line per delta. */
+  get thinkingLevel(): 'off' | 'on' | 'stream' {
+    return 'off'
+  }
+  /** @deprecated use `thinkingLevel !== 'off'` */
   get supportsThinking(): boolean {
-    return false
+    return this.thinkingLevel !== 'off'
   }
   /** Presentation limits (button count/button text/callback data). */
   get presentationLimits(): PresentationLimits {

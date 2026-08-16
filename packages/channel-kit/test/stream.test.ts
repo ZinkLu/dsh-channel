@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { emptyStreamState, streamReduce, type StreamCaps, type StreamFrame } from '../src/stream.ts'
+import { emptyStreamState, streamReduce, type StreamCaps, type StreamFrame } from '../src/policy/stream.ts'
 
-const progressCaps: StreamCaps = { streamingMode: 'progress', supportsEdit: true, supportsStatusText: false, supportsThinking: false }
-const offCaps: StreamCaps = { streamingMode: 'off', supportsEdit: true, supportsStatusText: false, supportsThinking: false }
+const progressCaps: StreamCaps = { streamingMode: 'progress', supportsEdit: true, supportsStatusText: false, thinkingLevel: 'off' }
+const offCaps: StreamCaps = { streamingMode: 'off', supportsEdit: true, supportsStatusText: false, thinkingLevel: 'off' }
 
 function frames(state = emptyStreamState, caps = progressCaps, ...inputs: Array<{ kind: string } & Record<string, unknown>>): StreamFrame[] {
   let s = state

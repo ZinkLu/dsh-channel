@@ -1,7 +1,8 @@
 import { mkdir, rename, writeFile } from 'node:fs/promises'
 import { readFileSync, renameSync } from 'node:fs'
 import { dirname } from 'node:path'
-import type { ChannelStore, DeliveryRecord, RecoverableDelivery } from '../store.js'
+import type { RecoverableDelivery } from '../../policy/recovery.js'
+import type { ChannelStore, DeliveryRecord } from '../store.js'
 
 const WRITE_DEBOUNCE_MS = 500
 

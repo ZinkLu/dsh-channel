@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { parseApprovalReply, renderApproval } from '../src/approval-render.ts'
+import { parseApprovalReply, renderApproval } from '../src/policy/approval-render.ts'
 
 const pending = [
   { num: 1, requestId: 'r1', toolName: 'Bash', expiresAt: Date.now() + 60_000 },

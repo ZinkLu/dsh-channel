@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { assertMediaWithinLimit, DEFAULT_MAX_INBOUND_MEDIA_BYTES } from '../src/media-limit.ts'
+import { assertMediaWithinLimit, DEFAULT_MAX_INBOUND_MEDIA_BYTES } from '../src/format/media-limit.ts'
 
 test('DEFAULT_MAX_INBOUND_MEDIA_BYTES is 20 MiB', () => {
   assert.equal(DEFAULT_MAX_INBOUND_MEDIA_BYTES, 20 * 1024 * 1024)

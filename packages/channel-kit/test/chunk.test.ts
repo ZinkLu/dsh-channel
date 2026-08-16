@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { chunkText, splitMarkdownBlocks } from '../src/chunk.ts'
+import { chunkText, splitMarkdownBlocks } from '../src/format/chunk.ts'
 
 test('splitMarkdownBlocks keeps fenced code atomic', () => {
   const md = 'hello\n\n```js\nconst a = 1\nconst b = 2\n```\n\nworld'

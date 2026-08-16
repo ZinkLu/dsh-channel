@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { renderForTier, stripReasoningTags, stripToolCallMarkup } from '../src/format.ts'
+import { renderForTier, stripReasoningTags, stripToolCallMarkup } from '../src/format/format.ts'
 
 test('markdown tier returns source unchanged', () => {
   const md = '**bold** `code` [t](u)'
