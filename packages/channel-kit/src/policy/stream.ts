@@ -46,7 +46,6 @@ export type StreamInput =
   | { readonly kind: 'edit-failed'; readonly visiblePrefix?: string }
 
 export interface StreamState {
-  readonly bufferedText: string
   readonly toolLines: readonly string[]
   readonly draftStarted: boolean
   readonly gateDeadline: number | undefined
@@ -61,7 +60,6 @@ export interface StreamState {
 }
 
 export const emptyStreamState: StreamState = {
-  bufferedText: '',
   toolLines: [],
   draftStarted: false,
   gateDeadline: undefined,
@@ -75,7 +73,8 @@ export type StreamFrame =
   | { readonly kind: 'noop' }
   | { readonly kind: 'final'; readonly text: string }
   | { readonly kind: 'draft'; readonly text: string }
-  | { readonly kind: 'draft-finalize' }
+  /** The draft is done; `editFailed` tells the bridge whether the preview may still hold text the user saw. */
+  | { readonly kind: 'draft-finalize'; readonly editFailed: boolean }
   | { readonly kind: 'status-line'; readonly text: string }
   | { readonly kind: 'arm-timer'; readonly at: number }
 
@@ -110,22 +109,9 @@ function resolveMode(caps: StreamCaps): 'off' | 'progress' {
 
 function reduceOff(state: StreamState, input: StreamInput): { state: StreamState; frames: StreamFrame[] } {
   if (input.kind === 'assistant-message') {
-    return { state: resetStreamState(), frames: [{ kind: 'final', text: input.text }] }
+    return { state: emptyStreamState, frames: [{ kind: 'final', text: input.text }] }
   }
   return { state, frames: [{ kind: 'noop' }] }
-}
-
-function resetStreamState(): StreamState {
-  return {
-    bufferedText: '',
-    toolLines: [],
-    draftStarted: false,
-    gateDeadline: undefined,
-    thinkingShown: false,
-    draftText: '',
-    visiblePrefix: '',
-    editFailed: false,
-  }
 }
 
 function reduceProgress(
@@ -137,7 +123,7 @@ function reduceProgress(
 ): { state: StreamState; frames: StreamFrame[] } {
   switch (input.kind) {
     case 'turn-start':
-      return { state: resetStreamState(), frames: [{ kind: 'noop' }] }
+      return { state: emptyStreamState, frames: [{ kind: 'noop' }] }
 
     case 'edit-failed': {
       // Record the visible prefix (bridge supplies it; fall back to the last draft
@@ -176,15 +162,15 @@ function reduceProgress(
 
     case 'assistant-message': {
       const frames: StreamFrame[] = []
-      if (state.draftStarted) frames.push({ kind: 'draft-finalize' })
+      if (state.draftStarted) frames.push({ kind: 'draft-finalize', editFailed: state.editFailed })
       frames.push({ kind: 'final', text: input.text })
-      return { state: resetStreamState(), frames }
+      return { state: emptyStreamState, frames }
     }
 
-    case 'turn-end': {
-      const next = resetStreamState()
-      return state.draftStarted ? { state: next, frames: [{ kind: 'draft-finalize' }] } : { state: next, frames: [{ kind: 'noop' }] }
-    }
+    case 'turn-end':
+      return state.draftStarted
+        ? { state: emptyStreamState, frames: [{ kind: 'draft-finalize', editFailed: state.editFailed }] }
+        : { state: emptyStreamState, frames: [{ kind: 'noop' }] }
 
     case 'tick': {
       if (state.gateDeadline === undefined) return { state, frames: [{ kind: 'noop' }] }
@@ -204,9 +190,6 @@ function reduceProgress(
       return { state, frames: [{ kind: 'arm-timer', at: state.gateDeadline }] }
     }
 
-    case 'text-delta':
-      return { state: { ...state, bufferedText: state.bufferedText + input.text }, frames: [{ kind: 'noop' }] }
-
     case 'reasoning-delta':
     case 'reasoning-block': {
       // Coalesce: only one thinking status line per turn (a 'stream' tier would otherwise spam identical bubbles).
@@ -216,6 +199,8 @@ function reduceProgress(
       return { state: { ...state, thinkingShown: true }, frames: [{ kind: 'status-line', text: line }] }
     }
 
+    // Token-level text deltas are not presented in v1 (block streaming is v2).
+    case 'text-delta':
     case 'step-start':
     case 'step-end':
       return { state, frames: [{ kind: 'noop' }] }

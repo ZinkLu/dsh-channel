@@ -89,12 +89,12 @@ export const defaultRecoveryPolicy: RecoveryPolicy = {
   },
 }
 
-/** Parse a `${sessionId}:${seq}` delivery key back into its parts. */
 /** Terminal send errors are never retried by the recovery policy (hermes taxonomy day-one rule). */
 export function isFatalSendError(errorKind: SendErrorKind | undefined): boolean {
   return errorKind === 'too_long' || errorKind === 'bad_format' || errorKind === 'forbidden' || errorKind === 'not_found'
 }
 
+/** Parse a `${sessionId}:${seq}` delivery key back into its parts. */
 export function splitDeliveryKey(key: string): { sessionId?: string; seq?: number } {
   const sep = key.lastIndexOf(':')
   if (sep <= 0) return {}

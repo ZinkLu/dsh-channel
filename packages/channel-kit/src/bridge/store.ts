@@ -52,6 +52,24 @@ export interface MemoryStoreOptions {
   maxAttempts?: number
   /** minimum age before an over-attempt entry is abandoned; default 24h */
   abandonMinAgeMs?: number
+  /** how long a settled (delivered/abandoned) ledger entry is retained; default 24h */
+  deliveryRetentionMs?: number
+}
+
+/** A ledger entry in a terminal state older than the retention window is dropped (the ledger is a handoff log, not an archive). */
+export function pruneSettledDeliveries(
+  deliveries: Map<string, DeliveryRecord>,
+  now: number,
+  retentionMs: number,
+): boolean {
+  let pruned = false
+  for (const [key, record] of deliveries) {
+    if (record.state !== 'delivered' && record.state !== 'abandoned') continue
+    if (now - record.updatedAt < retentionMs) continue
+    deliveries.delete(key)
+    pruned = true
+  }
+  return pruned
 }
 
 /** In-memory implementation for unit tests and non-persistent scenarios. Pure data operations + explicit flush. */
@@ -61,43 +79,38 @@ export function createMemoryStore(opts: MemoryStoreOptions = {}): ChannelStore {
   const seenTtlMs = opts.seenTtlMs ?? 24 * 60 * 60 * 1000
   const maxAttempts = opts.maxAttempts ?? 3
   const abandonMinAgeMs = opts.abandonMinAgeMs ?? 24 * 60 * 60 * 1000
+  const deliveryRetentionMs = opts.deliveryRetentionMs ?? 24 * 60 * 60 * 1000
 
   const seen = new Map<string, { outcome: InboundOutcome; expiresAt: number }>()
   const mergeBuffers = new Map<string, string[]>()
   const bindings = new Map<string, string>()
   const deliveries = new Map<string, DeliveryRecord>()
 
+  /** Amortized prune: TTL sweep, then trim the oldest entries back to `seenTrimTo`. */
   const pruneSeen = (now: number) => {
     for (const [id, entry] of seen) {
       if (entry.expiresAt <= now) seen.delete(id)
     }
-    while (seen.size > seenLimit) {
-      const oldest = seen.keys().next().value
-      if (oldest === undefined) break
-      seen.delete(oldest)
-      if (seen.size <= seenTrimTo) break
+    if (seen.size <= seenLimit) return
+    for (const id of [...seen.keys()].slice(0, seen.size - seenTrimTo)) seen.delete(id)
+  }
+
+  /** Live outcome, or undefined when unseen/expired (the one place the TTL is enforced on read). */
+  const liveOutcome = (messageId: string): InboundOutcome | undefined => {
+    const entry = seen.get(messageId)
+    if (!entry) return undefined
+    if (entry.expiresAt <= Date.now()) {
+      seen.delete(messageId)
+      return undefined
     }
+    return entry.outcome
   }
 
   return {
     seenInbound(messageId: string) {
-      const entry = seen.get(messageId)
-      if (!entry) return false
-      if (entry.expiresAt <= Date.now()) {
-        seen.delete(messageId)
-        return false
-      }
-      return true
+      return liveOutcome(messageId) !== undefined
     },
-    inboundOutcome(messageId: string) {
-      const entry = seen.get(messageId)
-      if (!entry) return undefined
-      if (entry.expiresAt <= Date.now()) {
-        seen.delete(messageId)
-        return undefined
-      }
-      return entry.outcome
-    },
+    inboundOutcome: liveOutcome,
     markInbound(messageId: string, outcome: InboundOutcome = 'done') {
       if (messageId === '') return
       const now = Date.now()
@@ -169,6 +182,7 @@ export function createMemoryStore(opts: MemoryStoreOptions = {}): ChannelStore {
     sweepRecoverable(opts: { now?: number; minAgeMs?: number } = {}) {
       const now = opts.now ?? Date.now()
       const minAgeMs = opts.minAgeMs ?? abandonMinAgeMs
+      pruneSettledDeliveries(deliveries, now, deliveryRetentionMs)
       const result: RecoverableDelivery[] = []
       for (const [key, record] of deliveries) {
         if (record.state === 'pending' || record.state === 'attempting' || record.state === 'failed') {

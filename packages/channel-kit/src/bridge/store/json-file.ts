@@ -3,7 +3,7 @@ import { readFileSync, renameSync } from 'node:fs'
 import { dirname } from 'node:path'
 import type { SendErrorKind } from 'dsh-channel'
 import type { RecoverableDelivery } from '../../policy/recovery.js'
-import type { ChannelStore, DeliveryRecord, InboundOutcome } from '../store.js'
+import { pruneSettledDeliveries, type ChannelStore, type DeliveryRecord, type InboundOutcome } from '../store.js'
 
 const WRITE_DEBOUNCE_MS = 500
 
@@ -91,10 +91,10 @@ export function createJsonFileStore(path: string): ChannelStore {
   const seenTrimTo = 500
   const maxAttempts = 3
   const abandonMinAgeMs = 24 * 60 * 60 * 1000
+  const deliveryRetentionMs = 24 * 60 * 60 * 1000
 
-  const seen = new Set<string>()
-  const seenOrder: string[] = []
-  const inboundOutcomes = new Map<string, InboundOutcome>()
+  /** messageId → outcome. A Map is insertion-ordered, so it is also the LRU trim order. */
+  const seen = new Map<string, InboundOutcome>()
   const mergeBuffers = new Map<string, string[]>()
   const bindings = new Map<string, string>()
   const deliveries = new Map<string, DeliveryRecord>()
@@ -104,10 +104,8 @@ export function createJsonFileStore(path: string): ChannelStore {
   let dirty = false
 
   const trimSeen = () => {
-    while (seenOrder.length > seenLimit) {
-      const removed = seenOrder.splice(0, seenOrder.length - seenTrimTo)
-      for (const id of removed) seen.delete(id)
-    }
+    if (seen.size <= seenLimit) return
+    for (const id of [...seen.keys()].slice(0, seen.size - seenTrimTo)) seen.delete(id)
   }
 
   const scheduleWrite = () => {
@@ -126,11 +124,7 @@ export function createJsonFileStore(path: string): ChannelStore {
       const raw = readFileSync(path, 'utf8')
       const data = normalize(JSON.parse(raw))
       for (const id of data.seenInbound) {
-        if (!seen.has(id)) {
-          seen.add(id)
-          seenOrder.push(id)
-          inboundOutcomes.set(id, data.inboundOutcomes[id] ?? 'done')
-        }
+        if (!seen.has(id)) seen.set(id, data.inboundOutcomes[id] ?? 'done')
       }
       trimSeen()
       for (const [k, v] of Object.entries(data.mergeBuffers)) mergeBuffers.set(k, [...v])
@@ -147,8 +141,8 @@ export function createJsonFileStore(path: string): ChannelStore {
 
   const snapshot = (): JsonFileData => ({
     version: 1,
-    seenInbound: [...seenOrder],
-    inboundOutcomes: Object.fromEntries(inboundOutcomes),
+    seenInbound: [...seen.keys()],
+    inboundOutcomes: Object.fromEntries(seen),
     mergeBuffers: Object.fromEntries([...mergeBuffers.entries()].map(([k, v]) => [k, [...v]])),
     bindings: Object.fromEntries(bindings),
     deliveries: Object.fromEntries(
@@ -177,19 +171,15 @@ export function createJsonFileStore(path: string): ChannelStore {
       return seen.has(messageId)
     },
     inboundOutcome(messageId: string) {
-      return seen.has(messageId) ? (inboundOutcomes.get(messageId) ?? 'done') : undefined
+      return seen.get(messageId)
     },
     markInbound(messageId: string, outcome: InboundOutcome = 'done') {
       if (messageId === '') return
-      if (seen.has(messageId)) {
-        const existing = inboundOutcomes.get(messageId) ?? 'done'
-        if (existing === 'handling' || outcome !== 'handling') inboundOutcomes.set(messageId, outcome)
-        scheduleWrite()
-        return
+      const existing = seen.get(messageId)
+      // Upgrade handling→done/failed; never downgrade a terminal outcome.
+      if (existing === undefined || existing === 'handling' || outcome !== 'handling') {
+        seen.set(messageId, outcome)
       }
-      seen.add(messageId)
-      seenOrder.push(messageId)
-      inboundOutcomes.set(messageId, outcome)
       trimSeen()
       scheduleWrite()
     },
@@ -255,6 +245,7 @@ export function createJsonFileStore(path: string): ChannelStore {
     sweepRecoverable(opts: { now?: number; minAgeMs?: number } = {}): RecoverableDelivery[] {
       const now = opts.now ?? Date.now()
       const minAgeMs = opts.minAgeMs ?? abandonMinAgeMs
+      if (pruneSettledDeliveries(deliveries, now, deliveryRetentionMs)) scheduleWrite()
       const result: RecoverableDelivery[] = []
       for (const [key, record] of deliveries) {
         if (record.state === 'pending' || record.state === 'attempting' || record.state === 'failed') {

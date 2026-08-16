@@ -441,7 +441,6 @@ export class ChannelRegistry extends Service {
         return { status: 'failed', error: `no channel "${label}"` }
       }
       const platformMessageIds: string[] = []
-      let part = 1
       try {
         // text (empty text is not sent out; when media-only, don't send an empty bubble).
         if (out.markdown !== '') {
@@ -462,7 +461,6 @@ export class ChannelRegistry extends Service {
             const result = await channel.send(out.chatKey, mediaUnsupportedText(media.kind))
             platformMessageIds.push(result.platformMessageId)
           }
-          part += 1
         }
         return { status: 'sent', platformMessageIds }
       } catch (error) {
@@ -474,7 +472,7 @@ export class ChannelRegistry extends Service {
           ...(classified.errorKind !== undefined ? { errorKind: classified.errorKind } : {}),
           ...(classified.retryAfterMs !== undefined ? { retryAfterMs: classified.retryAfterMs } : {}),
           ...(platformMessageIds.length > 0 ? { platformMessageIds } : {}),
-          ...(part !== undefined && platformMessageIds.length > 0 ? { failedAtChunk: platformMessageIds.length + 1 } : {}),
+          failedAtChunk: platformMessageIds.length + 1,
         }
       }
     })

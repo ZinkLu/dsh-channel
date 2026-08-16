@@ -45,7 +45,7 @@ export function outboundEchoReduce(
 ): OutboundEchoResult {
   const ttlMs = opts.ttlMs ?? 30_000
   const maxEntries = opts.maxEntries ?? 1000
-  const now = input.kind === 'tick' ? input.now : input.now
+  const now = input.now
   const prunedEntries = state.entries.filter((entry) => entry.expiresAt > now)
 
   if (input.kind === 'sent') {

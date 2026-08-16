@@ -54,16 +54,10 @@ export function mergeReduce(state: MergeState, input: MergeInput, opts: MergeOpt
 
   const deadlineFor = (firstAt: number, now: number) => Math.min(now + windowMs, firstAt + windowMs * maxWindowMultiplier)
 
-  // Commands never enter the buffer; they bypass immediately (stop/approval must not be delayed by debouncing).
-  if (isCommand) {
-    const texts = state.buffer.map((entry) => entry.join(''))
-    if (texts.length > 0) effects.push({ kind: 'flush', texts })
-    if (text.trim() !== '') effects.push({ kind: 'flush', texts: [text] })
-    return { state: emptyMergeState, effects }
-  }
-
-  // Messages with media immediately flush the current buffer and are delivered separately (attachments are not merged into the text batch).
-  if (hasMedia) {
+  // Two of openclaw's three iron rules share one shape: commands must not be
+  // delayed by debouncing, and a media message must not be merged into the text
+  // batch. Both flush what is buffered and then bypass with their own text.
+  if (isCommand || hasMedia) {
     const texts = state.buffer.map((entry) => entry.join(''))
     if (texts.length > 0) effects.push({ kind: 'flush', texts })
     if (text.trim() !== '') effects.push({ kind: 'flush', texts: [text] })

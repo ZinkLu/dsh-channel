@@ -84,12 +84,11 @@ export function parseApprovalReply(
     return { kind: 'not-an-answer' }
   }
 
-  // `1`/`2` or `#1` also flow through the numbered branch above; here we handle bare digits.
-  if (/^[01]$/.test(text) || text === '1' || text === '2') {
-    if (active.length === 1) {
-      return { kind: 'answer', num: active[0]!.num, outcome: text === '1' ? 'allowed-once' : 'rejected' }
-    }
-    return { kind: 'not-an-answer' }
+  // Bare digits, per the rendered text hint ("Reply 1 to approve / 2 to reject");
+  // `0` is accepted as a reject alias for the button encoding. Only valid when
+  // there is exactly one pending item.
+  if (/^[012]$/.test(text) && active.length === 1) {
+    return { kind: 'answer', num: active[0]!.num, outcome: text === '1' ? 'allowed-once' : 'rejected' }
   }
 
   return { kind: 'not-an-answer' }

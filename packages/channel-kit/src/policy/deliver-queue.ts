@@ -114,9 +114,11 @@ function onEnqueue<T>(
   maxQueue: number,
 ): { state: DeliverQueueState<T>; effects: DeliverQueueEffect<T>[] } {
   if (state.inFlight === null) {
-    // Idle worker: start immediately (first attempt).
+    // Idle worker: start immediately (first attempt). `waiting` is empty by the
+    // reducer's own invariant (advanceToNext only idles once it drains), but it
+    // is carried through rather than dropped.
     return {
-      state: { inFlight: input.item, attempts: 1, retryAt: undefined, waiting: [] },
+      state: { ...state, inFlight: input.item, attempts: 1, retryAt: undefined },
       effects: [{ kind: 'attempt', item: input.item }],
     }
   }
