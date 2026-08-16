@@ -58,9 +58,7 @@ export function splitMarkdownBlocks(markdown: string): string[] {
     const trimmed = line.trim()
     if (trimmed.startsWith('```')) {
       pushCurrent()
-      const fence = line
-      const fenceLine = line
-      const block: string[] = [fenceLine]
+      const block: string[] = [line]
       i++
       let closed = false
       while (i < lines.length) {
@@ -140,7 +138,6 @@ function hardSplitCodeBlock(text: string, maxChars: number, countBy: 'codepoint'
   const lines = text.split('\n')
   const open = lines[0]!
   const close = lines[lines.length - 1]!
-  const info = open.slice(3).trim()
   const inner = lines.slice(1, -1)
   const openLen = charLen(open, countBy)
   const closeLen = charLen(close, countBy)
@@ -183,15 +180,15 @@ function hardSplitText(text: string, maxChars: number, countBy: 'codepoint' | 'u
   let rest = text
   while (charLen(rest, countBy) > maxChars) {
     let splitAt = -1
-    // Preferred break points: newline / Chinese full stop / English period + space
-    for (let i = maxChars; i >= Math.max(1, Math.floor(maxChars * 0.6)); i--) {
+    // Preferred break points: newline / Chinese full stop / English period + space.
+    // The scan starts at maxChars - 1, not maxChars: a break *after* the character
+    // at index maxChars would put maxChars + 1 of them in the piece and overflow
+    // the platform's hard limit by one. (`. ` still yields maxChars + 1, whose
+    // last character is the space `trimEnd` removes below.)
+    for (let i = Math.min(maxChars - 1, rest.length - 1); i >= Math.max(1, Math.floor(maxChars * 0.6)); i--) {
       const ch = rest[i]
-      if (ch === '\n') {
-        splitAt = i + 1 // leave the newline with the previous piece
-        break
-      }
-      if (ch === '。') {
-        splitAt = i + 1
+      if (ch === '\n' || ch === '。') {
+        splitAt = i + 1 // leave the break character with the previous piece
         break
       }
       if (ch === '.' && rest[i + 1] === ' ') {

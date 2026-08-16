@@ -20,7 +20,7 @@ import { chunkText } from '../format/chunk.js'
 import { renderForTier } from '../format/format.js'
 import { promptHint } from '../format/prompt-hint.js'
 import { parseApprovalReply, renderApproval, type PendingApproval } from '../policy/approval-render.js'
-import { resolveBusyAction, type BusyAction } from '../policy/busy.js'
+import { resolveBusyAction, type BusyAction, type BusyMessageKind } from '../policy/busy.js'
 import {
   deliverQueueReduce,
   emptyDeliverQueueState,
@@ -646,7 +646,9 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     }
 
     const message = this.buildUserMessage(chatKey, text, messageIds, senderId, images)
-    const action = this.resolveBusyActionFor(agent.status)
+    // Media is never held behind a running turn: the attachment and its caption
+    // would detach from each other by the time the queue drains.
+    const action = this.resolveBusyActionFor(agent.status, images.length > 0 ? 'media' : 'text')
 
     const queued: BusyQueuedMessage = { chatKey, text, messageIds, senderId, images }
     if (action === 'queue') {
@@ -675,10 +677,10 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     })
   }
 
-  private resolveBusyActionFor(agentStatus: string): BusyAction {
-    // The channel bridge supports steer and queue (turn-end flush), so both
-    // capability gates are true; the decision reduces to the agent status.
-    return resolveBusyAction(agentStatus, 'text', { supportsSteer: true, supportsQueue: true })
+  private resolveBusyActionFor(agentStatus: string, kind: BusyMessageKind): BusyAction {
+    // The bridge supports both steer and queue (flushed at turn-end), so the
+    // capability gates are true and the decision reduces to status + kind.
+    return resolveBusyAction(agentStatus, kind, { supportsSteer: true, supportsQueue: true })
   }
 
   private buildUserMessage(

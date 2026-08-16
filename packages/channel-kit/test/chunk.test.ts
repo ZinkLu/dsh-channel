@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { chunkText, splitMarkdownBlocks } from '../src/format/chunk.ts'
+import { charLen, chunkText, splitMarkdownBlocks } from '../src/format/chunk.ts'
 
 test('splitMarkdownBlocks keeps fenced code atomic', () => {
   const md = 'hello\n\n```js\nconst a = 1\nconst b = 2\n```\n\nworld'
@@ -75,3 +75,24 @@ function hasNoLoneSurrogate(text: string): boolean {
   }
   return true
 }
+
+test('no chunk exceeds maxChars, whichever break point is chosen', () => {
+  const maxChars = 40
+  // Each case places a preferred break point exactly at the boundary, where an
+  // off-by-one in the scan spills one character past the platform's hard limit.
+  const cases = [
+    'a'.repeat(maxChars) + '\n' + 'b'.repeat(maxChars),
+    'a'.repeat(maxChars) + '。' + 'b'.repeat(maxChars),
+    'a'.repeat(maxChars) + '. ' + 'b'.repeat(maxChars),
+    'a'.repeat(maxChars - 1) + '\n' + 'b'.repeat(maxChars),
+    'a'.repeat(maxChars - 1) + '。' + 'b'.repeat(maxChars),
+    'word '.repeat(60),
+  ]
+  for (const countBy of ['codepoint', 'utf16'] as const) {
+    for (const text of cases) {
+      for (const chunk of chunkText(text, { maxChars, countBy })) {
+        assert.ok(charLen(chunk, countBy) <= maxChars, `"${chunk}" is ${charLen(chunk, countBy)} > ${maxChars}`)
+      }
+    }
+  }
+})

@@ -383,6 +383,8 @@ export class ChannelRegistry extends Service {
    */
   register(channel: Channel): () => void {
     return this.ctx.effect(() => {
+      // Defensive: `register` is reachable with a duck-typed channel that has no
+      // `accountId` getter, which would otherwise key the entry as `id:undefined`.
       const account = channel.accountId ?? 'default'
       const key = registryKey(channel.id, account)
       if (this.entries.has(key)) {
