@@ -7,15 +7,23 @@ export interface WeChatChannelOptions {
   /** Resolves the typing ticket (required by sendtyping); when unavailable, silently degrade to a no-op. */
   resolveTypingTicket?: (chatKey: string) => Promise<string | undefined>
   client: WeixinClient
+  /** Instance discriminator for multi-account deployments (default 'default'). */
+  accountId?: string
 }
 
 export class WeChatChannel extends Channel {
   readonly id = 'wechat'
   private readonly opts: WeChatChannelOptions
+  private readonly account: string
 
   constructor(opts: WeChatChannelOptions) {
     super()
     this.opts = opts
+    this.account = opts.accountId ?? 'default'
+  }
+
+  get accountId(): string {
+    return this.account
   }
 
   // WeChat iLink per-message text limit (hermes weixin MAX_MESSAGE_LENGTH=2000).

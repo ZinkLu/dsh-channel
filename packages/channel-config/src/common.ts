@@ -33,6 +33,10 @@ export interface ChannelBehaviorConfig {
   statePath?: string
   /** Inbound media size cap in bytes (providers that download media enforce it). Default 20 MiB. */
   maxInboundMediaBytes: number
+  /** Instance discriminator for multi-account deployments (disambiguates two bots of the same platform). Default 'default'. */
+  accountId?: string
+  /** Outbound HTTP proxy URL (http://[user:pass@]host:port); threads into the provider client's fetch. */
+  proxyUrl?: string
 }
 
 export function channelBehaviorSchema() {
@@ -41,6 +45,8 @@ export function channelBehaviorSchema() {
     approvalTimeoutSec: Schema.number().default(120),
     statePath: Schema.string(),
     maxInboundMediaBytes: Schema.number().default(20 * 1024 * 1024),
+    accountId: Schema.string(),
+    proxyUrl: Schema.string(),
   }
 }
 

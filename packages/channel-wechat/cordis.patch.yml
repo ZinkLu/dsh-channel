@@ -10,6 +10,6 @@
         allowedUserIds: []           # WeChat-side user id (after the iLink bot receives a DM, read from_user_id from the log and fill it in)
         provider: deepseek-official
         model: deepseek-v4-flash
-        # accountId is recommended to go through credentials: dsh credentials set WECHAT_ACCOUNT_ID ...
+        # platformAccountId is recommended to go through credentials: dsh credentials set WECHAT_ACCOUNT_ID ...
         # token is not in this file: dsh credentials set WECHAT_TOKEN or the WECHAT_TOKEN environment variable.
         # cwd / agentPreset unset = inherit the host process.cwd() + host default preset.

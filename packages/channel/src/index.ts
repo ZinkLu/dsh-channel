@@ -75,6 +75,8 @@ export interface InboundMessage {
   readonly media?: readonly InboundMedia[]
   /** Whether the bot was @-mentioned in a group chat (provider-determined; v1 group chats are not routed, only recorded) */
   readonly mentionsBot?: boolean
+  /** The platform id of the message this one replies to (observed; enables quote/reply parity + thread inference). */
+  readonly replyToMessageId?: string
 }
 
 /** Outbound media (portable payload: images use an attachment reference, documents use a cwd-relative path; never pass a raw host absolute path). */
@@ -90,6 +92,8 @@ export interface OutboundMedia {
 /** Outbound message: semantic content + presentation intent; splitting/escaping is the provider's concern */
 export interface OutboundMessage {
   readonly channel: string
+  /** Instance discriminator for multi-account deployments; defaults to 'default'. Omitted (or 'default') for the common single-account case. */
+  readonly accountId?: string
   readonly chatKey: string
   /** markdown source text; the provider renders it degraded according to its own formatTier */
   readonly markdown: string
@@ -105,6 +109,12 @@ export interface OutboundMessage {
   readonly presentation?: PresentationIntent
   /** The draft's platform message id when presentation='draft-edit'. */
   readonly editTarget?: string
+  /** Platform message id to reply to (quote). Only sent when the provider supportsReply. */
+  readonly replyTo?: string
+  /** Thread/forum-topic id (distinct from reply-to). Only sent when the provider supportsThreads. */
+  readonly threadId?: string
+  /** Deliver without notifying the user (no buzz). Status lines and heartbeats; only sent when the provider supportsSilent. */
+  readonly silent?: boolean
 }
 
 export interface OutboundChoice {
@@ -160,6 +170,16 @@ export type ChannelStatus = 'connecting' | 'connected' | 'disconnected' | 'fatal
 export abstract class Channel {
   /** Stable provider id ('telegram', 'discord', …), the registry key */
   abstract readonly id: string
+
+  /**
+   * Instance discriminator for multi-account deployments. `id` stays the
+   * provider-family key ('telegram') for capability-fact purposes; two instances
+   * of the same `id` are disambiguated by `accountId`. Default 'default' preserves
+   * today's single-account behavior with zero config changes.
+   */
+  get accountId(): string {
+    return 'default'
+  }
 
   // ---- capability facts: conservative base defaults, overridden by implementations ----
 
@@ -219,6 +239,22 @@ export abstract class Channel {
   get supportsReactions(): boolean {
     return false
   }
+  /** Whether replying to (quoting) a specific inbound message is supported on the outbound side. */
+  get supportsReply(): boolean {
+    return false
+  }
+  /** Whether threads (forum topics / Slack threads, distinct from reply-to) are supported. */
+  get supportsThreads(): boolean {
+    return false
+  }
+  /** Whether silent / no-notification delivery is supported (status lines and heartbeats shouldn't buzz). */
+  get supportsSilent(): boolean {
+    return false
+  }
+  /** Whether the provider can reconcile a prior delivery by querying the platform before a blind resend. */
+  get supportsReconciliation(): boolean {
+    return false
+  }
 
   // ---- required behavior ----
 
@@ -232,6 +268,12 @@ export abstract class Channel {
     opts?: {
       choices?: readonly OutboundChoice[]
       signal?: AbortSignal
+      /** Reply to (quote) this platform message id. */
+      replyTo?: string
+      /** Thread / forum-topic id (distinct from reply-to). */
+      threadId?: string
+      /** Deliver without notifying the user. */
+      silent?: boolean
     },
   ): Promise<{ platformMessageId: string }>
 
@@ -259,6 +301,42 @@ export abstract class Channel {
    * fall back to a text ack.
    */
   async react(_chatKey: string, _messageId: string, _emoji: string): Promise<void> {}
+
+  /**
+   * Reconcile a prior delivery by querying the platform before a blind resend
+   * (recovery path). Defaults to 'unknown' — graceful absence (R2). A provider
+   * may implement it to return 'confirmed-sent' (skip the resend) or
+   * 'confirmed-absent' (safe to resend) by inspecting platform state.
+   */
+  async reconcile(
+    _chatKey: string,
+    _deliveryKey: string,
+    _textHash: string,
+  ): Promise<'confirmed-sent' | 'confirmed-absent' | 'unknown'> {
+    return 'unknown'
+  }
+}
+
+/**
+ * Sibling optional interface for interactive/pairing login (QR, OAuth device
+ * flow). Deliberately NOT on `Channel` itself — only some platforms need it
+ * (R6), and it is consumed by a CLI/setup command, never by the bridge runtime.
+ * A provider package may additionally export an implementation of this shape.
+ * None of the three current providers implement it (all use static bot tokens).
+ */
+export interface ChannelLoginOptions {
+  signal?: AbortSignal
+}
+
+export interface ChannelLoginResult {
+  ok: boolean
+  /** Optional persisted auth fact (e.g. a credential ref name the caller should now resolve). */
+  credentialRef?: string
+  error?: string
+}
+
+export interface ChannelLogin {
+  login(opts?: ChannelLoginOptions): Promise<ChannelLoginResult>
 }
 
 /** Install the registry as a service on the current context (plugin entry point). */
@@ -267,34 +345,60 @@ export function apply(ctx: Context): void {
 }
 
 export class ChannelRegistry extends Service {
+  /** Keyed by `${id}:${accountId}` so multiple instances of the same provider family can coexist. */
   private entries = new Map<string, Channel>()
+  /** sessionId → outbound target binding (registry-wide, cross-provider), for proactive push discovery. */
+  private sessionBindings = new Map<string, { channel: string; accountId?: string; chatKey: string }>()
 
   constructor(ctx: Context) {
     super(ctx, 'channels')
   }
 
   /**
-   * Register a provider. A duplicate id throws. Returns a disposer via ctx.effect:
-   * the registration is automatically reclaimed when the provider unloads.
+   * Register a provider. A duplicate `(id, accountId)` throws (two accounts of
+   * the same platform are fine; two instances with the same discriminator are
+   * not). Returns a disposer via ctx.effect: the registration is automatically
+   * reclaimed when the provider unloads.
    */
   register(channel: Channel): () => void {
     return this.ctx.effect(() => {
-      if (this.entries.has(channel.id)) {
-        throw new Error(`channel "${channel.id}" is already registered`)
+      const account = channel.accountId ?? 'default'
+      const key = registryKey(channel.id, account)
+      if (this.entries.has(key)) {
+        throw new Error(`channel "${channel.id}" account "${account}" is already registered`)
       }
-      this.entries.set(channel.id, channel)
+      this.entries.set(key, channel)
       return () => {
-        this.entries.delete(channel.id)
+        this.entries.delete(key)
       }
     }, 'channels.register()') as () => void
   }
 
-  get(id: string): Channel | undefined {
-    return this.entries.get(id)
+  /** Look up by provider id; `accountId` defaults to 'default' (the single-account case). */
+  get(id: string, accountId = 'default'): Channel | undefined {
+    return this.entries.get(registryKey(id, accountId))
   }
 
   list(): Channel[] {
     return [...this.entries.values()]
+  }
+
+  /**
+   * Register a sessionId → (channel, chatKey) binding so policy plugins (monitor,
+   * reminder, cron) can discover where to push a proactive message without poking
+   * into a bridge's private maps. Idempotent; re-established on restore.
+   */
+  bindChatKey(sessionId: string, channelId: string, chatKey: string, accountId?: string): void {
+    this.sessionBindings.set(sessionId, {
+      channel: channelId,
+      ...(accountId !== undefined && accountId !== 'default' ? { accountId } : {}),
+      chatKey,
+    })
+  }
+
+  /** Read-only reverse lookup: which channel + chatKey is this session bound to. */
+  chatKeyOf(sessionId: string): { channel: string; accountId?: string; chatKey: string } | undefined {
+    return this.sessionBindings.get(sessionId)
   }
 
   /** Called when a provider receives a deduplicated inbound message: normalization assertion + broadcast */
@@ -310,13 +414,21 @@ export class ChannelRegistry extends Service {
    */
   async deliver(out: OutboundMessage): Promise<DeliveryReceipt> {
     return this.ctx.waterfall('channel/deliver', out, async (): Promise<DeliveryReceipt> => {
-      const channel = this.entries.get(out.channel)
-      if (channel === undefined) return { status: 'failed', error: `no channel "${out.channel}"` }
+      const channel = this.entries.get(registryKey(out.channel, out.accountId ?? 'default'))
+      if (channel === undefined) {
+        const label = out.accountId && out.accountId !== 'default' ? `${out.channel}:${out.accountId}` : out.channel
+        return { status: 'failed', error: `no channel "${label}"` }
+      }
       try {
         const platformMessageIds: string[] = []
         // text (empty text is not sent out; when media-only, don't send an empty bubble).
         if (out.markdown !== '') {
-          const result = await channel.send(out.chatKey, out.markdown, { choices: out.choices })
+          const result = await channel.send(out.chatKey, out.markdown, {
+            choices: out.choices,
+            replyTo: out.replyTo,
+            threadId: out.threadId,
+            silent: out.silent,
+          })
           platformMessageIds.push(result.platformMessageId)
         }
         // media: supportsMedia platforms go through sendMedia; otherwise degrade to a "could not deliver" text (hermes lesson: never echo the host path back).
@@ -338,6 +450,10 @@ export class ChannelRegistry extends Service {
 }
 
 export default ChannelRegistry
+
+function registryKey(id: string, accountId: string): string {
+  return `${id}:${accountId}`
+}
 
 function mediaUnsupportedText(kind: 'image' | 'document'): string {
   return kind === 'image' ? '⚠️ Could not deliver the image attachment.' : '⚠️ Could not deliver the file attachment.'

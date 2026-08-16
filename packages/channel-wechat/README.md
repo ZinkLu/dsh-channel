@@ -24,7 +24,8 @@ export function apply(ctx, config) { ... }
 | Field | Required | Default | Description |
 |---|---|---|---|
 | `allowedUserIds` | ✅ | None | WeChat user ids allowed to use the bot (iLink-side `from_user_id`) |
-| `accountId` | No | credential `WECHAT_ACCOUNT_ID` | iLink bot account id (used for self-message loopback filtering) |
+| `platformAccountId` | No | credential `WECHAT_ACCOUNT_ID` | iLink bot account id (used for self-message loopback filtering) |
+| `accountId` | No | `default` | dsh instance discriminator for multi-account deployments |
 | `provider` | No | `deepseek-official` | agent model provider |
 | `model` | No | None | agent model id |
 | `cwd` | No | host `process.cwd()` | agent working directory |
@@ -65,5 +66,5 @@ override it explicitly. See the `dsh-channel-telegram` README for details.
 - `WECHAT_TOKEN` / `WECHAT_ACCOUNT_ID` go only through `ctx.credentials.resolve` and never land in the config file.
 - The allowlist is required with no lenient default.
 - The approval answerer answers only for its own agent; on timeout or for a non-own agent it always calls `next()`, never allowing by default.
-- Self-message loopback filter: `from_user_id === accountId` or `msg_type === 2` (bot message) is dropped outright.
+- Self-message loopback filter: `from_user_id === platformAccountId` or `msg_type === 2` (bot message) is dropped outright.
 - v1 does not handle media: messages with media keep only the `hasMedia` fact (no download, no CDN decryption); group chats are dropped.

@@ -671,3 +671,100 @@ test('bridge reacts to a long message instead of a text ack', async () => {
   assert.deepEqual(client.reactions, [{ chatId: '42', messageId: 100, emoji: '👀' }])
   assert.ok(!client.sends.some((s) => s.text.includes('Received, working on it…')))
 })
+
+test('bridge observes inbound replyToMessageId', async () => {
+  const root = new Context()
+  new ChannelRegistry(root)
+
+  root.provide('agents', { list: () => [], get: () => undefined, resume: async () => { throw new Error('no persistence') }, create: async () => { throw new Error('group chats do not create agents') } })
+  root.provide('credentials', { resolve: async () => ({ value: 'test-token', source: 'test' }) })
+
+  const updates: TelegramUpdate[] = [
+    {
+      update_id: 1,
+      message: {
+        message_id: 200,
+        from: { id: 123, is_bot: false, first_name: 'Alice' },
+        chat: { id: -100, type: 'group' },
+        date: 1_700_000_000,
+        text: 'quote me',
+        reply_to_message: { message_id: 150 },
+      },
+    },
+  ]
+  const client = createFakeClient(updates)
+  const channel = new TelegramChannel({ client, resolveToken: async () => 'test-token' })
+  root.channels.register(channel)
+  const bridge = new TelegramBridge(
+    root,
+    () => ({ allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 0.05, approvalTimeoutSec: 120 }),
+    createMemoryStore(),
+    channel,
+    client,
+  )
+
+  const emitted: any[] = []
+  root.on('channel/message', (msg) => { emitted.push(msg) })
+
+  await bridge.start()
+  await waitFor(() => emitted.length === 1)
+  await bridge.stop()
+
+  assert.equal(emitted[0].replyToMessageId, '150')
+})
+
+class ReconcilingTelegramChannel extends TelegramChannel {
+  reconciled: Array<{ chatKey: string; key: string }> = []
+  get supportsReconciliation(): boolean {
+    return true
+  }
+  async reconcile(chatKey: string, key: string, _textHash: string): Promise<'confirmed-sent'> {
+    this.reconciled.push({ chatKey, key })
+    return 'confirmed-sent'
+  }
+}
+
+test('bridge consults reconcile before resending a failed delivery', async () => {
+  const root = new Context()
+  new ChannelRegistry(root)
+
+  const sessionId = 'channel:telegram:42'
+  const events: any[] = []
+  events[1] = { type: 'assistant/message', seq: 1, time: Date.now(), data: { message: { role: 'assistant', content: [{ type: 'text', text: 'hi' }] } } }
+  const fakeAgent = {
+    id: sessionId,
+    status: 'idle' as const,
+    session: { events },
+  }
+  root.provide('agents', {
+    list: () => [],
+    get: () => fakeAgent,
+    resume: async () => { throw new Error('not used') },
+    create: async () => { throw new Error('not used') },
+  })
+  root.provide('credentials', { resolve: async () => ({ value: 'test-token', source: 'test' }) })
+
+  const store = createMemoryStore()
+  store.setBinding('42', sessionId)
+  store.recordDelivery(`${sessionId}:1`, { chatKey: '42', textHash: 'abc' })
+  store.markFailed(`${sessionId}:1`, 'boom')
+
+  const client = createFakeClient([])
+  const channel = new ReconcilingTelegramChannel({ client, resolveToken: async () => 'test-token' })
+  root.channels.register(channel)
+  const bridge = new TelegramBridge(
+    root,
+    () => ({ allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 5, approvalTimeoutSec: 120 }),
+    store,
+    channel,
+    client,
+  )
+
+  await bridge.start()
+  await bridge.stop()
+
+  assert.equal(channel.reconciled.length, 1)
+  assert.equal(channel.reconciled[0]!.key, `${sessionId}:1`)
+  // Reconcile reported confirmed-sent → no blind resend.
+  assert.equal(client.sends.length, 0)
+})

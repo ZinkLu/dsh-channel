@@ -163,6 +163,42 @@ test('TelegramClient.sendPhoto posts multipart form', async () => {
   assert.ok(body instanceof FormData)
 })
 
+test('TelegramClient.sendMessage forwards reply/thread/silent options', async () => {
+  const bodies: any[] = []
+  const client = new TelegramClient({
+    baseUrl: 'https://example.test',
+    fetch: (async (url: string | URL | Request, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)))
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 5 } }), { status: 200 })
+    }) as typeof fetch,
+  })
+
+  await client.sendMessage('tok', '42', 'hi', { parseMode: 'HTML', replyTo: 7, threadId: 3, disableNotification: true })
+  assert.deepEqual(bodies[0]!.reply_parameters, { message_id: 7 })
+  assert.equal(bodies[0]!.message_thread_id, 3)
+  assert.equal(bodies[0]!.disable_notification, true)
+
+  await client.sendMessage('tok', '42', 'plain')
+  assert.equal(bodies[1]!.reply_parameters, undefined)
+  assert.equal(bodies[1]!.disable_notification, undefined)
+})
+
+test('TelegramChannel.send forwards replyTo/silent to the client', async () => {
+  const captured: any[] = []
+  const client = {
+    async sendMessage(_token: string, _chatId: string, _text: string, opts?: any): Promise<{ message_id: number }> {
+      captured.push(opts)
+      return { message_id: 1 }
+    },
+  } as any
+
+  const channel = new TelegramChannel({ client, resolveToken: async () => 'tok' })
+  await channel.send('42', 'hi', { replyTo: '9', silent: true })
+  assert.equal(captured[0]!.replyTo, 9)
+  assert.equal(captured[0]!.disableNotification, true)
+  assert.equal(captured[0]!.threadId, undefined)
+})
+
 test('TelegramChannel.sendMedia sends image via readImage and document via readFile', async () => {
   const sends: Array<{ kind: string; bytes: number[]; caption?: string }> = []
   const client = {

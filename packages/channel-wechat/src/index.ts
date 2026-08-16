@@ -18,12 +18,14 @@ export type { WeChatConfig } from 'dsh-channel-config'
 export function resolveStatePath(config: WeChatConfig): string {
   if (config.statePath) return config.statePath
   const base = process.env.DSH_HOME ?? join(homedir(), '.dsh')
-  return join(base, 'channel-wechat', 'state.json')
+  // Multi-account: scope the ledger under the account id; the default account keeps the v1 path unchanged.
+  const dir = config.accountId && config.accountId !== 'default' ? join('channel-wechat', config.accountId) : 'channel-wechat'
+  return join(base, dir, 'state.json')
 }
 
 export function apply(ctx: Context, config: WeChatConfig) {
   const store = createJsonFileStore(resolveStatePath(config))
-  const client = new WeixinClient()
+  const client = new WeixinClient({ proxyUrl: config.proxyUrl })
 
   // Settings seam: resolved value = schema defaults < base(config) < user document.
   let source: () => WeChatConfig = () => config
@@ -34,6 +36,7 @@ export function apply(ctx: Context, config: WeChatConfig) {
 
   const channel = new WeChatChannel({
     client,
+    accountId: config.accountId,
     resolveToken: async () => {
       const resolved = await ctx.credentials.resolve(credentialRef(CREDENTIAL_WECHAT_TOKEN))
       return resolved?.value

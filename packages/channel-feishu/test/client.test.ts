@@ -114,3 +114,21 @@ test('FeishuChannel.react resolves credentials and calls createReaction', async 
   await channel.react('oc_chat1', 'om_1', '👀')
   assert.deepEqual(reacted, [{ messageId: 'om_1', emoji: '👀' }])
 })
+
+test('FeishuChannel.send uses replyMessage when replyTo is provided', async () => {
+  const replies: Array<{ messageId: string; text: string }> = []
+  const client = {
+    async getTenantAccessToken(): Promise<string> { return 'tok' },
+    async replyMessage(_token: string, messageId: string, text: string): Promise<string> {
+      replies.push({ messageId, text })
+      return 'om_reply'
+    },
+    async sendMessage(): Promise<string> { return 'om_sent' },
+  } as any
+
+  const channel = new FeishuChannel({ client, resolveCredentials: async () => ({ appId: 'cli_a', appSecret: 'secret_b' }) })
+  assert.equal(channel.supportsReply, true)
+  const result = await channel.send('oc_chat1', 'hello', { replyTo: 'om_parent' })
+  assert.equal(result.platformMessageId, 'om_reply')
+  assert.deepEqual(replies, [{ messageId: 'om_parent', text: 'hello' }])
+})

@@ -46,6 +46,9 @@ export interface FeishuBridgeConfig {
   mergeWindowSec: number
   approvalTimeoutSec: number
   domain?: 'feishu' | 'lark'
+  /** Instance discriminator for multi-account deployments (default 'default'). */
+  accountId?: string
+  proxyUrl?: string
 }
 
 /** Payload carried through the deliver queue for a single chunk. */
@@ -143,6 +146,27 @@ export class FeishuBridge {
   /** Dynamic config read: the settings seam may swap the source at runtime. */
   private get config(): FeishuBridgeConfig {
     return this.source()
+  }
+
+  /** Account-qualified session id segment; empty for the default account (backward compatible). */
+  private get accountSegment(): string {
+    const account = this.channel.accountId
+    return account !== 'default' ? `:${account}` : ''
+  }
+
+  private sessionIdFor(chatKey: string): string {
+    return `channel:${this.channel.id}${this.accountSegment}:${chatKey}`
+  }
+
+  /** accountId for outbound messages; present only when non-default. */
+  private get accountQualifier(): { accountId?: string } {
+    const account = this.channel.accountId
+    return account !== 'default' ? { accountId: account } : {}
+  }
+
+  /** Mirror a sessionId → chatKey binding into the registry (cross-provider proactive-push seam). */
+  private registerSessionBinding(sessionId: string, chatKey: string): void {
+    this.ctx.channels.bindChatKey(sessionId, this.channel.id, chatKey, this.channel.accountId)
   }
 
   async start(): Promise<void> {
@@ -258,6 +282,18 @@ export class FeishuBridge {
       if (text === '') {
         this.store.markFailed(item.key, `recovery: empty assistant message ${item.key}`)
         continue
+      }
+      // Reconciliation: consult the channel before a blind resend (graceful 'unknown' by default).
+      if (item.state !== 'pending' && this.channel.supportsReconciliation) {
+        try {
+          const verdict = await this.channel.reconcile(item.chatKey, item.key, hashText(text))
+          if (verdict === 'confirmed-sent') {
+            this.store.markDelivered(item.key, [])
+            continue
+          }
+        } catch {
+          // fall through to resend
+        }
       }
       const marker = item.state === 'pending' ? '' : '(resumed resend, may duplicate)\n'
       try {
@@ -379,6 +415,7 @@ export class FeishuBridge {
       hasMedia: hasMedia(messageEvent),
       media: mediaFacts(messageEvent),
       mentionsBot: (message?.mentions?.length ?? 0) > 0,
+      replyToMessageId: message?.parent_id || undefined,
     }
     this.ctx.channels.ingest(inbound)
   }
@@ -461,6 +498,7 @@ export class FeishuBridge {
   private routeContext() {
     return {
       channel: 'feishu',
+      accountId: this.channel.accountId,
       boundSessions: this.store.bindings(),
       liveSessionIds: this.ctx.agents.list().map((agent) => agent.id),
     }
@@ -507,6 +545,7 @@ export class FeishuBridge {
 
   private async ensureAgent(sessionId: string, chatKey: string, create: boolean): Promise<Agent | undefined> {
     this.sessionChatKeys.set(sessionId, chatKey)
+    this.registerSessionBinding(sessionId, chatKey)
     const existing = this.ctx.agents.get(SessionId(sessionId))
     if (existing) return existing
 
@@ -671,8 +710,8 @@ export class FeishuBridge {
   ): Promise<void> {
     const out: OutboundMessage =
       rendered.kind === 'choices'
-        ? { channel: 'feishu', chatKey, markdown: rendered.text, choices: rendered.choices.map((c) => ({ id: c.id, label: c.label })), deliveryKey: `prompt:${chatKey}:${Date.now()}` }
-        : { channel: 'feishu', chatKey, markdown: rendered.text, deliveryKey: `prompt:${chatKey}:${Date.now()}` }
+        ? { channel: 'feishu', ...this.accountQualifier, chatKey, markdown: rendered.text, choices: rendered.choices.map((c) => ({ id: c.id, label: c.label })), deliveryKey: `prompt:${chatKey}:${Date.now()}` }
+        : { channel: 'feishu', ...this.accountQualifier, chatKey, markdown: rendered.text, deliveryKey: `prompt:${chatKey}:${Date.now()}` }
     try {
       await this.ctx.channels.deliver(out)
     } catch {
@@ -755,6 +794,7 @@ export class FeishuBridge {
     try {
       const receipt = await this.ctx.channels.deliver({
         channel: 'feishu',
+        ...this.accountQualifier,
         chatKey: item.value.chatKey,
         markdown: item.value.markdown,
         deliveryKey: item.key,
@@ -814,6 +854,7 @@ export class FeishuBridge {
     for (let i = 0; i < chunks.length; i++) {
       await this.ctx.channels.deliver({
         channel: 'feishu',
+        ...this.accountQualifier,
         chatKey,
         markdown: chunks[i]!,
         deliveryKey: `local:${chatKey}:${Date.now()}:${i}`,
@@ -834,9 +875,10 @@ export class FeishuBridge {
       return
     }
     if (command === 'new') {
-      const sessionId = `channel:feishu:${chatKey}:${Date.now()}`
+      const sessionId = `${this.sessionIdFor(chatKey)}:${Date.now()}`
       this.store.setBinding(chatKey, sessionId)
       this.sessionChatKeys.set(sessionId, chatKey)
+      this.registerSessionBinding(sessionId, chatKey)
       await this.sendLocal(chatKey, `✅ Created new session: ${sessionId}`)
       return
     }
@@ -847,12 +889,13 @@ export class FeishuBridge {
       }
       this.store.setBinding(chatKey, args)
       this.sessionChatKeys.set(args, chatKey)
+      this.registerSessionBinding(args, chatKey)
       await this.sendLocal(chatKey, `✅ Bound session: ${args}`)
       return
     }
     if (command === 'status') {
       const binding = this.store.bindings()[chatKey]
-      const sessionId = binding ?? `channel:feishu:${chatKey}`
+      const sessionId = binding ?? this.sessionIdFor(chatKey)
       const agent = this.ctx.agents.get(SessionId(sessionId))
       await this.sendLocal(chatKey, agent ? `Session ${sessionId} status: ${agent.status}` : `Session ${sessionId} is not running.`)
       return
@@ -916,8 +959,8 @@ export class FeishuBridge {
     )
     const out: OutboundMessage =
       rendered.kind === 'choices'
-        ? { channel: 'feishu', chatKey: entry.chatKey, markdown: rendered.text, choices: rendered.choices, deliveryKey: `approval:${entry.requestId}` }
-        : { channel: 'feishu', chatKey: entry.chatKey, markdown: rendered.text, deliveryKey: `approval:${entry.requestId}` }
+        ? { channel: 'feishu', ...this.accountQualifier, chatKey: entry.chatKey, markdown: rendered.text, choices: rendered.choices, deliveryKey: `approval:${entry.requestId}` }
+        : { channel: 'feishu', ...this.accountQualifier, chatKey: entry.chatKey, markdown: rendered.text, deliveryKey: `approval:${entry.requestId}` }
 
     try {
       await this.ctx.channels.deliver(out)

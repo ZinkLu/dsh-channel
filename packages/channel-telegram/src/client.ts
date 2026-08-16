@@ -1,4 +1,4 @@
-import { assertMediaWithinLimit } from 'dsh-channel-kit'
+import { assertMediaWithinLimit, proxiedFetch } from 'dsh-channel-kit'
 
 export interface TelegramUser {
   id: number
@@ -26,6 +26,7 @@ export interface TelegramMessage {
   caption?: string
   entities?: TelegramEntity[]
   caption_entities?: TelegramEntity[]
+  reply_to_message?: { message_id: number }
   reply_markup?: TelegramInlineKeyboardMarkup
   photo?: TelegramPhotoSize[]
   document?: TelegramDocument
@@ -117,6 +118,8 @@ export interface TelegramClientOptions {
   baseUrl?: string
   fetch?: typeof fetch
   timeoutMs?: number
+  /** Outbound HTTP proxy (http://[user:pass@]host:port); wraps the fetch implementation. */
+  proxyUrl?: string
 }
 
 export class TelegramApiError extends Error {
@@ -137,7 +140,8 @@ export class TelegramClient {
 
   constructor(opts: TelegramClientOptions = {}) {
     this.baseUrl = (opts.baseUrl ?? 'https://api.telegram.org').replace(/\/$/, '')
-    this.fetchImpl = opts.fetch ?? fetch
+    const rawFetch = opts.fetch ?? fetch
+    this.fetchImpl = opts.proxyUrl ? proxiedFetch(opts.proxyUrl) : rawFetch
     this.timeoutMs = opts.timeoutMs ?? 30_000
   }
 
@@ -163,14 +167,25 @@ export class TelegramClient {
     token: string,
     chatId: string,
     text: string,
-    opts: { parseMode?: 'HTML' | 'MarkdownV2'; replyMarkup?: TelegramInlineKeyboardMarkup; signal?: AbortSignal } = {},
+    opts: {
+      parseMode?: 'HTML' | 'MarkdownV2'
+      replyMarkup?: TelegramInlineKeyboardMarkup
+      signal?: AbortSignal
+      replyTo?: number
+      threadId?: number
+      disableNotification?: boolean
+    } = {},
   ): Promise<TelegramMessage> {
-    return this.callApi(token, 'sendMessage', {
+    const body: Record<string, unknown> = {
       chat_id: chatId,
       text,
       parse_mode: opts.parseMode,
       reply_markup: opts.replyMarkup,
-    }, opts.signal)
+    }
+    if (opts.replyTo !== undefined) body.reply_parameters = { message_id: opts.replyTo }
+    if (opts.threadId !== undefined) body.message_thread_id = opts.threadId
+    if (opts.disableNotification) body.disable_notification = true
+    return this.callApi(token, 'sendMessage', body, opts.signal)
   }
 
   async sendChatAction(token: string, chatId: string, action: string, signal?: AbortSignal): Promise<boolean> {

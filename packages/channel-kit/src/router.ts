@@ -1,5 +1,7 @@
 export interface RouteContext {
   readonly channel: string
+  /** Instance discriminator for multi-account deployments; 'default' (or omitted) keeps the single-account session id. */
+  readonly accountId?: string
   readonly boundSessions: Readonly<Record<string, string>> // chatKey → sessionId (store.bindings)
   readonly liveSessionIds: readonly string[] // projection of ctx.agents.list()
 }
@@ -48,7 +50,9 @@ export function route(
     return { kind: 'route', sessionId: bound, create: false }
   }
 
-  // Default policy: one session per chat, with the sessionId convention channel:<channelId>:<chatKey>.
-  const sessionId = `${prefix}:${ctx.channel}:${msg.chatKey}`
+  // Default policy: one session per chat, with the sessionId convention channel:<channelId>[:<accountId>]:<chatKey>.
+  // The account segment appears only for a non-default account, so single-account session ids are byte-for-byte unchanged.
+  const account = ctx.accountId && ctx.accountId !== 'default' ? `:${ctx.accountId}` : ''
+  const sessionId = `${prefix}:${ctx.channel}${account}:${msg.chatKey}`
   return { kind: 'route', sessionId, create: true }
 }

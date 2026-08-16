@@ -1,5 +1,6 @@
 export * from './chunk.js'
 export * from './deliver-queue.js'
+export * from './http-proxy.js'
 export * from './media-limit.js'
 export * from './merge.js'
 export * from './router.js'

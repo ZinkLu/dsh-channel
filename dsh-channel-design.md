@@ -725,10 +725,10 @@ Common base shared by all three providers:
 | Fragment | Fields |
 |---|---|
 | Agent routing | `provider` (default `deepseek-official`), `model?`, `cwd?`, `agentPreset?` |
-| Behavior + persistence | `mergeWindowSec` (5), `approvalTimeoutSec` (120), `statePath?`, `maxInboundMediaBytes` (20 MiB) |
+| Behavior + persistence | `mergeWindowSec` (5), `approvalTimeoutSec` (120), `statePath?`, `maxInboundMediaBytes` (20 MiB), `accountId?` (multi-account instance discriminator), `proxyUrl?` (outbound proxy) |
 | Allowlist | `allowedUserIds` (required; Telegram `number[]`, WeChat/Feishu `string[]`) |
 
-Platform differences stay per-provider: Telegram `pollingTimeoutSec` (30); WeChat `pollingTimeoutSec` + `accountId?` (iLink account); Feishu `domain: 'feishu'|'lark'` and no long-poll timeout (WebSocket).
+Platform differences stay per-provider: Telegram `pollingTimeoutSec` (30); WeChat `pollingTimeoutSec` + `platformAccountId?` (iLink account); Feishu `domain: 'feishu'|'lark'` and no long-poll timeout (WebSocket).
 
 ### 11.2 Settings seam (`installSettingsSection`)
 

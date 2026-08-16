@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto'
+import { proxiedFetch } from 'dsh-channel-kit'
 
 /**
  * WeChat (WeChat) iLink Bot API client.
@@ -90,6 +91,8 @@ export interface WeixinClientOptions {
   baseUrl?: string
   fetch?: typeof fetch
   timeoutMs?: number
+  /** Outbound HTTP proxy (http://[user:pass@]host:port); wraps the fetch implementation. */
+  proxyUrl?: string
 }
 
 export class WeixinApiError extends Error {
@@ -112,7 +115,8 @@ export class WeixinClient {
 
   constructor(opts: WeixinClientOptions = {}) {
     this.baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/$/, '')
-    this.fetchImpl = opts.fetch ?? fetch
+    const rawFetch = opts.fetch ?? fetch
+    this.fetchImpl = opts.proxyUrl ? proxiedFetch(opts.proxyUrl) : rawFetch
     this.timeoutMs = opts.timeoutMs ?? 35_000
   }
 

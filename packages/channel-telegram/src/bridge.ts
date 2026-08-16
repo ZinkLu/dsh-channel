@@ -56,6 +56,8 @@ export interface TelegramBridgeConfig {
   mergeWindowSec: number
   approvalTimeoutSec: number
   maxInboundMediaBytes?: number
+  accountId?: string
+  proxyUrl?: string
 }
 
 /** Payload carried through the deliver queue for a single chunk. */
@@ -167,6 +169,27 @@ export class TelegramBridge {
   /** Dynamic config read: the settings seam may swap the source at runtime. */
   private get config(): TelegramBridgeConfig {
     return this.source()
+  }
+
+  /** Account-qualified session id segment; empty for the default account (backward compatible). */
+  private get accountSegment(): string {
+    const account = this.channel.accountId
+    return account !== 'default' ? `:${account}` : ''
+  }
+
+  private sessionIdFor(chatKey: string): string {
+    return `channel:${this.channel.id}${this.accountSegment}:${chatKey}`
+  }
+
+  /** accountId for outbound messages; present only when non-default. */
+  private get accountQualifier(): { accountId?: string } {
+    const account = this.channel.accountId
+    return account !== 'default' ? { accountId: account } : {}
+  }
+
+  /** Mirror a sessionId → chatKey binding into the registry (cross-provider proactive-push seam). */
+  private registerSessionBinding(sessionId: string, chatKey: string): void {
+    this.ctx.channels.bindChatKey(sessionId, this.channel.id, chatKey, this.channel.accountId)
   }
 
   async start(): Promise<void> {
@@ -296,6 +319,20 @@ export class TelegramBridge {
       if (text === '') {
         this.store.markFailed(item.key, `recovery: empty assistant message ${item.key}`)
         continue
+      }
+      // Reconciliation: for uncertain (attempting/failed) deliveries, ask the channel
+      // whether it already landed before a blind resend. 'confirmed-absent' and 'unknown'
+      // fall through to a (marked) resend; a reconcile failure degrades to 'unknown'.
+      if (item.state !== 'pending' && this.channel.supportsReconciliation) {
+        try {
+          const verdict = await this.channel.reconcile(item.chatKey, item.key, hashText(text))
+          if (verdict === 'confirmed-sent') {
+            this.store.markDelivered(item.key, [])
+            continue
+          }
+        } catch {
+          // fall through to resend
+        }
       }
       const marker = item.state === 'pending' ? '' : '(resumed resend, may duplicate)\n'
       try {
@@ -479,6 +516,7 @@ export class TelegramBridge {
       hasMedia: hasMedia(message),
       media,
       mentionsBot: mentionsBotOf(message, this.botIdentity),
+      replyToMessageId: message.reply_to_message ? String(message.reply_to_message.message_id) : undefined,
     }
     this.ctx.channels.ingest(inbound)
   }
@@ -581,6 +619,7 @@ export class TelegramBridge {
   private routeContext() {
     return {
       channel: 'telegram',
+      accountId: this.channel.accountId,
       boundSessions: this.store.bindings(),
       liveSessionIds: this.ctx.agents.list().map((agent) => agent.id),
     }
@@ -631,6 +670,7 @@ export class TelegramBridge {
 
   private async ensureAgent(sessionId: string, chatKey: string, create: boolean): Promise<Agent | undefined> {
     this.sessionChatKeys.set(sessionId, chatKey)
+    this.registerSessionBinding(sessionId, chatKey)
     const existing = this.ctx.agents.get(SessionId(sessionId))
     if (existing) return existing
 
@@ -816,8 +856,8 @@ export class TelegramBridge {
     const text = renderForTier(rendered.text, this.channel.formatTier)
     const out: OutboundMessage =
       rendered.kind === 'choices'
-        ? { channel: 'telegram', chatKey, markdown: text, choices: rendered.choices.map((c) => ({ id: c.id, label: c.label })), deliveryKey }
-        : { channel: 'telegram', chatKey, markdown: text, deliveryKey }
+        ? { channel: 'telegram', ...this.accountQualifier, chatKey, markdown: text, choices: rendered.choices.map((c) => ({ id: c.id, label: c.label })), deliveryKey }
+        : { channel: 'telegram', ...this.accountQualifier, chatKey, markdown: text, deliveryKey }
     try {
       const receipt = await this.ctx.channels.deliver(out)
       const platformId = receipt.platformMessageIds?.[0]
@@ -851,7 +891,7 @@ export class TelegramBridge {
       this.feedStream(session.id, chatKey, { kind: 'tool-result', callId, name, ok: event.data.error === undefined, summary: event.data.error?.name })
     } else if (event.type === 'turn/end' && event.data.reason.kind !== 'completed') {
       const label = turnEndLabel(event.data.reason.kind)
-      void this.sendLocal(chatKey, `⏹ Turn ended: ${label}`).catch(() => {})
+      void this.sendLocal(chatKey, `⏹ Turn ended: ${label}`, { silent: true }).catch(() => {})
       this.feedStream(session.id, chatKey, { kind: 'turn-end', reason: event.data.reason.kind })
     }
   }
@@ -1011,6 +1051,7 @@ export class TelegramBridge {
     try {
       const receipt = await this.ctx.channels.deliver({
         channel: 'telegram',
+        ...this.accountQualifier,
         chatKey: item.value.chatKey,
         markdown: item.value.markdown,
         deliveryKey: item.key,
@@ -1063,16 +1104,18 @@ export class TelegramBridge {
     this.runDeliverEffects(chatKey, result.effects)
   }
 
-  private async sendLocal(chatKey: string, markdown: string): Promise<void> {
+  private async sendLocal(chatKey: string, markdown: string, opts: { silent?: boolean } = {}): Promise<void> {
     const html = renderForTier(markdown, 'html')
     const maxChars = this.channel.maxMessageChars ?? 4096
     const chunks = chunkText(html, { maxChars, countBy: 'utf16' })
     for (let i = 0; i < chunks.length; i++) {
       await this.ctx.channels.deliver({
         channel: 'telegram',
+        ...this.accountQualifier,
         chatKey,
         markdown: chunks[i]!,
         deliveryKey: `local:${chatKey}:${Date.now()}:${i}`,
+        silent: opts.silent ? true : undefined,
       })
       if (i < chunks.length - 1) await sleepWithAbort(1000, this.pollAbort?.signal)
     }
@@ -1090,9 +1133,10 @@ export class TelegramBridge {
       return
     }
     if (command === 'new') {
-      const sessionId = `channel:telegram:${chatKey}:${Date.now()}`
+      const sessionId = `${this.sessionIdFor(chatKey)}:${Date.now()}`
       this.store.setBinding(chatKey, sessionId)
       this.sessionChatKeys.set(sessionId, chatKey)
+      this.registerSessionBinding(sessionId, chatKey)
       await this.sendLocal(chatKey, `✅ Created new session: ${sessionId}`)
       return
     }
@@ -1103,12 +1147,13 @@ export class TelegramBridge {
       }
       this.store.setBinding(chatKey, args)
       this.sessionChatKeys.set(args, chatKey)
+      this.registerSessionBinding(args, chatKey)
       await this.sendLocal(chatKey, `✅ Bound to session: ${args}`)
       return
     }
     if (command === 'status') {
       const binding = this.store.bindings()[chatKey]
-      const sessionId = binding ?? `channel:telegram:${chatKey}`
+      const sessionId = binding ?? this.sessionIdFor(chatKey)
       const agent = this.ctx.agents.get(SessionId(sessionId))
       await this.sendLocal(chatKey, agent ? `Session ${sessionId} status: ${agent.status}` : `Session ${sessionId} is not running.`)
       return
@@ -1174,8 +1219,8 @@ export class TelegramBridge {
     const text = renderForTier(rendered.text, this.channel.formatTier)
     const out: OutboundMessage =
       rendered.kind === 'choices'
-        ? { channel: 'telegram', chatKey: entry.chatKey, markdown: text, choices: rendered.choices, deliveryKey }
-        : { channel: 'telegram', chatKey: entry.chatKey, markdown: text, deliveryKey }
+        ? { channel: 'telegram', ...this.accountQualifier, chatKey: entry.chatKey, markdown: text, choices: rendered.choices, deliveryKey }
+        : { channel: 'telegram', ...this.accountQualifier, chatKey: entry.chatKey, markdown: text, deliveryKey }
 
     try {
       const receipt = await this.ctx.channels.deliver(out)

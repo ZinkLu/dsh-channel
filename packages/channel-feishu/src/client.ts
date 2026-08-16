@@ -1,4 +1,5 @@
 import { decodeFrame, encodeFrame } from './proto.js'
+import { proxiedFetch } from 'dsh-channel-kit'
 
 /**
  * Feishu / Lark Open API client + long-connection (WebSocket) inbound client.
@@ -22,6 +23,8 @@ export interface FeishuClientOptions {
   timeoutMs?: number
   /** Tenant token cache expiry threshold (seconds); defaults to renewing 300s ahead. */
   tokenRefreshAheadSec?: number
+  /** Outbound HTTP proxy (http://[user:pass@]host:port); wraps the fetch implementation. */
+  proxyUrl?: string
 }
 
 export class FeishuApiError extends Error {
@@ -62,7 +65,8 @@ export class FeishuClient {
 
   constructor(opts: FeishuClientOptions = {}) {
     this.domain = opts.domain ?? 'feishu'
-    this.fetchImpl = opts.fetch ?? fetch
+    const rawFetch = opts.fetch ?? fetch
+    this.fetchImpl = opts.proxyUrl ? proxiedFetch(opts.proxyUrl) : rawFetch
     this.timeoutMs = opts.timeoutMs ?? 30_000
     this.refreshAheadSec = opts.tokenRefreshAheadSec ?? 300
   }
@@ -455,6 +459,7 @@ export interface FeishuMessageEvent {
     content?: string
     create_time?: string
     mentions?: unknown[]
+    parent_id?: string
   }
 }
 

@@ -125,6 +125,56 @@ test('bridge rejects non-allowlisted sender', async () => {
   assert.ok(sent.some((text) => text.includes('You are not authorized to use this bot')))
 })
 
+test('bridge observes inbound replyToMessageId from parent_id', async () => {
+  const root = new Context()
+  new ChannelRegistry(root)
+
+  const followed: RecordedUserMessage[] = []
+  const fakeAgent = {
+    id: 'channel:feishu:oc_chat1',
+    status: 'idle' as const,
+    session: { events: [] as any[] },
+    followup(message: any) { followed.push({ text: messageTextFromContent(message), source: message.source }) },
+    steer(message: any) { followed.push({ text: messageTextFromContent(message), source: message.source }) },
+  }
+  root.provide('agents', {
+    list: () => [],
+    get: () => undefined,
+    resume: async () => { throw new Error('no persistence') },
+    create: async () => ({ agent: fakeAgent, dispose: async () => {} }),
+  })
+  root.provide('credentials', { resolve: async () => ({ value: 'x', source: 'test' }) })
+
+  const client = fakeClient()
+  const channel = new FeishuChannel({ client, resolveCredentials: async () => ({ appId: 'cli_a', appSecret: 'secret_b' }) })
+  root.channels.register(channel)
+  const bridge = new FeishuBridge(
+    root,
+    () => ({ allowedUserIds: ['ou_alice'], provider: 'deepseek-official', mergeWindowSec: 0.05, approvalTimeoutSec: 120 }),
+    createMemoryStore(),
+    channel,
+    client,
+  )
+
+  const emitted: any[] = []
+  root.on('channel/message', (msg) => { emitted.push(msg) })
+
+  await bridge.handleEvent(makeEvent({
+    message: {
+      message_id: 'om_100',
+      chat_id: 'oc_chat1',
+      chat_type: 'p2p',
+      message_type: 'text',
+      content: JSON.stringify({ text: 'hi' }),
+      create_time: '1700000000000',
+      parent_id: 'om_parent',
+    },
+  }))
+  await waitFor(() => emitted.length === 1)
+
+  assert.equal(emitted[0].replyToMessageId, 'om_parent')
+})
+
 function messageTextFromContent(message: any): string {
   return message.content?.map((block: any) => block.text ?? '').join('\n') ?? ''
 }

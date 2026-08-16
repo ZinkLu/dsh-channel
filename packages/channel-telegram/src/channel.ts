@@ -6,6 +6,8 @@ export interface TelegramChannelOptions {
   /** Re-resolve the token on every send; caching across operations is forbidden. */
   resolveToken: () => Promise<string | undefined>
   client: TelegramClient
+  /** Instance discriminator for multi-account deployments (default 'default'). */
+  accountId?: string
   /** Image attachment → bytes (the bridge layer wires ctx.attachments.readImage). */
   readImage?: (ref: ImageAttachmentRef) => Promise<Uint8Array>
   /** Document filePath (cwd-relative) → bytes + filename (the bridge layer anchors meta.cwd and validates against path escapes). */
@@ -15,10 +17,16 @@ export interface TelegramChannelOptions {
 export class TelegramChannel extends Channel {
   readonly id = 'telegram'
   private readonly opts: TelegramChannelOptions
+  private readonly account: string
 
   constructor(opts: TelegramChannelOptions) {
     super()
     this.opts = opts
+    this.account = opts.accountId ?? 'default'
+  }
+
+  get accountId(): string {
+    return this.account
   }
 
   get maxMessageChars(): number | undefined {
@@ -58,6 +66,12 @@ export class TelegramChannel extends Channel {
     return true
   }
   get supportsReactions(): boolean {
+    return true
+  }
+  get supportsReply(): boolean {
+    return true
+  }
+  get supportsSilent(): boolean {
     return true
   }
 
@@ -105,7 +119,7 @@ export class TelegramChannel extends Channel {
   async send(
     chatKey: string,
     text: string,
-    opts?: { choices?: readonly OutboundChoice[]; signal?: AbortSignal },
+    opts?: { choices?: readonly OutboundChoice[]; signal?: AbortSignal; replyTo?: string; threadId?: string; silent?: boolean },
   ): Promise<{ platformMessageId: string }> {
     const token = await this.opts.resolveToken()
     if (!token) throw new Error('TELEGRAM_BOT_TOKEN is not configured')
@@ -122,13 +136,22 @@ export class TelegramChannel extends Channel {
           }
         : undefined
 
+    const sendOpts = {
+      parseMode: 'HTML' as const,
+      replyMarkup,
+      signal: opts?.signal,
+      replyTo: opts?.replyTo !== undefined ? Number(opts.replyTo) : undefined,
+      threadId: opts?.threadId !== undefined ? Number(opts.threadId) : undefined,
+      disableNotification: opts?.silent ?? false,
+    }
+
     // On HTML send failure, automatically degrade to plain text and retry once.
     try {
-      const sent = await this.opts.client.sendMessage(token, chatKey, text, { parseMode: 'HTML', replyMarkup, signal: opts?.signal })
+      const sent = await this.opts.client.sendMessage(token, chatKey, text, sendOpts)
       return { platformMessageId: String(sent.message_id) }
     } catch (htmlError) {
       const plain = plainTextFallback(text)
-      const sent = await this.opts.client.sendMessage(token, chatKey, plain, { replyMarkup, signal: opts?.signal })
+      const sent = await this.opts.client.sendMessage(token, chatKey, plain, { ...sendOpts, parseMode: undefined })
       return { platformMessageId: String(sent.message_id) }
     }
   }

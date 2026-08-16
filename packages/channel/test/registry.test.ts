@@ -169,3 +169,61 @@ test('channel/deliver waterfall can suppress and observe', async () => {
   assert.equal(sent.status, 'sent')
   assert.equal(observed.length, 2)
 })
+
+class AccountedChannel extends FakeChannel {
+  private readonly account: string
+  constructor(account: string) {
+    super()
+    this.account = account
+  }
+  get accountId(): string {
+    return this.account
+  }
+}
+
+test('ChannelRegistry allows multiple accounts of the same provider id', async () => {
+  const root = new Context()
+  new ChannelRegistry(root)
+  const prod = new AccountedChannel('prod')
+  const staging = new AccountedChannel('staging')
+  root.channels.register(prod)
+  root.channels.register(staging)
+
+  assert.equal(root.channels.get('fake', 'prod'), prod)
+  assert.equal(root.channels.get('fake', 'staging'), staging)
+  assert.equal(root.channels.get('fake'), undefined) // no 'default' instance registered
+  assert.equal(root.channels.list().length, 2)
+
+  // Deliver routes by accountId.
+  const receipt = await root.channels.deliver({ channel: 'fake', accountId: 'staging', chatKey: '7', markdown: 'hi', deliveryKey: 'k1' })
+  assert.equal(receipt.status, 'sent')
+  assert.deepEqual(staging.sent, ['7:hi'])
+  assert.equal(prod.sent.length, 0)
+})
+
+test('ChannelRegistry rejects a duplicate (id, accountId)', () => {
+  const root = new Context()
+  new ChannelRegistry(root)
+  root.channels.register(new AccountedChannel('prod'))
+  assert.throws(() => root.channels.register(new AccountedChannel('prod')), /already registered/)
+})
+
+test('ChannelRegistry.bindChatKey/chatKeyOf expose the proactive-push binding', () => {
+  const root = new Context()
+  new ChannelRegistry(root)
+  assert.equal(root.channels.chatKeyOf('sess-1'), undefined)
+  root.channels.bindChatKey('sess-1', 'telegram', '42', 'prod')
+  assert.deepEqual(root.channels.chatKeyOf('sess-1'), { channel: 'telegram', accountId: 'prod', chatKey: '42' })
+  // default account omits accountId from the binding
+  root.channels.bindChatKey('sess-2', 'telegram', '7')
+  assert.deepEqual(root.channels.chatKeyOf('sess-2'), { channel: 'telegram', chatKey: '7' })
+})
+
+test('presentation capability facts default conservatively and reconcile returns unknown', async () => {
+  const channel = new FakeChannel()
+  assert.equal(channel.supportsReply, false)
+  assert.equal(channel.supportsThreads, false)
+  assert.equal(channel.supportsSilent, false)
+  assert.equal(channel.supportsReconciliation, false)
+  assert.equal(await channel.reconcile('42', 'k1', 'hash'), 'unknown')
+})

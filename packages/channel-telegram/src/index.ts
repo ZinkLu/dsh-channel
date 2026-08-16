@@ -20,12 +20,14 @@ export type { TelegramConfig } from 'dsh-channel-config'
 export function resolveStatePath(config: TelegramConfig): string {
   if (config.statePath) return config.statePath
   const base = process.env.DSH_HOME ?? join(homedir(), '.dsh')
-  return join(base, 'channel-telegram', 'state.json')
+  // Multi-account: scope the ledger under the account id; the default account keeps the v1 path unchanged.
+  const dir = config.accountId && config.accountId !== 'default' ? join('channel-telegram', config.accountId) : 'channel-telegram'
+  return join(base, dir, 'state.json')
 }
 
 export function apply(ctx: Context, config: TelegramConfig) {
   const store = createJsonFileStore(resolveStatePath(config))
-  const client = new TelegramClient()
+  const client = new TelegramClient({ proxyUrl: config.proxyUrl })
   const cwd = config.cwd ?? process.cwd()
 
   // Settings seam: resolved value = schema defaults < base(config) < user document.
@@ -37,6 +39,7 @@ export function apply(ctx: Context, config: TelegramConfig) {
 
   const channel = new TelegramChannel({
     client,
+    accountId: config.accountId,
     resolveToken: async () => {
       const resolved = await ctx.credentials.resolve(credentialRef(CREDENTIAL_TELEGRAM_BOT_TOKEN))
       return resolved?.value

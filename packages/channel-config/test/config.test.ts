@@ -33,11 +33,11 @@ test('telegram allowlist is required and numeric-only', () => {
   assert.throws(() => schema({ allowedUserIds: ['not-a-number'] }))
 })
 
-test('wechat allowlist is string-based and accountId is optional', () => {
+test('wechat allowlist is string-based and platformAccountId is optional', () => {
   const schema = wechatConfigSchema()
   const resolved = schema({ allowedUserIds: ['ou_1'] })
   assert.deepEqual(resolved.allowedUserIds, ['ou_1'])
-  assert.equal(resolved.accountId, undefined)
+  assert.equal(resolved.platformAccountId, undefined)
   assert.equal(resolved.pollingTimeoutSec, 30)
   assert.throws(() => schema({ allowedUserIds: [12345] }))
 })
@@ -48,4 +48,15 @@ test('feishu domain defaults to feishu and rejects unknown values', () => {
   assert.equal(resolved.domain, 'feishu')
   assert.equal(schema({ allowedUserIds: ['ou_1'], domain: 'lark' }).domain, 'lark')
   assert.throws(() => schema({ allowedUserIds: ['ou_1'], domain: 'nope' }))
+})
+
+test('shared behavior schema carries accountId and proxyUrl (multi-account + deployment reach)', () => {
+  const schema = telegramConfigSchema()
+  const defaults = schema({ allowedUserIds: [1] })
+  assert.equal(defaults.accountId, undefined)
+  assert.equal(defaults.proxyUrl, undefined)
+
+  const configured = schema({ allowedUserIds: [1], accountId: 'prod', proxyUrl: 'http://proxy.local:3128' })
+  assert.equal(configured.accountId, 'prod')
+  assert.equal(configured.proxyUrl, 'http://proxy.local:3128')
 })

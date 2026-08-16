@@ -18,12 +18,14 @@ export type { FeishuConfig } from 'dsh-channel-config'
 export function resolveStatePath(config: FeishuConfig): string {
   if (config.statePath) return config.statePath
   const base = process.env.DSH_HOME ?? join(homedir(), '.dsh')
-  return join(base, 'channel-feishu', 'state.json')
+  // Multi-account: scope the ledger under the account id; the default account keeps the v1 path unchanged.
+  const dir = config.accountId && config.accountId !== 'default' ? join('channel-feishu', config.accountId) : 'channel-feishu'
+  return join(base, dir, 'state.json')
 }
 
 export function apply(ctx: Context, config: FeishuConfig) {
   const store = createJsonFileStore(resolveStatePath(config))
-  const client = new FeishuClient({ domain: config.domain })
+  const client = new FeishuClient({ domain: config.domain, proxyUrl: config.proxyUrl })
 
   // Settings seam: resolved value = schema defaults < base(config) < user document.
   let source: () => FeishuConfig = () => config
@@ -34,6 +36,7 @@ export function apply(ctx: Context, config: FeishuConfig) {
 
   const channel = new FeishuChannel({
     client,
+    accountId: config.accountId,
     resolveCredentials: async () => {
       const appId = await ctx.credentials.resolve(credentialRef(CREDENTIAL_FEISHU_APP_ID))
       const appSecret = await ctx.credentials.resolve(credentialRef(CREDENTIAL_FEISHU_APP_SECRET))

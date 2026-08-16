@@ -5,15 +5,23 @@ export interface FeishuChannelOptions {
   /** Re-resolve app credentials on every send; caching across operations is forbidden. */
   resolveCredentials: () => Promise<FeishuCredentials | undefined>
   client: FeishuClient
+  /** Instance discriminator for multi-account deployments (default 'default'). */
+  accountId?: string
 }
 
 export class FeishuChannel extends Channel {
   readonly id = 'feishu'
   private readonly opts: FeishuChannelOptions
+  private readonly account: string
 
   constructor(opts: FeishuChannelOptions) {
     super()
     this.opts = opts
+    this.account = opts.accountId ?? 'default'
+  }
+
+  get accountId(): string {
+    return this.account
   }
 
   // Feishu text messages are capped at 4096 chars (same as openclaw/mimiclaw).
@@ -54,6 +62,9 @@ export class FeishuChannel extends Channel {
   get supportsReactions(): boolean {
     return true
   }
+  get supportsReply(): boolean {
+    return true
+  }
 
   async react(chatKey: string, messageId: string, emoji: string): Promise<void> {
     const credentials = await this.opts.resolveCredentials()
@@ -65,13 +76,16 @@ export class FeishuChannel extends Channel {
   async send(
     chatKey: string,
     text: string,
-    opts?: { choices?: readonly OutboundChoice[]; signal?: AbortSignal },
+    opts?: { choices?: readonly OutboundChoice[]; signal?: AbortSignal; replyTo?: string; threadId?: string; silent?: boolean },
   ): Promise<{ platformMessageId: string }> {
     const credentials = await this.opts.resolveCredentials()
     if (!credentials) throw new Error('FEISHU_APP_ID / FEISHU_APP_SECRET are not configured')
 
     const token = await this.opts.client.getTenantAccessToken(credentials)
-    const messageId = await this.opts.client.sendMessage(token, chatKey, text, { signal: opts?.signal })
+    const messageId =
+      opts?.replyTo !== undefined
+        ? await this.opts.client.replyMessage(token, opts.replyTo, text, { signal: opts?.signal })
+        : await this.opts.client.sendMessage(token, chatKey, text, { signal: opts?.signal })
     return { platformMessageId: messageId }
   }
 }

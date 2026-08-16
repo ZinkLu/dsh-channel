@@ -29,6 +29,13 @@ test('unbound chat uses convention session id and create', () => {
   assert.deepEqual(route({ chatKey: 'chat2', text: 'hi', chatType: 'direct' }, ctx), { kind: 'route', sessionId: 'channel:telegram:chat2', create: true })
 })
 
+test('non-default account adds an account segment to the session id', () => {
+  const multi = { ...ctx, accountId: 'prod' }
+  assert.deepEqual(route({ chatKey: 'chat2', text: 'hi', chatType: 'direct' }, multi), { kind: 'route', sessionId: 'channel:telegram:prod:chat2', create: true })
+  // default account keeps the single-account session id byte-for-byte
+  assert.deepEqual(route({ chatKey: 'chat2', text: 'hi', chatType: 'direct' }, { ...ctx, accountId: 'default' }), { kind: 'route', sessionId: 'channel:telegram:chat2', create: true })
+})
+
 test('approval reply predicate routes to approval-reply', () => {
   const decision = route({ chatKey: 'chat1', text: '1', chatType: 'direct' }, ctx, {
     isApprovalReply: (text) => text === '1',
