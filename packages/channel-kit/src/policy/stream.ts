@@ -1,14 +1,19 @@
 /**
  * Streaming presentation reducer: fold session events into "presentation frames".
  *
- * Pure function (timers live outside, as in merge.ts): `streamReduce(state, input, caps, now)`
+ * Pure function (timers live outside, as in merge.ts): `streamReduce(state, input, caps, now, render)`
  * returns new state + frames. Frames are presentation intents (final/draft/draft-finalize/
- * arm-timer), executed by the bridge layer. Gating follows openclaw: in progress mode the
- * first tool event only arms a 1500ms timer, and the draft is created only when the timer
- * fires, so quick answers produce zero noise. block (text-chunk editing) v1 degrades to
+ * status-line/arm-timer), executed by the bridge layer. Gating follows openclaw: in progress
+ * mode the first tool event only arms a 1500ms timer, and the draft is created only when the
+ * timer fires, so quick answers produce zero noise. block (text-chunk editing) v1 degrades to
  * terminal-state delivery.
+ *
+ * `render` is the *injected* renderer set (tool-call line / tool-result line / thinking line).
+ * It is passed in from the `PresentationPolicy` at call time so a custom policy that overrides
+ * `renderToolCall`/`renderToolResult`/`renderThinking` actually takes effect — the reducer never
+ * reaches back to the module-level renderers when the caller supplies its own.
  */
-import { renderThinking, type ThinkingLevel } from './thinking.js'
+import { renderThinking, type ThinkingInput, type ThinkingLevel } from './thinking.js'
 import { formatToolLine, formatToolResultLine, resolveToolDisplay } from './tool-display.js'
 
 export interface StreamCaps {
@@ -16,6 +21,13 @@ export interface StreamCaps {
   supportsEdit: boolean
   supportsStatusText: boolean
   thinkingLevel: ThinkingLevel
+}
+
+/** The three presentation renders the reducer needs. A PresentationPolicy satisfies this. */
+export interface StreamRenderers {
+  renderToolCall(name: string, args: string): string
+  renderToolResult(name: string, result: { ok: boolean; durationMs?: number; summary?: string }): string
+  renderThinking(input: ThinkingInput, level: ThinkingLevel): string | null
 }
 
 export type StreamInput =
@@ -26,6 +38,7 @@ export type StreamInput =
   | { readonly kind: 'tool-result'; readonly callId: string; readonly name: string; readonly ok: boolean; readonly durationMs?: number; readonly summary?: string }
   | { readonly kind: 'text-delta'; readonly text: string }
   | { readonly kind: 'reasoning-delta'; readonly text: string }
+  | { readonly kind: 'reasoning-block'; readonly text: string }
   | { readonly kind: 'assistant-message'; readonly text: string }
   | { readonly kind: 'turn-end'; readonly reason: 'completed' | 'aborted' | 'blocked' | 'error' | 'max-tokens' | 'interrupted' }
   | { readonly kind: 'tick' }
@@ -35,6 +48,8 @@ export interface StreamState {
   readonly toolLines: readonly string[]
   readonly draftStarted: boolean
   readonly gateDeadline: number | undefined
+  /** Whether a thinking status line was already emitted this turn (coalesces the 'stream' tier). */
+  readonly thinkingShown: boolean
 }
 
 export const emptyStreamState: StreamState = {
@@ -42,6 +57,7 @@ export const emptyStreamState: StreamState = {
   toolLines: [],
   draftStarted: false,
   gateDeadline: undefined,
+  thinkingShown: false,
 }
 
 export type StreamFrame =
@@ -55,10 +71,23 @@ export type StreamFrame =
 const PROGRESS_GATE_MS = 1500
 const DRAFT_HEADER = 'Working…'
 
-export function streamReduce(state: StreamState, input: StreamInput, caps: StreamCaps, now: number): { state: StreamState; frames: StreamFrame[] } {
+/** The built-in renderers: tool-call/result → tool-display lines; thinking → placeholder. */
+export const defaultStreamRenderers: StreamRenderers = {
+  renderToolCall: renderToolCallLine,
+  renderToolResult: renderToolResultLine,
+  renderThinking,
+}
+
+export function streamReduce(
+  state: StreamState,
+  input: StreamInput,
+  caps: StreamCaps,
+  now: number,
+  render: StreamRenderers = defaultStreamRenderers,
+): { state: StreamState; frames: StreamFrame[] } {
   const mode = resolveMode(caps)
   if (mode === 'off') return reduceOff(state, input)
-  return reduceProgress(state, input, caps, now)
+  return reduceProgress(state, input, caps, now, render)
 }
 
 function resolveMode(caps: StreamCaps): 'off' | 'progress' {
@@ -70,19 +99,24 @@ function resolveMode(caps: StreamCaps): 'off' | 'progress' {
 
 function reduceOff(state: StreamState, input: StreamInput): { state: StreamState; frames: StreamFrame[] } {
   if (input.kind === 'assistant-message') {
-    return { state: { ...state, bufferedText: '' }, frames: [{ kind: 'final', text: input.text }] }
+    return { state: { ...state, bufferedText: '', thinkingShown: false }, frames: [{ kind: 'final', text: input.text }] }
   }
   return { state, frames: [{ kind: 'noop' }] }
 }
 
-function reduceProgress(state: StreamState, input: StreamInput, caps: StreamCaps, now: number): { state: StreamState; frames: StreamFrame[] } {
+function reduceProgress(
+  state: StreamState,
+  input: StreamInput,
+  caps: StreamCaps,
+  now: number,
+  render: StreamRenderers,
+): { state: StreamState; frames: StreamFrame[] } {
   switch (input.kind) {
     case 'turn-start':
-      return { state: { bufferedText: '', toolLines: [], draftStarted: false, gateDeadline: undefined }, frames: [{ kind: 'noop' }] }
+      return { state: { bufferedText: '', toolLines: [], draftStarted: false, gateDeadline: undefined, thinkingShown: false }, frames: [{ kind: 'noop' }] }
 
     case 'tool-call': {
-      const display = resolveToolDisplay(input.name, input.arguments)
-      const line = formatToolLine(display, { detailMode: 'compact', commandText: 'status', maxDetailChars: 40 })
+      const line = render.renderToolCall(input.name, input.arguments)
       const toolLines = [...state.toolLines, line]
       if (state.draftStarted) {
         return { state: { ...state, toolLines }, frames: [{ kind: 'draft', text: composeDraft(toolLines) }] }
@@ -96,7 +130,7 @@ function reduceProgress(state: StreamState, input: StreamInput, caps: StreamCaps
 
     case 'tool-result': {
       if (!state.draftStarted) return { state, frames: [{ kind: 'noop' }] }
-      const line = formatToolResultLine(input.name, { ok: input.ok, durationMs: input.durationMs, summary: input.summary })
+      const line = render.renderToolResult(input.name, { ok: input.ok, durationMs: input.durationMs, summary: input.summary })
       const toolLines = [...state.toolLines, line]
       return { state: { ...state, toolLines }, frames: [{ kind: 'draft', text: composeDraft(toolLines) }] }
     }
@@ -105,11 +139,11 @@ function reduceProgress(state: StreamState, input: StreamInput, caps: StreamCaps
       const frames: StreamFrame[] = []
       if (state.draftStarted) frames.push({ kind: 'draft-finalize' })
       frames.push({ kind: 'final', text: input.text })
-      return { state: { bufferedText: '', toolLines: [], draftStarted: false, gateDeadline: undefined }, frames }
+      return { state: { bufferedText: '', toolLines: [], draftStarted: false, gateDeadline: undefined, thinkingShown: false }, frames }
     }
 
     case 'turn-end': {
-      const next = { bufferedText: '', toolLines: [], draftStarted: false, gateDeadline: undefined }
+      const next = { bufferedText: '', toolLines: [], draftStarted: false, gateDeadline: undefined, thinkingShown: false }
       return state.draftStarted ? { state: next, frames: [{ kind: 'draft-finalize' }] } : { state: next, frames: [{ kind: 'noop' }] }
     }
 
@@ -124,9 +158,13 @@ function reduceProgress(state: StreamState, input: StreamInput, caps: StreamCaps
     case 'text-delta':
       return { state: { ...state, bufferedText: state.bufferedText + input.text }, frames: [{ kind: 'noop' }] }
 
-    case 'reasoning-delta': {
-      const line = renderThinking({ kind: 'delta', text: input.text }, caps.thinkingLevel)
-      return line === null ? { state, frames: [{ kind: 'noop' }] } : { state, frames: [{ kind: 'status-line', text: line }] }
+    case 'reasoning-delta':
+    case 'reasoning-block': {
+      // Coalesce: only one thinking status line per turn (a 'stream' tier would otherwise spam identical bubbles).
+      if (state.thinkingShown) return { state, frames: [{ kind: 'noop' }] }
+      const line = render.renderThinking({ kind: input.kind === 'reasoning-block' ? 'block' : 'delta', text: input.text }, caps.thinkingLevel)
+      if (line === null) return { state, frames: [{ kind: 'noop' }] }
+      return { state: { ...state, thinkingShown: true }, frames: [{ kind: 'status-line', text: line }] }
     }
 
     case 'step-start':
@@ -137,4 +175,13 @@ function reduceProgress(state: StreamState, input: StreamInput, caps: StreamCaps
 
 function composeDraft(lines: readonly string[]): string {
   return [DRAFT_HEADER, ...lines].join('\n')
+}
+
+function renderToolCallLine(name: string, args: string): string {
+  const display = resolveToolDisplay(name, args)
+  return formatToolLine(display, { detailMode: 'compact', commandText: 'status', maxDetailChars: 40 })
+}
+
+function renderToolResultLine(name: string, result: { ok: boolean; durationMs?: number; summary?: string }): string {
+  return formatToolResultLine(name, { ok: result.ok, durationMs: result.durationMs, summary: result.summary })
 }

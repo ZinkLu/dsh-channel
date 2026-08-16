@@ -38,7 +38,7 @@ export interface RecoveryPolicy {
 }
 
 export type RecoveryAction =
-  | { readonly kind: 'resend'; readonly item: RecoverableDelivery; readonly marker?: string }
+  | { readonly kind: 'resend'; readonly item: RecoverableDelivery; readonly marker?: string; readonly text: string; readonly origin: { sessionId: string; seq: number } }
   | { readonly kind: 'skip'; readonly item: RecoverableDelivery; readonly reason: string }
   | { readonly kind: 'abandon'; readonly item: RecoverableDelivery; readonly reason: string }
 
@@ -74,7 +74,7 @@ export const defaultRecoveryPolicy: RecoveryPolicy = {
         }
       }
       const marker = item.state === 'pending' ? '' : '(resumed resend, may duplicate)\n'
-      actions.push({ kind: 'resend', item, marker })
+      actions.push({ kind: 'resend', item, marker, text, origin: { sessionId, seq } })
     }
     return actions
   },

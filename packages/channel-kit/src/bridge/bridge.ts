@@ -37,7 +37,7 @@ import {
   type PresentationPolicy,
 } from '../policy/presentation.js'
 import { parsePromptReply, renderPrompt, type PendingPrompt, type PromptOptions } from '../policy/prompt-render.js'
-import { defaultRecoveryPolicy, hashText, splitDeliveryKey, type RecoveryPolicy } from '../policy/recovery.js'
+import { defaultRecoveryPolicy, hashText, type RecoveryPolicy } from '../policy/recovery.js'
 import { route, type RouteDecision } from '../policy/router.js'
 import { emptyStreamState, type StreamFrame, type StreamInput, type StreamState } from '../policy/stream.js'
 import type { ChannelStore } from './store.js'
@@ -256,9 +256,8 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     this.ctx.channels.bindChatKey(sessionId, this.channel.id, chatKey, this.channel.accountId)
   }
 
-  /** Whether the sender is allowlisted (platform-specific id type). */
-  protected isAllowed(_senderId: string): boolean {
-    return true
+  private warn(message: string): void {
+    this.ctx.logger(`dsh-channel-${this.channel.id}`).warn(message)
   }
 
   // ---- startup recovery ----
@@ -316,15 +315,13 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
         this.store.markFailed(action.item.key, action.reason)
         continue
       }
-      const { sessionId, seq } = splitDeliveryKey(action.item.key)
-      if (sessionId === undefined || seq === undefined) {
-        this.store.markFailed(action.item.key, `recovery: cannot parse delivery key ${action.item.key}`)
+      if (action.text === '') {
+        this.store.markFailed(action.item.key, `recovery: empty assistant text ${action.item.key}`)
         continue
       }
-      const text = this.resolveAssistantText(sessionId, seq)
       try {
-        await this.sendOutbound(action.item.chatKey, (action.marker ?? '') + text, action.item.key, {
-          origin: { sessionId, seq },
+        await this.sendOutbound(action.item.chatKey, (action.marker ?? '') + action.text, action.item.key, {
+          origin: action.origin,
           recover: action.item.state,
         })
       } catch (error) {
@@ -651,10 +648,11 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     entry?: PromptEntry,
   ): Promise<void> {
     const text = renderForTier(rendered.text, this.channel.formatTier)
+    const deliveryKey = entry !== undefined ? `prompt:${entry.requestId}` : `prompt:${chatKey}:${Date.now()}`
     const out: OutboundMessage =
       rendered.kind === 'choices'
-        ? { channel: this.channel.id, ...this.accountQualifier, chatKey, markdown: text, choices: rendered.choices.map((c) => ({ id: c.id, label: c.label })), deliveryKey: `prompt:${chatKey}:${Date.now()}` }
-        : { channel: this.channel.id, ...this.accountQualifier, chatKey, markdown: text, deliveryKey: `prompt:${chatKey}:${Date.now()}` }
+        ? { channel: this.channel.id, ...this.accountQualifier, chatKey, markdown: text, choices: rendered.choices.map((c) => ({ id: c.id, label: c.label })), deliveryKey }
+        : { channel: this.channel.id, ...this.accountQualifier, chatKey, markdown: text, deliveryKey }
     try {
       const receipt = await this.ctx.channels.deliver(out)
       const platformId = receipt.platformMessageIds?.[0]
@@ -670,9 +668,13 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     const chatKey = this.sessionChatKeys.get(session.id)
     if (!chatKey) return
 
-    const input = this.presentation.project({ type: event.type, seq: event.seq, data: event.data }, (callId) => this.toolCallNames.get(callId))
-    if (input === null) return
+    const inputs = this.presentation.project({ type: event.type, seq: event.seq, data: event.data }, (callId) => this.toolCallNames.get(callId))
+    for (const input of inputs) {
+      this.handleStreamInput(session.id, chatKey, input, event.seq)
+    }
+  }
 
+  private handleStreamInput(sessionId: string, chatKey: string, input: StreamInput, seq: number): void {
     switch (input.kind) {
       case 'turn-start':
         void this.onTurnStart(chatKey).catch(() => {})
@@ -695,11 +697,12 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
       case 'step-end':
       case 'text-delta':
       case 'reasoning-delta':
+      case 'reasoning-block':
         break
     }
 
-    const deliveryCtx = input.kind === 'assistant-message' ? { seq: event.seq } : undefined
-    this.feedStream(session.id, chatKey, input, deliveryCtx)
+    const deliveryCtx = input.kind === 'assistant-message' ? { seq } : undefined
+    this.feedStream(sessionId, chatKey, input, deliveryCtx)
   }
 
   private streamCaps() {
@@ -714,7 +717,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
   private feedStream(sessionId: string, chatKey: string, input: StreamInput, deliveryCtx?: { seq?: number }): void {
     if (input.kind !== 'tick') this.clearStreamTimer(sessionId)
     const state = this.streamStates.get(sessionId) ?? emptyStreamState
-    const result = this.presentation.reduce(state, input, this.streamCaps(), Date.now())
+    const result = this.presentation.reduce(state, input, this.streamCaps(), Date.now(), this.presentation)
     this.streamStates.set(sessionId, result.state)
     for (const frame of result.frames) this.executeStreamFrame(sessionId, chatKey, frame, deliveryCtx)
   }
@@ -730,7 +733,9 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
         return
       }
       case 'draft':
-        void this.showDraft(chatKey, sessionId, frame.text).catch(() => {})
+        void this.showDraft(chatKey, sessionId, frame.text).catch((error: unknown) => {
+          this.warn(`draft presentation failed: ${error instanceof Error ? error.message : String(error)}`)
+        })
         return
       case 'draft-finalize':
         void this.finalizeDraft(chatKey, sessionId).catch(() => {})
@@ -750,8 +755,9 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     this.draftMessageIds.delete(sessionId)
     try {
       await this.deleteDraft(chatKey, String(existing))
-    } catch {
+    } catch (error) {
       // Draft deletion is best-effort; the final answer is already sent separately.
+      this.warn(`draft finalize failed: ${error instanceof Error ? error.message : String(error)}`)
     }
     this.ctx.emit('channel/present', { kind: 'draft-finalize', channel: this.channel.id, chatKey, draftKey: `draft:${sessionId}` } satisfies PresentationFrame)
   }

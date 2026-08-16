@@ -53,9 +53,6 @@ export class TelegramChannel extends Channel {
   get supportsStatusText(): boolean {
     return false
   }
-  get supportsThinking(): boolean {
-    return false
-  }
   get presentationLimits(): PresentationLimits {
     return { maxValueBytes: 64 }
   }

@@ -54,9 +54,6 @@ export class WeChatChannel extends Channel {
   get supportsStatusText(): boolean {
     return false
   }
-  get supportsThinking(): boolean {
-    return false
-  }
   get supportsMultiSelect(): boolean {
     return false
   }
