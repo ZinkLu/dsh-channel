@@ -19,7 +19,7 @@ against the rc.6 source), and [docs/dsh-core-alignment-audit.md](./docs/dsh-core
 | Package | Directory | Description |
 |---|---|---|
 | `dsh-channel` | `packages/channel` | Contract package: `ctx.channels` registry (multi-account via `accountId`), `Channel` abstract base class, `channel/*` event vocabulary, `MessageSourceMap.channel` merging, proactive-push binding (`chatKeyOf`) |
-| `dsh-channel-kit` | `packages/channel-kit` | Pure-function library: chunk / merge / router / approval-render / store / format / prompt-render / stream / deliver-queue (retry + backpressure) / media-limit / http-proxy (outbound proxy transport) |
+| `dsh-channel-kit` | `packages/channel-kit` | `ChannelBridge`, the shared handler (inbound pipeline, session-event → presentation frames, deliver queue, startup recovery, approval/prompt broker) over a pure-function library: `format/` (chunk, format, prompt-hint, media-limit, http-proxy), `policy/` (merge, router, stream, busy, deliver-queue, recovery, finalization, approval/prompt render, …), plus a `testing/` conformance suite each provider installs |
 | `dsh-channel-config` | `packages/channel-config` | Shared channel configuration: agent-routing/behavior/allowlist schema constructors, credential refs, and settings namespaces |
 | `dsh-channel-telegram` | `packages/channel-telegram` | First provider: Telegram long polling, HTML rendering, inline-keyboard approval, delivery ledger, reactions, inbound media size cap, reply/thread/silent delivery |
 | `dsh-channel-wechat` | `packages/channel-wechat` | WeChat (iLink Bot API): long polling, markdown pass-through, numbered-text approval |
@@ -31,9 +31,9 @@ against the rc.6 source), and [docs/dsh-core-alignment-audit.md](./docs/dsh-core
 
 ```bash
 npm install          # install workspace dependencies
-npm run build -ws    # build all six packages into each package's lib/
-npm run test -ws     # run all tests
-npm run typecheck -ws
+npm run build        # build all six packages into each package's lib/ (dependency order)
+npm run test         # build, then run all tests
+npm run typecheck
 ```
 
 You can also operate on a single package:
@@ -105,7 +105,7 @@ npm run test -w dsh-channel-feishu
 The repo ships a dev echo bot for verifying the Telegram send/receive path without a full dsh host:
 
 ```bash
-npm run build -ws
+npm run build
 TELEGRAM_BOT_TOKEN='...' node scripts/run-echo-bot.mjs
 ```
 
@@ -181,7 +181,7 @@ DeepSeek Harness (dsh) 的消息渠道公共层与多个 provider 实现（Teleg
 | 包 | 目录 | 说明 |
 |---|---|---|
 | `dsh-channel` | `packages/channel` | 契约包：`ctx.channels` 注册表（`accountId` 多账号）、`Channel` 抽象基类、`channel/*` 事件词汇表、`MessageSourceMap.channel` 归并、主动推送绑定（`chatKeyOf`） |
-| `dsh-channel-kit` | `packages/channel-kit` | 纯函数库：chunk / merge / router / approval-render / store / format / prompt-render / stream / deliver-queue（重试 + 背压）/ media-limit / http-proxy（出站代理传输） |
+| `dsh-channel-kit` | `packages/channel-kit` | `ChannelBridge` 共享 handler（入站流水线、session 事件 → 展示帧、投递队列、启动恢复、审批/追问 broker），其下是纯函数库：`format/`（chunk、format、prompt-hint、media-limit、http-proxy）、`policy/`（merge、router、stream、busy、deliver-queue、recovery、finalization、审批/追问渲染……），以及各 provider 安装的 `testing/` 一致性测试套件 |
 | `dsh-channel-config` | `packages/channel-config` | 共享渠道配置：agent 路由/行为/allowlist schema 构造器、凭证 ref、settings 命名空间 |
 | `dsh-channel-telegram` | `packages/channel-telegram` | 第一个 provider：Telegram 长轮询、HTML 渲染、inline-keyboard 审批、delivery ledger、表情回应、入站媒体大小上限、回复/静默投递 |
 | `dsh-channel-wechat` | `packages/channel-wechat` | 微信（iLink Bot API）：长轮询、markdown 透传、编号文本审批 |
@@ -193,9 +193,9 @@ DeepSeek Harness (dsh) 的消息渠道公共层与多个 provider 实现（Teleg
 
 ```bash
 npm install          # 安装 workspace 依赖
-npm run build -ws    # 构建六个包到各包 lib/
-npm run test -ws     # 运行全部测试
-npm run typecheck -ws
+npm run build        # 按依赖顺序构建六个包到各包 lib/
+npm run test         # 先构建，再运行全部测试
+npm run typecheck
 ```
 
 也可以单独操作某个包：
@@ -266,7 +266,7 @@ npm run test -w dsh-channel-feishu
 仓库自带一个开发用 echo bot，用于不依赖完整 dsh 宿主时验证 Telegram 收发链路：
 
 ```bash
-npm run build -ws
+npm run build
 TELEGRAM_BOT_TOKEN='...' node scripts/run-echo-bot.mjs
 ```
 
