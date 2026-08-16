@@ -77,7 +77,6 @@ test('bridge routes an inbound p2p text event to the agent', async () => {
     () => ({ allowedUserIds: ['ou_alice'], provider: 'deepseek-official', mergeWindowSec: 0.05, approvalTimeoutSec: 120 }),
     createMemoryStore(),
     channel,
-    client,
   )
 
   const emitted: any[] = []
@@ -111,7 +110,6 @@ test('bridge rejects non-allowlisted sender', async () => {
     () => ({ allowedUserIds: ['ou_alice'], provider: 'deepseek-official', mergeWindowSec: 0.05, approvalTimeoutSec: 120 }),
     createMemoryStore(),
     channel,
-    client,
   )
 
   // Intercept deliver to observe outbound.
@@ -153,7 +151,6 @@ test('bridge observes inbound replyToMessageId from parent_id', async () => {
     () => ({ allowedUserIds: ['ou_alice'], provider: 'deepseek-official', mergeWindowSec: 0.05, approvalTimeoutSec: 120 }),
     createMemoryStore(),
     channel,
-    client,
   )
 
   const emitted: any[] = []

@@ -7,9 +7,10 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build --workspaces",
-    "test": "npm run test --workspaces",
-    "typecheck": "npm run typecheck --workspaces"
+    "//build": "Explicit order: --workspaces walks packages/ alphabetically, which puts channel-feishu ahead of the channel-kit it compiles against.",
+    "build": "npm run build -w dsh-channel -w dsh-channel-kit -w dsh-channel-config -w dsh-channel-telegram -w dsh-channel-wechat -w dsh-channel-feishu",
+    "test": "npm run build && npm run test --workspaces",
+    "typecheck": "npm run build && npm run typecheck --workspaces"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",

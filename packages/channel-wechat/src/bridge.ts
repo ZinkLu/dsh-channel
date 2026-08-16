@@ -119,67 +119,17 @@ export class WeChatBridge extends ChannelBridge<WeChatBridgeConfig> {
     // Self-message loopback guard (hermes: sender_id == account_id).
     if (!sender || sender === accountId || message.msg_type === 2) return
 
-    const chatType = chatTypeOf(message, accountId)
     const chatKey = toChatKey(message, accountId)
-    const messageId = String(message.message_id ?? message.client_id ?? '')
     if (!chatKey) return
 
-    // Group chats are not routed in v1, but facts are still emitted (usable for policy-plugin auditing).
-    if (chatType !== 'direct') {
-      this.ingest(message, chatKey, 'group')
-      return
-    }
-
-    if (!this.isAllowed(sender)) {
-      await this.sendLocal(chatKey, '⚠️ You are not authorized to use this bot.')
-      return
-    }
-
-    if (messageId) {
-      if (this.isOwnEcho(chatKey, messageId)) return
-      if (this.store.seenInbound(messageId)) return
-      this.store.markInbound(messageId, 'handling')
-    }
-
-    // context_token echo + typing ticket warm-up (hermes ContextTokenStore / _maybe_fetch_typing_ticket).
+    // context_token echo + typing ticket warm-up (hermes ContextTokenStore /
+    // _maybe_fetch_typing_ticket). Both are idempotent, so they run ahead of the
+    // shared pipeline's dedupe rather than needing a hook inside it.
     const contextToken = message.context_token
     if (contextToken) this.client.setContextToken(chatKey, contextToken)
     void this.warmTypingTicket(chatKey, contextToken)
 
-    // Approval/prompt answers take priority over merge/router (openclaw control-command iron rule).
-    const text = messageText(message)
-    if (await this.handleInboundReply(text)) {
-      if (messageId) this.store.markInbound(messageId, 'done')
-      return
-    }
-
-    const isCommand = text.trim().startsWith('/')
-
-    this.ingest(message, chatKey, 'direct')
-
-    if (isCommand) {
-      await this.flushBuffered(chatKey)
-      await this.handleCommand(text.trim(), chatKey)
-      if (messageId) this.store.markInbound(messageId, 'done')
-      return
-    }
-
-    if (hasMedia(message)) {
-      await this.flushBuffered(chatKey)
-      if (text.trim() !== '') {
-        await this.dispatchText(chatKey, text, [messageId].filter(Boolean), sender)
-      }
-      if (messageId) this.store.markInbound(messageId, 'done')
-      return
-    }
-
-    if (text.trim() === '') {
-      if (messageId) this.store.markInbound(messageId, 'done')
-      return
-    }
-
-    await this.mergeMessage(chatKey, text, messageId, sender)
-    if (messageId) this.store.markInbound(messageId, 'done')
+    await this.handleInbound(this.normalize(message, chatKey, accountId), message)
   }
 
   private async warmTypingTicket(chatKey: string, contextToken?: string): Promise<void> {
@@ -193,13 +143,14 @@ export class WeChatBridge extends ChannelBridge<WeChatBridgeConfig> {
     }
   }
 
-  private ingest(message: WeixinMessage, chatKey: string, chatType: 'direct' | 'group'): void {
-    const inbound: InboundMessage = {
+  /** iLink message → the platform-agnostic inbound shape. */
+  private normalize(message: WeixinMessage, chatKey: string, accountId: string): InboundMessage {
+    return {
       channel: 'wechat',
       chatKey,
       senderId: senderId(message),
       messageId: String(message.message_id ?? message.client_id ?? ''),
-      chatType,
+      chatType: chatTypeOf(message, accountId),
       text: messageText(message),
       timestamp: Date.now(),
       hasMedia: hasMedia(message),
@@ -207,7 +158,6 @@ export class WeChatBridge extends ChannelBridge<WeChatBridgeConfig> {
       // iLink messages carry no mention/at metadata, so group mentions are not observable here (unlike Telegram/Feishu).
       mentionsBot: false,
     }
-    this.ctx.channels.ingest(inbound)
   }
 }
 

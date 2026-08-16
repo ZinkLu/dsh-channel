@@ -47,7 +47,7 @@ export function apply(ctx: Context, config: FeishuConfig) {
 
   ctx.channels.register(channel)
 
-  const bridge = new FeishuBridge(ctx, () => source() as FeishuBridgeConfig, store, channel, client)
+  const bridge = new FeishuBridge(ctx, () => source() as FeishuBridgeConfig, store, channel)
   ctx.effect(async () => {
     await bridge.start()
     return async () => {

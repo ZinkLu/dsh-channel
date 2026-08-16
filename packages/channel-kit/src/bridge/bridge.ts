@@ -15,7 +15,7 @@ import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-user-approval'
 import type {} from '@deepseek-ai/dsh-system-prompt'
-import type { Channel, OutboundMessage, PresentationFrame, SendErrorKind } from 'dsh-channel'
+import type { Channel, InboundMessage, OutboundMessage, PresentationFrame, SendErrorKind } from 'dsh-channel'
 import { chunkText } from '../format/chunk.js'
 import { renderForTier } from '../format/format.js'
 import { promptHint } from '../format/prompt-hint.js'
@@ -272,6 +272,9 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
   protected abstract connect(): Promise<void>
   protected abstract disconnect(): Promise<void>
 
+  /** Whether this platform sender is on the configured allowlist (the security boundary; no permissive default). */
+  protected abstract isAllowed(senderId: string): boolean
+
   /** Download inbound images into model-visible attachment refs; default none (facts-only). */
   protected async downloadInboundImages(_message: unknown): Promise<ImageAttachmentRef[]> {
     return []
@@ -406,6 +409,84 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     const event = agent?.session.events[seq]
     if (!agent || !event || event.type !== 'assistant/message') return ''
     return assistantMessageText((event.data as { message?: unknown }).message)
+  }
+
+  // ---- inbound ----
+
+  /**
+   * The shared inbound pipeline. Providers normalize their transport payload
+   * into an `InboundMessage` and hand it here; the order below is the design's,
+   * not theirs to vary:
+   *
+   *   group drop → allowlist → echo suppression → dedupe → approval/prompt reply
+   *   → ingest → command → media → merge
+   *
+   * Two orderings are load-bearing. Approval/prompt answers are resolved *before*
+   * merge/router, so a "yes" can never queue behind the very turn that is blocked
+   * waiting for it (openclaw's control-command iron rule). And commands and media
+   * both flush the merge buffer first, so nothing is delayed by the debounce
+   * window or welded onto an attachment's batch.
+   *
+   * @param raw the untouched platform message, handed back to `downloadInboundImages`.
+   */
+  protected async handleInbound(inbound: InboundMessage, raw?: unknown): Promise<void> {
+    const { chatKey, senderId, messageId, text } = inbound
+
+    // v1 does not route group chats, but the fact is still broadcast so policy
+    // plugins can audit them (chatnode's stance on the prompt-injection surface).
+    if (inbound.chatType !== 'direct') {
+      this.ctx.channels.ingest(inbound)
+      return
+    }
+
+    if (!this.isAllowed(senderId)) {
+      await this.sendLocal(chatKey, '⚠️ You are not authorized to use this bot.')
+      return
+    }
+
+    if (messageId !== '') {
+      if (this.isOwnEcho(chatKey, messageId)) return
+      if (this.store.seenInbound(messageId)) return
+      this.store.markInbound(messageId, 'handling')
+    }
+
+    try {
+      await this.routeInbound(inbound, raw)
+      if (messageId !== '') this.store.markInbound(messageId, 'done')
+    } catch (error) {
+      // One unhandleable message must not tear down the transport loop; record
+      // the outcome so a webhook redelivery can tell "gave up" from "answered".
+      if (messageId !== '') this.store.markInbound(messageId, 'failed')
+      this.warn(`inbound handling failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  private async routeInbound(inbound: InboundMessage, raw: unknown): Promise<void> {
+    const { chatKey, senderId, messageId, text } = inbound
+    const messageIds = messageId !== '' ? [messageId] : []
+
+    if (await this.handleInboundReply(text)) return
+
+    this.ctx.channels.ingest(inbound)
+
+    const trimmed = text.trim()
+    if (trimmed.startsWith('/')) {
+      await this.flushBuffered(chatKey)
+      await this.handleCommand(trimmed, chatKey)
+      return
+    }
+
+    if (inbound.hasMedia) {
+      await this.flushBuffered(chatKey)
+      const images = await this.downloadInboundImages(raw)
+      if (trimmed !== '' || images.length > 0) {
+        await this.dispatchText(chatKey, text, messageIds, senderId, images)
+      }
+      return
+    }
+
+    if (trimmed === '') return
+    await this.mergeMessage(chatKey, text, messageId, senderId)
   }
 
   // ---- inbound merge ----

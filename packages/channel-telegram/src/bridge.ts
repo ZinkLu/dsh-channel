@@ -153,83 +153,28 @@ export class TelegramBridge extends ChannelBridge<TelegramBridgeConfig> {
   }
 
   private async processMessage(message: TelegramMessage): Promise<void> {
-    const chat = message.chat
-    const chatKey = toChatKey(chat)
-    const senderId = message.from ? String(message.from.id) : ''
+    // Self-message filtering to prevent loopback (this also drops other bots, which v1 does not route).
     if (message.from?.is_bot) return
-
-    if (chat.type !== 'private') {
-      // v1 group chats are not routed, but facts are still ingested (usable for policy-plugin auditing).
-      // Everything non-private (group/supergroup/channel) is a group fact here.
-      this.ingest(chatKey, senderId, message, 'group')
-      return
-    }
-
-    if (!this.isAllowed(senderId)) {
-      await this.sendLocal(chatKey, '⚠️ You are not authorized to use this bot.')
-      return
-    }
-
-    const messageId = String(message.message_id)
-    if (this.isOwnEcho(chatKey, messageId)) return
-    if (this.store.seenInbound(messageId)) return
-    this.store.markInbound(messageId, 'handling')
-
-    // Approval/prompt replies take priority over merge/router (openclaw control-command iron rule).
-    if (await this.handleInboundReply(messageText(message))) {
-      this.store.markInbound(messageId, 'done')
-      return
-    }
-
-    const text = messageText(message)
-    const isCommand = text.trim().startsWith('/')
-
-    this.ingest(chatKey, senderId, message, 'direct')
-
-    if (isCommand) {
-      await this.flushBuffered(chatKey)
-      await this.handleCommand(text.trim(), chatKey)
-      this.store.markInbound(messageId, 'done')
-      return
-    }
-
-    if (hasMedia(message)) {
-      await this.flushBuffered(chatKey)
-      // Download images → saveImage → model-visible image block; other media only carry fileRef facts (not downloaded).
-      const images = await this.downloadInboundImages(message)
-      if (text.trim() !== '' || images.length > 0) {
-        await this.dispatchText(chatKey, text, [messageId], senderId, images)
-      }
-      this.store.markInbound(messageId, 'done')
-      return
-    }
-
-    if (text.trim() === '') {
-      this.store.markInbound(messageId, 'done')
-      return
-    }
-
-    await this.mergeMessage(chatKey, text, messageId, senderId)
-    this.store.markInbound(messageId, 'done')
+    await this.handleInbound(this.normalize(message), message)
   }
 
-  private ingest(chatKey: string, senderId: string, message: TelegramMessage, chatType: 'direct' | 'group'): void {
-    const media = mediaFacts(message)
-    const inbound: InboundMessage = {
+  /** Telegram update → the platform-agnostic inbound shape. */
+  private normalize(message: TelegramMessage): InboundMessage {
+    return {
       channel: 'telegram',
-      chatKey,
-      senderId,
+      chatKey: toChatKey(message.chat),
+      senderId: message.from ? String(message.from.id) : '',
       senderName: senderName(message.from),
       messageId: String(message.message_id),
-      chatType,
+      // Everything non-private (group/supergroup/channel) is a group fact.
+      chatType: message.chat.type === 'private' ? 'direct' : 'group',
       text: messageText(message),
       timestamp: message.date * 1000,
       hasMedia: hasMedia(message),
-      media,
+      media: mediaFacts(message),
       mentionsBot: mentionsBotOf(message, this.botIdentity),
       replyToMessageId: message.reply_to_message ? String(message.reply_to_message.message_id) : undefined,
     }
-    this.ctx.channels.ingest(inbound)
   }
 
   /** Download inbound images and store via `ctx.attachments.saveImage` (visible to the model); missing/failure degrades to fileRef facts. */
