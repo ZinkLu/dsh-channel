@@ -1,5 +1,10 @@
 # Hermes-Agent Channel-Facing Capabilities — Source-Grounded Report
 
+> **ARCHIVED — raw research on a third-party codebase, kept for provenance.** Its transferable
+> conclusions are in `../../dsh-channel-design.md` §1.4 and the two archived roadmaps; what was
+> deliberately *not* taken from hermes is in `../dsh-channel-backlog.md` §3.1. Line numbers refer
+> to a 2026-08 snapshot of `NousResearch/hermes-agent@main` and have almost certainly drifted.
+
 > Research target: `NousResearch/hermes-agent` @ `main` (tree SHA `c896c09c42910c584c4c7d2325b58c14713ea42c`).
 > Purpose: port the ideas into a TypeScript "dsh-channel" abstraction layer using the **capability-fact + graceful-degradation** pattern.
 >

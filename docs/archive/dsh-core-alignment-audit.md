@@ -1,5 +1,11 @@
 # dsh-channel design alignment check (against the rc.6 source)
 
+> **ARCHIVED — a completed one-time verification.** Its conclusions (all aligned, two refinements)
+> are folded into `../dsh-core-reference.md` §8; this file is kept for the per-item rc.6 source
+> line numbers behind them. §4's three precision points have all landed in code
+> (`createUserMessage` is used at `packages/channel-kit/src/bridge/bridge.ts:697`). Re-run this
+> check if the pinned dsh version moves off rc.6.
+
 > Checked against: every concrete assertion about the dsh core API in `dsh-channel-design.md`
 > §1.1/§1.2 and R1–R10 (originally in the handoff, now merged into design §6).
 > Baseline: `@deepseek-ai/*@0.1.0-rc.6` compiled types

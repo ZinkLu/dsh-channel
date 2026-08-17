@@ -1,5 +1,11 @@
 # dsh-channel Capability Gap Analysis & Roadmap
 
+> **ARCHIVED — historical record, not a plan.** M7–M10 all shipped; this document describes work
+> that is done. Do not write code from it: the tree is authoritative, and §7.1 already notes where
+> the implementation deliberately diverged from the shapes proposed here. What is still open or
+> deliberately rejected has moved to `../dsh-channel-backlog.md`; the architecture it fed into is
+> in `../../dsh-channel-design.md` §12.
+
 > Status: implemented through M10 (M7 hardening shipped; M8 delivery & identity, M9 presentation extras,
 > M10 deployment reach shipped) · Date: 2026-08-16 · Last updated: 2026-08-16 (M8–M10 landed)
 > Upstream: `dsh-channel-design.md` (architecture and contracts; R1–R10 in its §6/§7) ·

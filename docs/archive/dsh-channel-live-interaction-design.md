@@ -1,5 +1,11 @@
 # dsh-channel Interaction Capability Design: Streaming / Tools & Thinking / Offer Options / Processing Status
 
+> **ARCHIVED — historical record, not a plan.** Its own header below says "design draft, not
+> implementation"; that is stale. Streaming, thinking (as a three-level `thinkingLevel`, per §6 Q2),
+> tool display, the unified prompt renderer, and adaptive flood throttling (§6 Q8) all shipped in
+> M11–M14. §7's interface inventory is superseded by the real types in `packages/`. The questions
+> from §6 that are genuinely still unverified are carried in `../dsh-channel-backlog.md` §1.
+
 > Status: design draft (design only, not implementation) · Date: 2026-08-14
 > Upstream: `dsh-channel-design.md` (architecture and contracts; the R1–R10 hard constraints are in its §6/§7)
 > Research baseline: dsh rc.6 installed types (`node_modules/@deepseek-ai/*`) + dsh master source

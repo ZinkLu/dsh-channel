@@ -1,10 +1,15 @@
 # dsh-channel Mechanism Gap Analysis & Roadmap
 
+> **ARCHIVED — historical record, not a plan.** M11–M14 all shipped, and §10 is the audit that
+> reconciled the claims with the tree. Do not write code from it. What is still open or
+> deliberately rejected has moved to `../dsh-channel-backlog.md`; the architecture it fed into is
+> in `../../dsh-channel-design.md` §13.
+
 > Status: M11–M13 shipped, then audited against the tree — see §10 (M14) for what the audit
 > found and closed · Date: 2026-08-16 · Baseline: post-refactor `81a49e2` (ChannelBridge + policy seams)
 > Companion to: `dsh-channel-capability-roadmap.md` (capability *facts* — what the contract exposes; M7–M10
 > shipped) · this document covers capability *mechanisms* — how the shared layer behaves under
-> concurrency, failure, and recovery. · Architecture upstream: `docs/dsh-channel-policy-abstraction.md`
+> concurrency, failure, and recovery. · Architecture upstream: `dsh-channel-policy-abstraction.md`
 > Research baseline: `openclaw@bba57301` · `NousResearch/hermes-agent@56526bc0` (both cloned 2026-08-16,
 > implementation layer read directly — the prior pass mined only their capability vocabulary)
 

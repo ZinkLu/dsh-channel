@@ -639,12 +639,16 @@ Per T7's advice, **T7's interface-call checklist is listed in the first week of 
 | M5 | npm publish + `dsh-plugin` topic + awesome-dsh-plugin PR + an "add a new platform" tutorial (hermes's ADDING_A_PLATFORM is the style template: one table for the required surface, one for the optional surface, itemized degradation notes) | — |
 | M6 | Media (§10): contract adds `InboundMedia`/`OutboundMedia`/`supportsMedia`/`sendMedia`; Telegram `getFile` download + `sendPhoto`/`sendDocument` send | Image end-to-end (inbound lands in the log, outbound reachable) |
 | M7 ✅ | Capability hardening (§12): inbound media size cap, generic outbound retry/backpressure queue, `mentionsBot` fix, reaction-based ack; plus the configuration/settings seam (§11) | P0 hardening green; full suite (channel+kit+config+3 providers) passes |
-| M8–M10 ✅ | Capability reach: multi-account, reconciliation seam, reply/thread/silent delivery, pairing-login interface, outbound proxy (`docs/dsh-channel-capability-roadmap.md`) | Contract additive only; A5 re-checked |
-| M11–M14 ✅ | Mechanism hardening + the `ChannelBridge` handler layer (§13); M14 audits M11–M13 against the tree (`docs/dsh-channel-mechanism-roadmap.md` §10) | Conformance suite + capability proofs per provider; providers hold transport only |
+| M8–M10 ✅ | Capability reach: multi-account, reconciliation seam, reply/thread/silent delivery, pairing-login interface, outbound proxy (`docs/archive/dsh-channel-capability-roadmap.md`) | Contract additive only; A5 re-checked |
+| M11–M14 ✅ | Mechanism hardening + the `ChannelBridge` handler layer (§13); M14 audits M11–M13 against the tree (`docs/archive/dsh-channel-mechanism-roadmap.md` §10) | Conformance suite + capability proofs per provider; providers hold transport only |
 
 ---
 
 ## 9. Risks and Open Questions
+
+> The v1 design risks are below. The **live** list — what is still unverified, what is deferred and
+> on which trigger, and which designs were considered and rejected — is
+> `docs/dsh-channel-backlog.md`.
 
 | Risk / question | Handling |
 |---|---|
@@ -776,8 +780,9 @@ Host-side wiring is complete, but rc.6's apiproxy only exposes a hardcoded `WEB_
 
 ## 13. The `ChannelBridge` Handler Layer (M11–M14)
 
-> Status: shipped · Architecture: `docs/dsh-channel-policy-abstraction.md` · Mechanisms and the
-> post-M13 audit: `docs/dsh-channel-mechanism-roadmap.md` §10.
+> Status: shipped · Architecture: `docs/archive/dsh-channel-policy-abstraction.md` · Mechanisms and
+> the post-M13 audit: `docs/archive/dsh-channel-mechanism-roadmap.md` §10 (both archived — history,
+> not plans).
 
 §5.2/§5.3 describe the inbound and outbound orchestration as Telegram's. It is no longer:
 `dsh-channel-kit`'s `ChannelBridge` is that orchestration, written once, and the providers are

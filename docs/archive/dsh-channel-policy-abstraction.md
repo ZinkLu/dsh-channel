@@ -1,5 +1,10 @@
 # dsh-channel Handler & Policy Abstraction (slim)
 
+> **ARCHIVED — historical record, not a plan.** All five migration steps in §5 landed;
+> `ChannelBridge` and the two policy seams are shipped code. Read it for *why* the abstraction has
+> this shape, not for what it will look like. The non-goals in §4 are still binding and have been
+> restated in `../dsh-channel-backlog.md` §3.2.
+
 > Status: **implemented** · §5's five migration steps have all landed, most recently
 > step 3–4's inbound half: `ChannelBridge.handleInbound` now owns the pipeline the
 > three providers used to each carry a copy of. §3's hook list has been reconciled

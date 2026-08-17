@@ -13,8 +13,12 @@ Split into six packages per [dsh-channel-design.md](./dsh-channel-design.md).
 
 For the alignment baseline against dsh's own core/seam, see [docs/dsh-core-reference.md](./docs/dsh-core-reference.md)
 (full ctx seam/core table + core packages + lifecycle + tool pipeline + session log, checked line-by-line
-against the rc.6 source), and [docs/dsh-core-alignment-audit.md](./docs/dsh-core-alignment-audit.md)
-(point-by-point verification of the design doc against the dsh API).
+against the rc.6 source). What is deliberately *not* built — open questions, deferred work with its
+trigger, and designs considered and rejected — is in
+[docs/dsh-channel-backlog.md](./docs/dsh-channel-backlog.md).
+
+Those three plus this file are the live documents. `docs/archive/` holds the completed roadmaps and
+the original research they came from: accurate history, not plans — read the tree, not them.
 
 | Package | Directory | Description |
 |---|---|---|
@@ -174,9 +178,12 @@ DeepSeek Harness (dsh) 的消息渠道公共层与多个 provider 实现（Teleg
 按照 [dsh-channel-design.md](./dsh-channel-design.md) 拆为六个包。
 
 对 dsh 本身核心/seam 的对齐基线，见 [docs/dsh-core-reference.md](./docs/dsh-core-reference.md)
-（ctx seam/core 全表 + 核心包 + 生命周期 + 工具流水线 + 会话日志，逐条对照 rc.6 源码），
-以及 [docs/dsh-core-alignment-audit.md](./docs/dsh-core-alignment-audit.md)（设计文档对 dsh API
-的逐条核对结果）。
+（ctx seam/core 全表 + 核心包 + 生命周期 + 工具流水线 + 会话日志，逐条对照 rc.6 源码）。
+刻意**没有**做的部分——待验证的开放问题、带触发条件的延后项、以及已论证并否决的设计——见
+[docs/dsh-channel-backlog.md](./docs/dsh-channel-backlog.md)。
+
+这三份加本文件是活文档。`docs/archive/` 存放已交付的 roadmap 与其原始调研：是准确的历史，不是计划——
+以代码树为准，不要照着它们写码。
 
 | 包 | 目录 | 说明 |
 |---|---|---|
