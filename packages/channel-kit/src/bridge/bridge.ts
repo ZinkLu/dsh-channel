@@ -19,12 +19,12 @@ import type { Channel, InboundMessage, OutboundMessage, PresentationFrame, SendE
 import { chunkText } from '../format/chunk.js'
 import { renderForTier } from '../format/format.js'
 import { promptHint } from '../format/prompt-hint.js'
-import { parseApprovalReply, renderApproval, type PendingApproval } from '../policy/approval-render.js'
 import { resolveBusyAction, type BusyAction, type BusyMessageKind } from '../policy/busy.js'
 import {
   deliverQueueReduce,
   emptyDeliverQueueState,
   type DeliverQueueEffect,
+  type DeliverQueueInput,
   type DeliverQueueOptions,
   type DeliverQueueState,
   type QueuedDelivery,
@@ -36,14 +36,15 @@ import { emptyOutboundEchoState, outboundEchoReduce, type OutboundEchoState } fr
 import {
   assistantMessageText,
   defaultPresentationPolicy,
-  projectSessionEvent,
   turnEndLabel,
   type PresentationPolicy,
 } from '../policy/presentation.js'
-import { parsePromptReply, renderPrompt, type PendingPrompt, type PromptOptions } from '../policy/prompt-render.js'
+import type { PromptAnswer } from '../policy/prompt-render.js'
 import { chunkDeliveryKey, chunkIndexOf, defaultRecoveryPolicy, hashText, type RecoveryPolicy } from '../policy/recovery.js'
 import { route, type RouteDecision } from '../policy/router.js'
 import { emptyStreamState, type StreamFrame, type StreamInput, type StreamState } from '../policy/stream.js'
+import { InteractionBroker, type AskUserQuestionRequestLike, type AskUserQuestionAnswerLike } from './interaction-broker.js'
+import { KeyedTimers, settledWithin } from './timing.js'
 import type { ChannelStore } from './store.js'
 
 /** Common config surface the base handler reads; providers widen it with their own fields. */
@@ -90,20 +91,6 @@ interface BusyQueuedMessage {
   images: readonly ImageAttachmentRef[]
 }
 
-interface ApprovalEntry extends PendingApproval {
-  agentId: string
-  chatKey: string
-  timer?: NodeJS.Timeout
-  resolve?: (outcome: 'allowed-once' | 'rejected' | 'deferred') => void
-  messageId?: number
-}
-
-interface PromptEntry extends PendingPrompt {
-  chatKey: string
-  timer?: NodeJS.Timeout
-  messageId?: number
-}
-
 interface AgentPresetJoin {
   presetId?: string
   mount?: (agentCtx: Context) => Promise<void>
@@ -117,27 +104,7 @@ interface AgentPresetsLike {
 
 /** Minimal duck type of dsh-user-questions (optional dependency; the package is not imported). */
 interface UserQuestionsLike {
-  registerProvider(provider: UserQuestionProviderLike): () => void
-}
-interface UserQuestionProviderLike {
-  ask(request: AskUserQuestionRequestLike): Promise<AskUserQuestionAnswerLike>
-}
-interface AskUserQuestionRequestLike {
-  questions: AskUserQuestionItemLike[]
-  agent?: { id: string }
-  signal?: AbortSignal
-}
-interface AskUserQuestionItemLike {
-  id: string
-  question: string
-  detail?: string
-  header?: string
-  options?: Array<{ label: string; description?: string }>
-  multiSelect?: boolean
-  intent?: { kind: 'plan-review'; approve: string }
-}
-interface AskUserQuestionAnswerLike {
-  answers: Array<{ id: string; selected: string[]; custom?: string }>
+  registerProvider(provider: { ask(request: AskUserQuestionRequestLike): Promise<AskUserQuestionAnswerLike> }): () => void
 }
 
 export abstract class ChannelBridge<TCfg extends BridgeConfig> {
@@ -149,31 +116,30 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
 
   protected abstract readonly config: TCfg
 
+  private readonly broker: InteractionBroker
+
   private readonly mergeStates = new Map<string, MergeState>()
   private readonly mergeEntries = new Map<string, MergeEntry[]>()
-  private readonly mergeTimers = new Map<string, NodeJS.Timeout>()
+  private readonly mergeTimers = new KeyedTimers()
   private readonly sessionChatKeys = new Map<string, string>()
   private readonly ownedHandles = new Map<string, AgentHandle>()
-  private readonly pendingApprovals = new Map<number, ApprovalEntry>()
-  private readonly pendingPrompts = new Map<number, PromptEntry>()
   private readonly lastTypingAt = new Map<string, number>()
   private readonly streamStates = new Map<string, StreamState>()
-  private readonly streamTimers = new Map<string, NodeJS.Timeout>()
+  private readonly streamTimers = new KeyedTimers()
   private readonly draftThrottleStates = new Map<string, DraftThrottleState>()
-  private readonly draftThrottleTimers = new Map<string, NodeJS.Timeout>()
+  private readonly draftThrottleTimers = new KeyedTimers()
   /** Last draft text the platform *accepted*, per session — the append-tail baseline. */
   private readonly shownDraftText = new Map<string, string>()
   protected readonly draftMessageIds = new Map<string, number>()
   private readonly toolCallNames = new Map<string, string>()
   private readonly deliverQueueStates = new Map<string, DeliverQueueState<BridgeDelivery>>()
-  private readonly deliverQueueTimers = new Map<string, NodeJS.Timeout>()
+  private readonly deliverQueueTimers = new KeyedTimers()
   private readonly outboundEchoStates = new Map<string, OutboundEchoState>()
   private readonly busyQueues = new Map<string, BusyQueuedMessage[]>()
   private readonly sessionTurnTails = new Map<string, Promise<void>>()
   private readonly statusWaiters: Array<() => void> = []
   private readonly disposers: Array<() => void> = []
 
-  private promptSeq = 0
   private localSeq = 0
   private recoverPromise: Promise<void> | undefined
   private started = false
@@ -185,6 +151,14 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     this.store = store
     this.presentation = policies?.presentation ?? defaultPresentationPolicy
     this.recovery = policies?.recovery ?? defaultRecoveryPolicy
+    this.broker = new InteractionBroker({
+      channel,
+      timeoutMs: () => this.config.approvalTimeoutSec * 1000,
+      chatKeyForAgent: (agentId) => this.sessionChatKeys.get(agentId),
+      deliver: (out) => this.ctx.channels.deliver(out),
+      rememberOwnSends: (chatKey, ids) => this.rememberOwnSends(chatKey, ids),
+      accountQualifier: () => this.accountQualifier,
+    })
   }
 
   // ---- lifecycle ----
@@ -196,7 +170,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     this.disposers.push(this.ctx.on('session/event', (session: Session, event: SessionEvent) => {
       this.onSessionEvent(session, event)
     }))
-    this.disposers.push(this.ctx.on('approval/request', async (req, next) => this.onApprovalRequest(req, next)))
+    this.disposers.push(this.ctx.on('approval/request', async (req, next) => this.broker.handleApprovalRequest(req, next)))
     this.disposers.push(this.ctx.on('channel/status', (channelId: string, status: 'connecting' | 'connected' | 'disconnected' | 'fatal') => {
       if (channelId !== this.channel.id) return
       this.channelStatus = status
@@ -231,34 +205,21 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
       }
     }
 
-    for (const timer of this.mergeTimers.values()) clearTimeout(timer)
-    this.mergeTimers.clear()
-    for (const timer of this.streamTimers.values()) clearTimeout(timer)
-    this.streamTimers.clear()
+    this.mergeTimers.clearAll()
+    this.streamTimers.clearAll()
     this.streamStates.clear()
-    for (const timer of this.draftThrottleTimers.values()) clearTimeout(timer)
-    this.draftThrottleTimers.clear()
+    this.draftThrottleTimers.clearAll()
     this.draftThrottleStates.clear()
     this.shownDraftText.clear()
     this.draftMessageIds.clear()
     this.toolCallNames.clear()
-    for (const timer of this.deliverQueueTimers.values()) clearTimeout(timer)
-    this.deliverQueueTimers.clear()
+    this.deliverQueueTimers.clearAll()
     this.deliverQueueStates.clear()
     this.busyQueues.clear()
     this.sessionTurnTails.clear()
     this.outboundEchoStates.clear()
     for (const resolve of this.statusWaiters.splice(0)) resolve()
-    for (const entry of this.pendingApprovals.values()) {
-      if (entry.timer) clearTimeout(entry.timer)
-      entry.resolve?.('deferred')
-    }
-    this.pendingApprovals.clear()
-    for (const entry of this.pendingPrompts.values()) {
-      if (entry.timer) clearTimeout(entry.timer)
-      entry.resolve([], undefined)
-    }
-    this.pendingPrompts.clear()
+    this.broker.settleAll()
 
     for (const [sessionId, handle] of [...this.ownedHandles]) {
       try {
@@ -446,17 +407,17 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
    *
    * Two orderings are load-bearing. Approval/prompt answers are resolved *before*
    * merge/router, so a "yes" can never queue behind the very turn that is blocked
-   * waiting for it (openclaw's control-command iron rule). And commands and media
-   * both flush the merge buffer first, so nothing is delayed by the debounce
-   * window or welded onto an attachment's batch.
+   * waiting for it. And commands and media both flush the merge buffer first, so
+   * nothing is delayed by the debounce window or welded onto an attachment's batch.
    *
    * @param raw the untouched platform message, handed back to `downloadInboundImages`.
    */
   protected async handleInbound(inbound: InboundMessage, raw?: unknown): Promise<void> {
-    const { chatKey, senderId, messageId, text } = inbound
+    const { chatKey, senderId, messageId } = inbound
 
-    // v1 does not route group chats, but the fact is still broadcast so policy
-    // plugins can audit them (chatnode's stance on the prompt-injection surface).
+    // v1 does not route group chats (unclear ownership semantics + a large
+    // prompt-injection surface), but the fact is still broadcast so policy
+    // plugins can audit them.
     if (inbound.chatType !== 'direct') {
       this.ctx.channels.ingest(inbound)
       return
@@ -531,7 +492,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     this.mergeEntries.delete(chatKey)
     this.mergeStates.set(chatKey, emptyMergeState)
     this.store.setMergeBuffer(chatKey, [])
-    this.clearMergeTimer(chatKey)
+    this.mergeTimers.clear(chatKey)
     for (let i = 0; i < texts.length; i++) {
       await this.dispatchText(chatKey, texts[i]!, entries[i]?.messageIds ?? [], entries[i]?.senderId ?? '0')
     }
@@ -588,22 +549,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
   }
 
   private armMergeTimer(chatKey: string, at: number): void {
-    this.clearMergeTimer(chatKey)
-    const delay = Math.max(0, at - Date.now())
-    const timer = setTimeout(() => {
-      this.mergeTimers.delete(chatKey)
-      void this.onMergeTick(chatKey)
-    }, delay)
-    timer.unref?.()
-    this.mergeTimers.set(chatKey, timer)
-  }
-
-  private clearMergeTimer(chatKey: string): void {
-    const timer = this.mergeTimers.get(chatKey)
-    if (timer !== undefined) {
-      clearTimeout(timer)
-      this.mergeTimers.delete(chatKey)
-    }
+    this.mergeTimers.arm(chatKey, at, () => void this.onMergeTick(chatKey))
   }
 
   private async onMergeTick(chatKey: string): Promise<void> {
@@ -629,7 +575,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     const decision: RouteDecision = route(
       { chatKey, text, chatType: 'direct' },
       this.routeContext(),
-      { isApprovalReply: (value) => parseApprovalReply({ text: value }, [...this.pendingApprovals.values()]).kind === 'answer' },
+      { isApprovalReply: (value) => this.broker.isApprovalAnswer(value) },
     )
 
     if (decision.kind === 'drop') return
@@ -843,111 +789,9 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     const userQuestions = agentCtx.get('userQuestions') as UserQuestionsLike | undefined
     if (userQuestions === undefined) return
     try {
-      userQuestions.registerProvider({ ask: (request) => this.askUserQuestions(request) })
+      userQuestions.registerProvider({ ask: (request) => this.broker.ask(request) })
     } catch {
       // Single-slot conflict: this scope already has a provider; don't grab it, and don't block agent creation.
-    }
-  }
-
-  private async askUserQuestions(request: AskUserQuestionRequestLike): Promise<AskUserQuestionAnswerLike> {
-    const agentId = request.agent?.id
-    const chatKey = agentId !== undefined ? this.sessionChatKeys.get(agentId) : undefined
-    if (chatKey === undefined) return { answers: [] }
-
-    const answers: Array<{ id: string; selected: string[]; custom?: string }> = []
-    for (const question of request.questions) {
-      if (request.signal?.aborted) break
-      const num = ++this.promptSeq
-      const answer = await this.askQuestion(chatKey, num, question, request.signal)
-      answers.push({ id: question.id, selected: answer.selected, custom: answer.custom })
-    }
-    return { answers }
-  }
-
-  private askQuestion(
-    chatKey: string,
-    num: number,
-    question: AskUserQuestionItemLike,
-    signal?: AbortSignal,
-  ): Promise<{ selected: string[]; custom?: string }> {
-    const options = question.options?.map((option) => option.label) ?? []
-
-    let settle!: (selected: readonly string[], custom?: string) => void
-    const verdict = new Promise<{ selected: string[]; custom?: string }>((resolve) => {
-      settle = (selected, custom) => resolve({ selected: [...selected], custom })
-    })
-
-    const entry: PromptEntry = {
-      num,
-      requestId: `channel-${this.channel.id}:${Date.now()}:${num}`,
-      question: question.question,
-      detail: question.detail,
-      options,
-      multiSelect: question.multiSelect ?? false,
-      allowFreeText: true,
-      intent: question.intent,
-      expiresAt: Date.now() + this.config.approvalTimeoutSec * 1000,
-      resolve: (selected, custom) => settle(selected, custom),
-      chatKey,
-    }
-    this.pendingPrompts.set(num, entry)
-
-    const onAbort = () => {
-      this.pendingPrompts.delete(num)
-      if (entry.timer) clearTimeout(entry.timer)
-      settle([])
-    }
-    signal?.addEventListener('abort', onAbort, { once: true })
-
-    const rendered = renderPrompt(
-      {
-        num,
-        question: question.question,
-        detail: question.detail,
-        options,
-        multiSelect: question.multiSelect,
-        allowFreeText: true,
-        intent: question.intent,
-      },
-      this.promptCaps(),
-    )
-    void this.sendPromptRendered(chatKey, rendered, entry).catch(() => {})
-
-    entry.timer = setTimeout(() => {
-      this.pendingPrompts.delete(num)
-      settle([])
-    }, this.config.approvalTimeoutSec * 1000)
-    entry.timer.unref?.()
-
-    return verdict
-  }
-
-  private promptCaps(): PromptOptions {
-    return {
-      supportsChoices: this.channel.supportsChoices,
-      supportsMultiSelect: this.channel.supportsMultiSelect,
-      presentationLimits: this.channel.presentationLimits,
-    }
-  }
-
-  private async sendPromptRendered(
-    chatKey: string,
-    rendered: { kind: 'choices'; text: string; choices: ReadonlyArray<{ id: string; label: string }> } | { kind: 'text'; text: string },
-    entry?: PromptEntry,
-  ): Promise<void> {
-    const text = renderForTier(rendered.text, this.channel.formatTier)
-    const deliveryKey = entry !== undefined ? `prompt:${entry.requestId}` : `prompt:${chatKey}:${Date.now()}`
-    const out: OutboundMessage =
-      rendered.kind === 'choices'
-        ? { channel: this.channel.id, ...this.accountQualifier, chatKey, markdown: text, choices: rendered.choices.map((c) => ({ id: c.id, label: c.label })), deliveryKey }
-        : { channel: this.channel.id, ...this.accountQualifier, chatKey, markdown: text, deliveryKey }
-    try {
-      const receipt = await this.ctx.channels.deliver(out)
-      const platformId = receipt.platformMessageIds?.[0]
-      if (platformId && entry) entry.messageId = Number(platformId)
-      this.rememberOwnSends(chatKey, receipt.platformMessageIds ?? [])
-    } catch {
-      // Prompt send failed: the answerer fails closed after timeout (empty answer); never default to allowing.
     }
   }
 
@@ -1007,7 +851,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
   }
 
   private feedStream(sessionId: string, chatKey: string, input: StreamInput, deliveryCtx?: { seq?: number }): void {
-    if (input.kind !== 'tick') this.clearStreamTimer(sessionId)
+    if (input.kind !== 'tick') this.streamTimers.clear(sessionId)
     const state = this.streamStates.get(sessionId) ?? emptyStreamState
     const result = this.presentation.reduce(state, input, this.streamCaps(), Date.now(), this.presentation)
     this.streamStates.set(sessionId, result.state)
@@ -1034,7 +878,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
         this.sendLocal(chatKey, frame.text, { silent: this.channel.supportsSilent })
         return
       case 'arm-timer':
-        this.armStreamTimer(sessionId, chatKey, frame.at)
+        this.streamTimers.arm(sessionId, frame.at, () => this.feedStream(sessionId, chatKey, { kind: 'tick' }))
         return
     }
   }
@@ -1072,31 +916,8 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     this.ctx.emit('channel/present', { kind: 'draft-discard', channel: this.channel.id, chatKey, draftKey: `draft:${sessionId}` } satisfies PresentationFrame)
   }
 
-  private armStreamTimer(sessionId: string, chatKey: string, at: number): void {
-    this.clearStreamTimer(sessionId)
-    const delay = Math.max(0, at - Date.now())
-    const timer = setTimeout(() => {
-      this.streamTimers.delete(sessionId)
-      this.feedStream(sessionId, chatKey, { kind: 'tick' })
-    }, delay)
-    timer.unref?.()
-    this.streamTimers.set(sessionId, timer)
-  }
-
-  private clearStreamTimer(sessionId: string): void {
-    const timer = this.streamTimers.get(sessionId)
-    if (timer !== undefined) {
-      clearTimeout(timer)
-      this.streamTimers.delete(sessionId)
-    }
-  }
-
   private clearDraftThrottle(sessionId: string): void {
-    const timer = this.draftThrottleTimers.get(sessionId)
-    if (timer !== undefined) {
-      clearTimeout(timer)
-      this.draftThrottleTimers.delete(sessionId)
-    }
+    this.draftThrottleTimers.clear(sessionId)
     this.draftThrottleStates.delete(sessionId)
     this.shownDraftText.delete(sessionId)
   }
@@ -1109,15 +930,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     this.draftThrottleStates.set(sessionId, attempt.state)
 
     if (attempt.effect.kind === 'delay') {
-      const existing = this.draftThrottleTimers.get(sessionId)
-      if (existing !== undefined) clearTimeout(existing)
-      const delay = Math.max(0, attempt.effect.at - now)
-      const timer = setTimeout(() => {
-        this.draftThrottleTimers.delete(sessionId)
-        this.sendDraftThrottled(sessionId, chatKey, text)
-      }, delay)
-      timer.unref?.()
-      this.draftThrottleTimers.set(sessionId, timer)
+      this.draftThrottleTimers.arm(sessionId, attempt.effect.at, () => this.sendDraftThrottled(sessionId, chatKey, text))
       return
     }
 
@@ -1191,6 +1004,13 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     return result.matches
   }
 
+  /** Render for the platform tier and split into sendable chunks. */
+  private renderChunks(markdown: string): string[] {
+    const rendered = renderForTier(markdown, this.channel.formatTier)
+    const maxChars = this.channel.maxMessageChars ?? 4096
+    return chunkText(rendered, { maxChars, countBy: this.chunkCountBy })
+  }
+
   /**
    * Render → chunk → record in the ledger → hand to the deliver queue. Returns
    * once the chunks are enqueued, not once they are sent: the queue owns the
@@ -1202,9 +1022,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     deliveryKey: string,
     opts: { origin?: OutboundMessage['origin']; recover?: 'pending' | 'attempting' | 'failed' } = {},
   ): void {
-    const rendered = renderForTier(markdown, this.channel.formatTier)
-    const maxChars = this.channel.maxMessageChars ?? 4096
-    const chunks = chunkText(rendered, { maxChars, countBy: this.chunkCountBy })
+    const chunks = this.renderChunks(markdown)
 
     if (opts.recover) {
       // Recovery targets exactly one ledger entry, under its existing key. A
@@ -1224,7 +1042,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     }
   }
 
-  /** Chunk counting mode: Telegram counts UTF-16 code units; the default counts code points. */
+  /** Chunk counting mode: platforms that limit by UTF-16 code units override this. */
   protected get chunkCountBy(): 'codepoint' | 'utf16' {
     return 'codepoint'
   }
@@ -1235,11 +1053,16 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     return { maxRetries: 3, baseDelayMs: 1000, maxQueue: 32, spacingMs: 1000 }
   }
 
-  private enqueueDelivery(chatKey: string, item: QueuedDelivery<BridgeDelivery>): void {
+  /** The one reduce-and-run step every deliver-queue input goes through. */
+  private feedDeliverQueue(chatKey: string, input: DeliverQueueInput<BridgeDelivery>): void {
     const state = this.deliverQueueStates.get(chatKey) ?? emptyDeliverQueueState<BridgeDelivery>()
-    const result = deliverQueueReduce(state, { kind: 'enqueue', item, now: Date.now() }, this.deliverQueueOptions())
+    const result = deliverQueueReduce(state, input, this.deliverQueueOptions())
     this.deliverQueueStates.set(chatKey, result.state)
     this.runDeliverEffects(chatKey, result.effects)
+  }
+
+  private enqueueDelivery(chatKey: string, item: QueuedDelivery<BridgeDelivery>): void {
+    this.feedDeliverQueue(chatKey, { kind: 'enqueue', item, now: Date.now() })
   }
 
   private runDeliverEffects(chatKey: string, effects: DeliverQueueEffect<BridgeDelivery>[]): void {
@@ -1249,7 +1072,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
           void this.performAttempt(chatKey, effect.item)
           break
         case 'retry-after':
-          this.armDeliverTimer(chatKey, effect.at)
+          this.deliverQueueTimers.arm(chatKey, effect.at, () => this.feedDeliverQueue(chatKey, { kind: 'tick', now: Date.now() }))
           break
         case 'give-up':
           this.store.markFailed(effect.item.key, effect.error, effect.errorKind)
@@ -1307,40 +1130,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     errorKind?: SendErrorKind,
     retryAfterMs?: number,
   ): void {
-    const state = this.deliverQueueStates.get(chatKey) ?? emptyDeliverQueueState<BridgeDelivery>()
-    const result = deliverQueueReduce(
-      state,
-      { kind: 'attempt-result', key, outcome, error, errorKind, retryAfterMs, now: Date.now() },
-      this.deliverQueueOptions(),
-    )
-    this.deliverQueueStates.set(chatKey, result.state)
-    this.runDeliverEffects(chatKey, result.effects)
-  }
-
-  private armDeliverTimer(chatKey: string, at: number): void {
-    this.clearDeliverTimer(chatKey)
-    const delay = Math.max(0, at - Date.now())
-    const timer = setTimeout(() => {
-      this.deliverQueueTimers.delete(chatKey)
-      this.onDeliverTick(chatKey)
-    }, delay)
-    timer.unref?.()
-    this.deliverQueueTimers.set(chatKey, timer)
-  }
-
-  private clearDeliverTimer(chatKey: string): void {
-    const timer = this.deliverQueueTimers.get(chatKey)
-    if (timer !== undefined) {
-      clearTimeout(timer)
-      this.deliverQueueTimers.delete(chatKey)
-    }
-  }
-
-  private onDeliverTick(chatKey: string): void {
-    const state = this.deliverQueueStates.get(chatKey) ?? emptyDeliverQueueState<BridgeDelivery>()
-    const result = deliverQueueReduce(state, { kind: 'tick', now: Date.now() }, this.deliverQueueOptions())
-    this.deliverQueueStates.set(chatKey, result.state)
-    this.runDeliverEffects(chatKey, result.effects)
+    this.feedDeliverQueue(chatKey, { kind: 'attempt-result', key, outcome, error, errorKind, retryAfterMs, now: Date.now() })
   }
 
   /**
@@ -1350,9 +1140,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
    * these are local notices, not agent output, so the ledger marks are no-ops.
    */
   protected sendLocal(chatKey: string, markdown: string, opts: { silent?: boolean } = {}): void {
-    const rendered = renderForTier(markdown, this.channel.formatTier)
-    const maxChars = this.channel.maxMessageChars ?? 4096
-    const chunks = chunkText(rendered, { maxChars, countBy: this.chunkCountBy })
+    const chunks = this.renderChunks(markdown)
     const seq = ++this.localSeq
     for (let i = 0; i < chunks.length; i++) {
       this.enqueueDelivery(chatKey, {
@@ -1402,141 +1190,23 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     this.sendLocal(chatKey, `Unknown command: ${command}. Use /help for help.`)
   }
 
-  // ---- approval ----
-
-  private onApprovalRequest = async (
-    req: import('@deepseek-ai/dsh-user-approval').ApprovalRequest,
-    next: () => Promise<import('@deepseek-ai/dsh-user-approval').ApprovalOutcome>,
-  ): Promise<import('@deepseek-ai/dsh-user-approval').ApprovalOutcome> => {
-    const chatKey = this.sessionChatKeys.get(req.agent.id)
-    if (!chatKey) return next()
-
-    const num = ++this.promptSeq
-    const entry: ApprovalEntry = {
-      num,
-      requestId: `channel-${this.channel.id}:${Date.now()}:${num}`,
-      toolName: req.toolName,
-      expiresAt: Date.now() + this.config.approvalTimeoutSec * 1000,
-      agentId: req.agent.id,
-      chatKey,
-    }
-
-    let settle!: (outcome: 'allowed-once' | 'rejected' | 'deferred') => void
-    const verdict = new Promise<'allowed-once' | 'rejected' | 'deferred'>((resolve) => {
-      settle = resolve
-      entry.resolve = resolve
-      this.pendingApprovals.set(num, entry)
-    })
-
-    const onAbort = () => {
-      this.pendingApprovals.delete(num)
-      if (entry.timer) clearTimeout(entry.timer)
-      settle('deferred')
-    }
-    req.signal?.addEventListener('abort', onAbort, { once: true })
-
-    await this.sendApprovalPrompt(entry, req)
-    if (!this.pendingApprovals.has(num)) {
-      req.signal?.removeEventListener('abort', onAbort)
-      return next()
-    }
-
-    entry.timer = setTimeout(() => {
-      this.pendingApprovals.delete(num)
-      settle('deferred')
-    }, this.config.approvalTimeoutSec * 1000)
-    entry.timer.unref?.()
-
-    const outcome = await verdict
-    req.signal?.removeEventListener('abort', onAbort)
-    if (entry.timer) clearTimeout(entry.timer)
-    if (outcome === 'deferred') return next()
-    return outcome
-  }
-
-  private async sendApprovalPrompt(
-    entry: ApprovalEntry,
-    req: import('@deepseek-ai/dsh-user-approval').ApprovalRequest,
-  ): Promise<void> {
-    const rendered = renderApproval(
-      { toolName: req.toolName, reason: req.reason, num: entry.num },
-      { supportsChoices: this.channel.supportsChoices },
-    )
-    const text = renderForTier(rendered.text, this.channel.formatTier)
-    const out: OutboundMessage =
-      rendered.kind === 'choices'
-        ? { channel: this.channel.id, ...this.accountQualifier, chatKey: entry.chatKey, markdown: text, choices: rendered.choices, deliveryKey: `approval:${entry.requestId}` }
-        : { channel: this.channel.id, ...this.accountQualifier, chatKey: entry.chatKey, markdown: text, deliveryKey: `approval:${entry.requestId}` }
-
-    try {
-      const receipt = await this.ctx.channels.deliver(out)
-      const platformId = receipt.platformMessageIds?.[0]
-      if (platformId) entry.messageId = Number(platformId)
-      this.rememberOwnSends(entry.chatKey, receipt.platformMessageIds ?? [])
-    } catch {
-      // Fail-fast: if the prompt cannot be delivered the user demonstrably
-      // cannot answer, so resolve `deferred` immediately instead of waiting
-      // out approvalTimeoutSec (hermes approval.py:3504-3510).
-      this.pendingApprovals.delete(entry.num)
-      if (entry.timer) clearTimeout(entry.timer)
-      entry.resolve?.('deferred')
-    }
-  }
+  // ---- approval / prompt (delegated to the broker) ----
 
   protected resolveApproval(num: number, outcome: 'allowed-once' | 'rejected'): void {
-    const entry = this.pendingApprovals.get(num)
-    if (!entry) return
-    this.pendingApprovals.delete(num)
-    if (entry.timer) clearTimeout(entry.timer)
-    entry.resolve?.(outcome)
+    this.broker.resolveApproval(num, outcome)
   }
 
-  protected resolvePrompt(num: number, answer: { selected: readonly string[]; custom?: string }): void {
-    const entry = this.pendingPrompts.get(num)
-    if (!entry) return
-    this.pendingPrompts.delete(num)
-    if (entry.timer) clearTimeout(entry.timer)
-    entry.resolve(answer.selected, answer.custom)
+  protected resolvePrompt(num: number, answer: PromptAnswer): void {
+    this.broker.resolvePrompt(num, answer)
   }
 
   /** Whether inbound text is an approval/prompt answer (and resolve it if so). */
   protected async handleInboundReply(text: string): Promise<boolean> {
-    const approvalReply = parseApprovalReply({ text }, [...this.pendingApprovals.values()])
-    if (approvalReply.kind === 'answer') {
-      this.resolveApproval(approvalReply.num, approvalReply.outcome)
-      return true
-    }
-    const promptReply = parsePromptReply({ text }, [...this.pendingPrompts.values()])
-    if (promptReply.kind === 'answer') {
-      this.resolvePrompt(promptReply.num, promptReply.answer)
-      return true
-    }
-    return false
+    return this.broker.handleInboundReply(text)
   }
 
   /** Resolve a button-callback choice (prompt:<num>:<idx>); returns the answer, or null. */
-  protected handleInboundChoice(choiceId: string): { selected: readonly string[]; custom?: string } | null {
-    const reply = parsePromptReply({ choiceId }, [...this.pendingPrompts.values()])
-    if (reply.kind !== 'answer') return null
-    this.resolvePrompt(reply.num, reply.answer)
-    return reply.answer
+  protected handleInboundChoice(choiceId: string): PromptAnswer | null {
+    return this.broker.handleInboundChoice(choiceId)
   }
-}
-
-/** True when `promise` settled (either way) within `timeoutMs`; false on timeout. */
-function settledWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
-  return new Promise<boolean>((resolve) => {
-    const timer = setTimeout(() => resolve(false), timeoutMs)
-    timer.unref?.()
-    void promise.then(
-      () => {
-        clearTimeout(timer)
-        resolve(true)
-      },
-      () => {
-        clearTimeout(timer)
-        resolve(true)
-      },
-    )
-  })
 }

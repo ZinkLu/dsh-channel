@@ -1,6 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
-import { ChannelBridge, type BridgeConfig, type BridgePolicyOverrides, type ChannelStore } from 'dsh-channel-kit'
+import { ChannelBridge, sleepWithAbort, type BridgeConfig, type BridgePolicyOverrides, type ChannelStore } from 'dsh-channel-kit'
 import type { InboundMessage } from 'dsh-channel'
 import type { WeChatChannel } from './channel.js'
 import type { WeixinClient, WeixinMessage } from './client.js'
@@ -116,15 +116,14 @@ export class WeChatBridge extends ChannelBridge<WeChatBridgeConfig> {
   private async processMessage(message: WeixinMessage): Promise<void> {
     const accountId = (await this.resolveAccountId()) ?? ''
     const sender = senderId(message)
-    // Self-message loopback guard (hermes: sender_id == account_id).
+    // Self-message loopback guard: our own account's sends replay through getupdates.
     if (!sender || sender === accountId || message.msg_type === 2) return
 
     const chatKey = toChatKey(message, accountId)
     if (!chatKey) return
 
-    // context_token echo + typing ticket warm-up (hermes ContextTokenStore /
-    // _maybe_fetch_typing_ticket). Both are idempotent, so they run ahead of the
-    // shared pipeline's dedupe rather than needing a hook inside it.
+    // context_token echo + typing ticket warm-up. Both are idempotent, so they
+    // run ahead of the shared pipeline's dedupe rather than needing a hook inside it.
     const contextToken = message.context_token
     if (contextToken) this.client.setContextToken(chatKey, contextToken)
     void this.warmTypingTicket(chatKey, contextToken)
@@ -159,20 +158,4 @@ export class WeChatBridge extends ChannelBridge<WeChatBridgeConfig> {
       mentionsBot: false,
     }
   }
-}
-
-function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) return Promise.resolve()
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort)
-      resolve()
-    }, ms)
-    timer.unref?.()
-    const onAbort = () => {
-      clearTimeout(timer)
-      reject(new Error('aborted'))
-    }
-    signal?.addEventListener('abort', onAbort, { once: true })
-  })
 }

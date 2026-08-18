@@ -1,7 +1,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { ImageAttachmentRef, ImageMediaType } from '@deepseek-ai/dsh-attachment'
-import { ChannelBridge, DEFAULT_MAX_INBOUND_MEDIA_BYTES, renderForTier, type BridgeConfig, type BridgePolicyOverrides, type ChannelStore } from 'dsh-channel-kit'
+import { ChannelBridge, DEFAULT_MAX_INBOUND_MEDIA_BYTES, renderForTier, sleepWithAbort, type BridgeConfig, type BridgePolicyOverrides, type ChannelStore } from 'dsh-channel-kit'
 import type { InboundMedia, InboundMessage } from 'dsh-channel'
 import type { TelegramChannel } from './channel.js'
 import type { TelegramCallbackQuery, TelegramClient, TelegramMessage, TelegramPhotoSize } from './client.js'
@@ -313,20 +313,4 @@ function sniffImageMediaType(bytes: Uint8Array): ImageMediaType | undefined {
   if (bytes.length >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return 'image/webp'
   if (bytes.length >= 6 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38 && (bytes[4] === 0x37 || bytes[4] === 0x39)) return 'image/gif'
   return undefined
-}
-
-function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) return Promise.resolve()
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort)
-      resolve()
-    }, ms)
-    timer.unref?.()
-    const onAbort = () => {
-      clearTimeout(timer)
-      reject(new Error('aborted'))
-    }
-    signal?.addEventListener('abort', onAbort, { once: true })
-  })
 }
