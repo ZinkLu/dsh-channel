@@ -1,5 +1,5 @@
 /**
- * Installable conformance suite (openclaw message/contracts.ts). Provider
+ * Installable conformance suite. Provider
  * packages call `installChannelContractSuite({ ... })` in their test files and
  * get the shared behavioral battery against their own mocked client.
  *

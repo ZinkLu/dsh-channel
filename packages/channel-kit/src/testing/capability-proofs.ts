@@ -1,5 +1,5 @@
 /**
- * Capability proofs (openclaw message/contracts.ts:119-142): for every
+ * Capability proofs: for every
  * `supportsX === true`, the suite demands a proof callback and fails the build
  * without it. Declaring a capability without a proof is recorded, not skipped.
  */

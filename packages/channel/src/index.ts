@@ -122,7 +122,7 @@ export interface OutboundChoice {
   readonly label: string
 }
 
-/** Machine-readable outbound send error taxonomy (hermes base.py:2484-2520).
+/** Machine-readable outbound send error taxonomy.
  *  Provider clients classify platform error codes into one of these kinds. */
 export type SendErrorKind =
   | 'too_long'
@@ -149,7 +149,7 @@ export interface DeliveryReceipt {
 /** Presentation intent: final message / new draft / edit existing draft / status line. */
 export type PresentationIntent = 'final' | 'draft-new' | 'draft-edit' | 'status-line'
 
-/** Presentation limits (a reduced version of openclaw ChannelPresentationCapabilities.limits). All undefined = no known limit. */
+/** Presentation limits. All undefined = no known limit. */
 export interface PresentationLimits {
   /** Maximum buttons per message; beyond this, degrade to numbered text. */
   readonly maxOptions?: number
@@ -232,7 +232,7 @@ export abstract class Channel {
   get streamingMode(): 'off' | 'block' | 'progress' {
     return 'off'
   }
-  /** Whether to present a "doing X…" status line as text (hermes supports_status_text, Slack-like); textless platforms stay false. */
+  /** Whether to present a "doing X…" status line as text; textless platforms stay false. */
   get supportsStatusText(): boolean {
     return false
   }
@@ -305,8 +305,8 @@ export abstract class Channel {
 
   /**
    * Send one piece of media (image/document). Implemented only by supportsMedia
-   * platforms; the base class throws (the same "optional method + degradation" as hermes
-   * send_image/send_file — consumers should check supportsMedia first).
+   * platforms; the base class throws (optional method + degradation — consumers
+   * should check supportsMedia first).
    */
   async sendMedia(
     _chatKey: string,
@@ -454,7 +454,7 @@ export class ChannelRegistry extends Service {
           })
           platformMessageIds.push(result.platformMessageId)
         }
-        // media: supportsMedia platforms go through sendMedia; otherwise degrade to a "could not deliver" text (hermes lesson: never echo the host path back).
+        // media: supportsMedia platforms go through sendMedia; otherwise degrade to a "could not deliver" text (never echo the host path back).
         for (const media of out.media ?? []) {
           if (channel.supportsMedia) {
             const result = await channel.sendMedia(out.chatKey, media)

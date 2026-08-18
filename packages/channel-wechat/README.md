@@ -1,8 +1,7 @@
 # dsh-channel-wechat
 
-WeChat (WeChat / weixin) provider for `dsh-channel`, using Tencent's **iLink Bot API**
-(same as the hermes `weixin` adapter): long-polling inbound, markdown pass-through, numbered-text
-approval, and delivery ledger.
+WeChat (WeChat / weixin) provider for `dsh-channel`, using Tencent's **iLink Bot API**:
+long-polling inbound, markdown pass-through, numbered-text approval, and delivery ledger.
 
 > It differs from the Telegram provider in only two ways: **transport** (`getupdates` long polling,
 > no webhook/public address) and **capability facts** (`formatTier: 'markdown'`,

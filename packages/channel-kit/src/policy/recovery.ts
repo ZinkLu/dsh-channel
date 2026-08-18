@@ -89,7 +89,7 @@ export const defaultRecoveryPolicy: RecoveryPolicy = {
   },
 }
 
-/** Terminal send errors are never retried by the recovery policy (hermes taxonomy day-one rule). */
+/** Terminal send errors are never retried by the recovery policy. */
 export function isFatalSendError(errorKind: SendErrorKind | undefined): boolean {
   return errorKind === 'too_long' || errorKind === 'bad_format' || errorKind === 'forbidden' || errorKind === 'not_found'
 }

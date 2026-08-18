@@ -1,8 +1,7 @@
 # dsh-channel-feishu
 
 The Feishu / Lark provider for `dsh-channel`, using Open API for sending + **long-connection
-(WebSocket) mode** for inbound (same as openclaw / mimiclaw / ironclaw), with no public address
-and no webhook required.
+(WebSocket) mode** for inbound, with no public address and no webhook required.
 
 > The only differences from Telegram/WeChat are transport and capability facts:
 > `formatTier: 'plain'` (Feishu text messages are plain text), `supportsChoices: false` (v1 has no

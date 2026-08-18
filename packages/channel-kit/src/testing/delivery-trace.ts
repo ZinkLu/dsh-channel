@@ -1,5 +1,5 @@
 /**
- * Delivery-trace golden support (openclaw contracts/trace/delivery-trace.ts).
+ * Delivery-trace golden support.
  *
  * A scenario is replayed under a fake clock and the observed client-call
  * sequence is canonicalized to JSONL. The fixed non-zero epoch matters:

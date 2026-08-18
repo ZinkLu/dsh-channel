@@ -17,8 +17,8 @@ against the rc.6 source). What is deliberately *not* built — open questions, d
 trigger, and designs considered and rejected — is in
 [docs/dsh-channel-backlog.md](./docs/dsh-channel-backlog.md).
 
-Those three plus this file are the live documents. `docs/archive/` holds the completed roadmaps and
-the original research they came from: accurate history, not plans — read the tree, not them.
+Those three plus this file are the documentation set: our design, the implementation as shipped,
+and the roadmap/backlog. Completed process documents are kept in git history, not in the tree.
 
 | Package | Directory | Description |
 |---|---|---|
@@ -123,10 +123,10 @@ It loads `dsh-channel` + `dsh-agent` + `dsh-credentials-local` + `dsh-channel-te
 |---|---|---|
 | `dsh-channel` | 14 | register/unregister, duplicate-registration rejection (incl. `(id, accountId)`), deliver default, waterfall observation and short-circuit, event broadcast, `supportsReactions`/`react`, multi-account registry + `chatKeyOf`/`bindChatKey`, capability-fact defaults (`supportsReply`/`supportsThreads`/`supportsSilent`/`supportsReconciliation`) |
 | `dsh-channel-config` | 6 | shared schema defaults/required/union across telegram/wechat/feishu, numeric vs string allowlist element types, `maxInboundMediaBytes` default/override, `accountId`/`proxyUrl` shared behavior fields, `platformAccountId` (WeChat) |
-| `dsh-channel-kit` | 84 | chunk fence padding/prefix convergence, merge three iron rules and `..`/`!!`, router decision table (incl. multi-account session ids), approval numbering/timeout, store state machine and JSON file, format three-tier degradation and `<tool_calls>`/reasoning sanitization, prompt-render options/multi-select/free-text, tool-display, stream reducer, deliver-queue retry/backoff/spacing/backpressure, media size guard, http-proxy (CONNECT tunnel + absolute-form + multipart) |
-| `dsh-channel-telegram` | 27 | Telegram API calls and redaction, HTML-failure fallback to plain text, inbound routing/merge/delivery, allowlist, approval answerer timeout `next()`, `<tool_calls>` leak interception, agent preset join, progress draft, user-questions provider, settings namespace registration, inbound media size cap (streaming + Content-Length), `getMe`/`setMessageReaction`, group `mentionsBot` observation, ack-long reaction, reply/thread/silent send options, inbound `replyToMessageId`, recovery reconciliation |
-| `dsh-channel-wechat` | 5 | iLink getupdates/sendmessage calls and redaction, context_token echo, inbound routing/merge/delivery, allowlist |
-| `dsh-channel-feishu` | 15 | tenant_access_token cache, sendMessage receive_id_type parsing, protobuf frame encode/decode, inbound event routing/delivery, allowlist, `createReaction`/`react`, `replyMessage`/`supportsReply`, inbound `replyToMessageId` (`parent_id`) |
+| `dsh-channel-kit` | 115 | chunk fence padding/prefix convergence, merge three iron rules and `..`/`!!`, router decision table (incl. multi-account session ids), approval numbering/timeout, store state machine and JSON file, format three-tier degradation and `<tool_calls>`/reasoning sanitization, prompt-render options/multi-select/free-text, tool-display, stream reducer, deliver-queue retry/backoff/spacing/backpressure, media size guard, http-proxy (CONNECT tunnel + absolute-form + multipart) |
+| `dsh-channel-telegram` | 33 | Telegram API calls and redaction, HTML-failure fallback to plain text, inbound routing/merge/delivery, allowlist, approval answerer timeout `next()`, `<tool_calls>` leak interception, agent preset join, progress draft, user-questions provider, settings namespace registration, inbound media size cap (streaming + Content-Length), `getMe`/`setMessageReaction`, group `mentionsBot` observation, ack-long reaction, reply/thread/silent send options, inbound `replyToMessageId`, recovery reconciliation |
+| `dsh-channel-wechat` | 9 | iLink getupdates/sendmessage calls and redaction, context_token echo, inbound routing/merge/delivery, allowlist |
+| `dsh-channel-feishu` | 19 | tenant_access_token cache, sendMessage receive_id_type parsing, protobuf frame encode/decode, inbound event routing/delivery, allowlist, `createReaction`/`react`, `replyMessage`/`supportsReply`, inbound `replyToMessageId` (`parent_id`) |
 
 ---
 
@@ -182,8 +182,8 @@ DeepSeek Harness (dsh) 的消息渠道公共层与多个 provider 实现（Teleg
 刻意**没有**做的部分——待验证的开放问题、带触发条件的延后项、以及已论证并否决的设计——见
 [docs/dsh-channel-backlog.md](./docs/dsh-channel-backlog.md)。
 
-这三份加本文件是活文档。`docs/archive/` 存放已交付的 roadmap 与其原始调研：是准确的历史，不是计划——
-以代码树为准，不要照着它们写码。
+这三份加本文件即全部文档：只讲我们的设计、已交付的实现、以及计划（roadmap/backlog）。
+已完成的过程文档保留在 git 历史里，不再保留在代码树中。
 
 | 包 | 目录 | 说明 |
 |---|---|---|
@@ -289,10 +289,10 @@ TELEGRAM_BOT_TOKEN='...' node scripts/run-echo-bot.mjs
 |---|---|---|
 | `dsh-channel` | 14 | 注册/卸载、重复注册拒绝（含 `(id, accountId)`）、deliver 缺省、waterfall 观察与短路、事件广播、`supportsReactions`/`react`、多账号注册表 + `chatKeyOf`/`bindChatKey`、能力事实缺省（`supportsReply`/`supportsThreads`/`supportsSilent`/`supportsReconciliation`） |
 | `dsh-channel-config` | 6 | telegram/wechat/feishu 共享 schema 的默认值/必填/枚举、数字 vs 字符串 allowlist 元素类型、`maxInboundMediaBytes` 默认/覆盖、`accountId`/`proxyUrl` 共享行为字段、`platformAccountId`（微信） |
-| `dsh-channel-kit` | 84 | chunk 围栏补齐/前缀收敛、merge 三铁律与 `..`/`!!`、router 决策表（含多账号会话 id）、approval 编号/超时、store 状态机与 JSON 文件、format 三档降级与 `<tool_calls>`/reasoning 净化、prompt-render 选项/多选/自由文本、tool-display、stream reducer、deliver-queue 重试/退避/间隔/背压、媒体大小守卫、http-proxy（CONNECT 隧道 + absolute-form + multipart） |
-| `dsh-channel-telegram` | 27 | Telegram API 调用与脱敏、HTML 失败降级纯文本、入站路由/merge/投递、allowlist、审批 answerer 超时 `next()`、`<tool_calls>` 泄漏拦截、agent preset join、progress 草稿、user-questions provider、settings 命名空间注册、入站媒体大小上限（流式 + Content-Length）、`getMe`/`setMessageReaction`、群聊 `mentionsBot` 观察、ack-long 表情回应、回复/话题/静默发送选项、入站 `replyToMessageId`、恢复对账 |
-| `dsh-channel-wechat` | 5 | iLink getupdates/sendmessage 调用与脱敏、context_token 回显、入站路由/merge/投递、allowlist |
-| `dsh-channel-feishu` | 15 | tenant_access_token 缓存、sendMessage receive_id_type 解析、protobuf 帧编解码、入站事件路由/投递、allowlist、`createReaction`/`react`、`replyMessage`/`supportsReply`、入站 `replyToMessageId`（`parent_id`） |
+| `dsh-channel-kit` | 115 | chunk 围栏补齐/前缀收敛、merge 三铁律与 `..`/`!!`、router 决策表（含多账号会话 id）、approval 编号/超时、store 状态机与 JSON 文件、format 三档降级与 `<tool_calls>`/reasoning 净化、prompt-render 选项/多选/自由文本、tool-display、stream reducer、deliver-queue 重试/退避/间隔/背压、媒体大小守卫、http-proxy（CONNECT 隧道 + absolute-form + multipart） |
+| `dsh-channel-telegram` | 33 | Telegram API 调用与脱敏、HTML 失败降级纯文本、入站路由/merge/投递、allowlist、审批 answerer 超时 `next()`、`<tool_calls>` 泄漏拦截、agent preset join、progress 草稿、user-questions provider、settings 命名空间注册、入站媒体大小上限（流式 + Content-Length）、`getMe`/`setMessageReaction`、群聊 `mentionsBot` 观察、ack-long 表情回应、回复/话题/静默发送选项、入站 `replyToMessageId`、恢复对账 |
+| `dsh-channel-wechat` | 9 | iLink getupdates/sendmessage 调用与脱敏、context_token 回显、入站路由/merge/投递、allowlist |
+| `dsh-channel-feishu` | 19 | tenant_access_token 缓存、sendMessage receive_id_type 解析、protobuf 帧编解码、入站事件路由/投递、allowlist、`createReaction`/`react`、`replyMessage`/`supportsReply`、入站 `replyToMessageId`（`parent_id`） |
 
 ---
 

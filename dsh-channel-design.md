@@ -1,8 +1,8 @@
 # dsh-channel Design & Technical Document
 
-> Version: v0.2 draft · Date: 2026-08-14
-> The R1–R10 hard constraints and acceptance criteria (A1–A6) have been merged into §6/§7; the original `dsh-channel-handoff.md` has been deleted and this document is the single design source.
-> Research baseline: deepseek-harness@47f9438, LoserFox/telegram, BiBoyang/dsh-im-bridge, Jesse-njx/dsh-chatnode-wechat, nowledge-mem, NousResearch/hermes-agent, openclaw/openclaw (all 2026-08-14 main-branch snapshots)
+> Version: v0.3 · Date: 2026-08-18
+> The R1–R10 hard constraints and acceptance criteria (A1–A6) have been merged into §6/§7; this document is the single design source. It describes this repo's own design, implementation, and roadmap — nothing else.
+> dsh baseline: deepseek-harness@47f9438 (rc.6); the line-by-line core alignment lives in `docs/dsh-core-reference.md`.
 
 ---
 
@@ -22,7 +22,7 @@ The first two layers are the fixed public layer; the provider is an **open set**
 
 ---
 
-## 1. Research Conclusions (the part that decides the design)
+## 1. Design Foundations (the part that decides the design)
 
 ### 1.1 The Shape Answers the dsh Source Gives
 
@@ -44,39 +44,43 @@ The first two layers are the fixed public layer; the provider is an **open set**
 | `session/event` schema | `(session: Session, event: SessionEvent)`, emit mode, post-commit, fire-and-forget; `SessionEvent = { type, seq, time, data, ignorable? }`. `SessionEventMap` is extended via `declare module '@deepseek-ai/dsh-session/types'` declaration merging (user-approval's `approval/asked`/`approval/decided` are the ready-made example). Note: **bare events land outside a turn and are dropped as a crash tail on reload** — extending log events requires wrapping them inside an open turn (see the §4.5 store trade-off). |
 | `approval/request` signature and timeout | Waterfall: `(req: ApprovalRequest, next) => Promise<ApprovalOutcome>`; `req = { agent, toolName, callId?, reason?, signal? }`; outcome ∈ `'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'`, no answerer / answerer throws → `'unavailable'` (fail-closed); `signal` abort → `'cancelled'`, late answers are dropped. The `'never'` session policy rejects in place before dispatch. The audit pair (asked/decided) is logged by `ApprovalService`; the answerer need not care. |
 | `ctx.sessions.fork(source, boundary?, childSessionId?)` | Can only fork a prefix at a completed turn boundary (`OPEN_TURN` is rejected); the channel scenario corresponds to `/fork`-style commands, **not in v1**, just reserve the interface. |
-| `ctx.credentials` | `ctx.credentials.resolve(credentialRef('TELEGRAM_BOT_TOKEN'))` → `{ value, source } | undefined`; **re-resolve on every operation, never cache across operations** (changing credentials needs no restart). chatnode-wechat's `bootWithCredentials` is the ready-made usage example. |
-| Telegram Bot API | Text limit **4096** chars/message (caption 1024); `getUpdates` long polling and `setWebhook` are mutually exclusive, v1 uses long polling (no public-IP dependency, matches the reference implementations); rich text uses **HTML parse mode** (MarkdownV2 needs escaping of the eighteen characters `_*[]()~`>#+-=|{}.!`, fragile; both reference implementations choose HTML + plain-text fallback); approvals can use an **inline keyboard** (`callback_data` ≤64 bytes, after the callback must call `answerCallbackQuery` to clear the spinner); `editMessageText` supports draft-style streaming (v2); rate limit ~30 msg/s globally, ~1 msg/s per chat (20/min for groups), outbound needs throttling. |
+| `ctx.credentials` | `ctx.credentials.resolve(credentialRef('TELEGRAM_BOT_TOKEN'))` → `{ value, source } | undefined`; **re-resolve on every operation, never cache across operations** (changing credentials needs no restart). |
+| Telegram Bot API | Text limit **4096** chars/message (caption 1024); `getUpdates` long polling and `setWebhook` are mutually exclusive, v1 uses long polling (no public-IP dependency); rich text uses **HTML parse mode** (MarkdownV2 needs escaping of the eighteen characters `_*[]()~`>#+-=|{}.!`, fragile — so HTML + plain-text fallback); approvals can use an **inline keyboard** (`callback_data` ≤64 bytes, after the callback must call `answerCallbackQuery` to clear the spinner); `editMessageText` supports draft-style streaming (v2); rate limit ~30 msg/s globally, ~1 msg/s per chat (20/min for groups), outbound needs throttling. |
 
-### 1.3 The Three Existing Implementations: Convergence and Lessons
+### 1.3 Adopted Design Principles
 
-| | LoserFox/telegram | BiBoyang/dsh-im-bridge | Jesse-njx/dsh-chatnode-wechat |
-|---|---|---|---|
-| Session routing | One session per chat (`telegram:<chatId>`), **in-memory Map, lost on restart** | One user bound to one session (`/bind`), follows the most recent activity | One peer drives the "active session" (toggled by `/use` `/new`) |
-| merge | None | Debounce window + `..`/`!!` control suffixes + crash-recovery snapshot | None |
-| chunk | Prefers break points at newlines/periods | Codepoint counting + `(i/n)` prefix recursive convergence | markdown block splitting to preserve code fences + greedy bin packing (from hermes) |
-| approval | None | Text "approve/reject" + a single pending broker, on timeout delegates via `next()` | Numbered `#n` + `/yes` `/no`, on timeout denies by default, only answers for its own agent |
-| store | None (all in-memory) | JSON atomic write: seenIds ring, context_token, bindings, merge snapshot | In-gateway dedupe TTL |
-| format | Markdown → Telegram HTML subset, falls back to plain text on failure | None | markdown normalization |
-| Service abstraction | None | None | **The only one that did service layering**: `ctx.wechat` gateway + `wechat/message` event + node consumer layer |
+The comparative survey that preceded this design is deliberately not part of this document; what
+it produced is the following set of rules, each of which now has an owner in the tree:
 
-The three fought their own battles yet converged on the same set of filenames — proof that the six grunt-work modules are the problem's inherent shape (the §4 judgment holds). Common defects: **none derives idempotency from the session log** (all build their own state), and none expresses capability facts (chunk length, presence of buttons are all hardcoded). chatnode's gateway/node boundary and its stance that "the allowlist is the security boundary, required with no default" are adopted directly.
-
-### 1.4 hermes-agent and openclaw: Portable Conclusions from Mature Gateways
-
-**hermes** (`gateway/platforms/base.py`, 7322 lines, 25+ platforms):
-
-- **The required adapter surface is tiny**: `connect / disconnect / send / send_typing / send_image / get_chat_info`; everything else (files, voice, clarify buttons, approval buttons, model picker) gets a **degradation default from the base class, overridden by platform per capability** — fully isomorphic with R6, and proof that this surface did not fork across 25 platforms.
-- **The counterexample**: its "built-in path" checklist requires touching **16 places in core code** per platform (enum, factory, auth table, cron table, tool routing, status, wizard…). This is exactly why dsh-channel exists: the registry + events collapse those 16 places into one plugin.
-- **Platform hints go into the system prompt** (`PLATFORM_HINTS`): if the model isn't told which platform it's on, it will emit markdown on platforms that don't render markdown. → Adopted as kit's `promptHint()` (§4.7).
-- **delivery ledger** (`gateway/delivery_ledger.py`): the final reply that was "generated but not confirmed delivered" is the only artifact that can be lost without a trace. A `pending → attempting → delivered/failed/abandoned` state machine; after an `attempting` crash a redelivery must carry a visible "recovered resend" marker — **honest at-least-once, never silent duplication**. → Adopted as the store's deliveries table (§4.5).
-- Engineering conventions: self-message filtering to prevent loopback, redacting platform identifiers from logs, exponential backoff + jittered reconnect, `MAX_MESSAGE_LENGTH` as a constant.
-
-**openclaw** (`src/channels/`, 29 channels, a channel is a plugin):
-
-- **`ChannelPlugin` = `id + meta + capabilities` required, everything else optional adapter slots** — again, capability facts + graceful degradation. `capabilities` is a static fact table: `chatTypes / reactions / edit / threads / media / blockStreaming / nativeCommands`.
-- **The three iron rules of debounce** (`inbound-debounce-policy.ts`): messages with media are **not merged** (attachment metadata would detach from the text batch); control commands (stop/status) are **not delayed**; empty text is not merged. → Written directly into the merge module's contract (§4.2).
-- **Four streaming modes**: `off | partial | block | progress`. The progress-mode gating is worth copying: **only a timer trigger creates the draft message; fast answers never emit a draft at all**. v1 does only `off` (final delivery) + an optional progress heartbeat, leaving `block` (draft editing) to v2's `supportsEdit` platforms.
-- Boundary discipline: core channel code must not be imported directly by plugins; the extension surface goes through the SDK contract — corresponding to our "consumers depend only on `dsh-channel`" (R3).
+- **The six grunt-work modules are the problem's inherent shape.** Independent channel
+  implementations keep re-growing the same six pieces (chunk / merge / router / approval-render /
+  store / format); building them once as pure functions is the kit's reason to exist (§4).
+- **A tiny required adapter surface scales; everything else is a capability fact.**
+  `connect / disconnect / send / sendTyping` plus `get`-style capability facts with conservative
+  defaults covers many platforms without forking the interface; optional abilities degrade in the
+  base class instead of appearing as platform-specific methods (§3.3, R6).
+- **A registry + events beats built-in platform lists.** Any design where adding a platform
+  touches a fixed set of core call sites turns every platform into a core patch; the
+  `ctx.channels` registry collapses that to one plugin (§3.4).
+- **Idempotency derives from the session log, not from private state.** Claimed messages are
+  necessarily in the log; the store is only a safety net and an optimization (§4.5, R7).
+- **The delivery ledger is non-negotiable.** The final reply that was "generated but not confirmed
+  delivered" is the only artifact that can vanish without a trace. `pending → attempting →
+  delivered/failed/abandoned`, and a redelivery after an `attempting` crash carries a visible
+  "(recovered resend)" marker — honest at-least-once, never silent duplication or loss (§4.5).
+- **The three merge iron rules.** Media is never merged into a text batch; control commands
+  (stop / approval replies) are never delayed by the debounce window; empty text is never merged
+  (§4.2).
+- **Streaming is gated by capability facts and timers.** `streamingMode: off | block | progress`;
+  only a timer trigger may create a draft/progress message, so fast answers produce zero noise.
+  v1 ships `off` + progress; `block` (draft editing) waits for v2 (§4.1).
+- **Platform hints go into the system prompt.** A model that is not told which platform it is on
+  emits markdown on platforms that render none → kit `promptHint()` (§4.7).
+- **The allowlist is the security boundary** — required, with no permissive default; it is the
+  front door of prompt injection (§5.1).
+- **Engineering conventions:** self-message filtering against loopback, redacting platform
+  identifiers from logs, exponential backoff + jittered reconnect, message-length limits as
+  explicit per-platform constants.
 
 ---
 
@@ -227,7 +231,7 @@ export type ChannelStatus = 'connecting' | 'connected' | 'disconnected' | 'fatal
 /**
  * Abstract base class for platform providers. A plain abstract class, not a Service (aligned with LlmAdapter):
  * the lifecycle is carried by the provider plugin's own fiber, registered via ctx.channels.register().
- * The required surface is deliberately tiny (hermes covers 25 platforms with 6 methods);
+ * The required surface is deliberately tiny (§1.3: a tiny required surface scales);
  * capability differences always go through "capability facts + degradation"; never add methods only one platform can implement (R6).
  */
 export abstract class Channel {
@@ -344,15 +348,15 @@ export interface ChunkOptions {
 export function chunkText(markdown: string, opts: ChunkOptions): string[]
 ```
 
-Algorithm (combining the strengths of all three implementations):
+Algorithm:
 
-1. **Split by markdown blocks**, treating fenced code blocks as atomic (chatnode's `splitMarkdownBlocks`) — never cut through code blocks or links (§4 hard requirement);
-2. Greedy bin packing to `maxChars` (chatnode `packBlocks`);
+1. **Split by markdown blocks**, treating fenced code blocks as atomic — never cut through code blocks or links (§4 hard requirement);
+2. Greedy bin packing to `maxChars`;
 3. An over-long single atomic block degrades to a hard cut, but **code blocks get fences re-added on a hard cut** (at the cut, add ``` to close/reopen, keeping every segment renderable);
-4. When `numbering: 'prefix'`, apply im-bridge's recursive prefix-width convergence (the prefix consumes budget, the segment count and prefix width affect each other, converges in 5 rounds, falls back to no prefix on failure);
-5. Within a plain-text segment, prefer breaking at newlines / `.` / `. ` (LoserFox's break-point preference).
+4. When `numbering: 'prefix'`, apply recursive prefix-width convergence (the prefix consumes budget, the segment count and prefix width affect each other, converges in 5 rounds, falls back to no prefix on failure);
+5. Within a plain-text segment, prefer breaking at newlines / `.` / `. `.
 
-Streaming trade-off: **v1 only does final delivery** (at the `assistant/message` event level, i.e. openclaw's `off`/`block` boundary) — platform rate limits + most platforms lacking edit capability make per-token outbound infeasible; perceived latency for long-running tasks is compensated by the progress heartbeat (§5.4). Draft streaming on `supportsEdit` platforms (openclaw `block` mode + "only a timer trigger creates the draft" gating) goes to v2.
+Streaming trade-off: **v1 only does final delivery** (at the `assistant/message` event level) — platform rate limits + most platforms lacking edit capability make per-token outbound infeasible; perceived latency for long-running tasks is compensated by the progress heartbeat (§5.4). Draft streaming on `supportsEdit` platforms (`block` streaming mode + "only a timer trigger creates the draft" gating) goes to v2.
 
 ### 4.2 merge — Merging Consecutive Sends
 
@@ -370,15 +374,15 @@ export type MergeEffect =
 export function mergeReduce(state: MergeState, input: MergeInput, opts: MergeOptions): { state: MergeState; effects: MergeEffect[] }
 ```
 
-Contract (absorbing openclaw's three iron rules + im-bridge's control suffixes):
+Contract (the three merge iron rules + the control suffixes):
 
 - `isCommand` (starts with `/` or an approval reply word) **never enters the buffer, bypasses immediately** — stop/approval must not be delayed by debounce;
 - A `hasMedia` message **immediately flushes the current buffer and is delivered separately** — attachments are not merged with the text batch;
-- `..` suffix = keep waiting (resets the window); `!!` suffix = flush immediately; bare suffixes ignored (im-bridge semantics, configurable off);
+- `..` suffix = keep waiting (resets the window); `!!` suffix = flush immediately; bare suffixes ignored (configurable off);
 - Default window 5s; buffer joined with `\n`;
 - **Interjecting while the agent is thinking**: merge doesn't care — after flush the consumer picks the delivery method per agent state: `idle → followup`, `running → steer` (dsh's inbox semantics naturally answers this question).
 
-Crash recovery: every buffer change produces a snapshot (the consumer writes it to the store's `mergeBuffers`); at startup, after `restore`, treat it as just-arrived and reopen the window (im-bridge's approach).
+Crash recovery: every buffer change produces a snapshot (the consumer writes it to the store's `mergeBuffers`); at startup, after `restore`, treat it as just-arrived and reopen the window.
 
 ### 4.3 router — Platform Conversation → dsh Session
 
@@ -396,9 +400,9 @@ export type RouteDecision =
 export function route(msg: { chatKey; text; chatType; mentionsBot? }, ctx: RouteContext, opts: RouterOptions): RouteDecision
 ```
 
-- **Default policy: one session per chat**, with the sessionId convention `channel:<channelId>:<chatKey>` (LoserFox's model, ownership recoverable from the id); `/new` rotates to `channel:<channelId>:<chatKey>:<ts>` and updates the binding.
+- **Default policy: one session per chat**, with the sessionId convention `channel:<channelId>:<chatKey>` (ownership recoverable from the id); `/new` rotates to `channel:<channelId>:<chatKey>:<ts>` and updates the binding.
 - **Resume before create**: when the target sessionId is not in the live list, the consumer first tries `ctx.agents.resume({ resumeSessionId })` (no context loss across restart when persistence is deployed, the other half of A4), then `create` on failure. The router only gives the decision; agents calls stay on the consumer side.
-- Groups: v1 `chatType !== 'direct'` → `drop` (chatnode's stance: iLink group semantics are unclear + a large prompt-injection surface); the `mentionsBot` fact is already in the type, so enabling groups in v2 won't touch the contract.
+- Groups: v1 `chatType !== 'direct'` → `drop` (unclear group ownership semantics + a large prompt-injection surface); the `mentionsBot` fact is already in the type, so enabling groups in v2 won't touch the contract.
 - One user, multiple devices: converges naturally — the routing key is the chat, not the device.
 
 ### 4.4 approval-render — Expressing Approval on Buttonless Channels
@@ -414,10 +418,10 @@ export function parseApprovalReply(input: { text?: string; choiceId?: string }, 
 
 The consumer's answerer orchestration contract (the non-pure-function part, pinned down in the docs and templates):
 
-1. **Only answer for its own agent**: `req.agent.session.id` is not a session routed by this channel → immediately `return next()` (chatnode's `ownsAgent` discipline, to avoid stealing the web UI's approvals);
+1. **Only answer for its own agent**: `req.agent.session.id` is not a session routed by this channel → immediately `return next()` (to avoid stealing the web UI's approvals);
 2. **Show first, then wait**: the question is sent first; the user cannot answer what they can't see;
-3. Numbered concurrency: multiple pendings are distinguished by `#n`; bare `1`/`2` are valid only when there is exactly one pending (chatnode semantics);
-4. **On timeout → `return next()`** (im-bridge's approach, better than chatnode's direct `'rejected'`): hand the decision back to the downstream answerer chain (the web UI may still be showing it); no one on the chain → `ApprovalService` records `'unavailable'`, still fail-closed. **No path ever defaults to allowing**;
+3. Numbered concurrency: multiple pendings are distinguished by `#n`; bare `1`/`2` are valid only when there is exactly one pending;
+4. **On timeout → `return next()`**: hand the decision back to the downstream answerer chain (the web UI may still be showing it); no one on the chain → `ApprovalService` records `'unavailable'`, still fail-closed. **No path ever defaults to allowing**;
 5. `req.signal` abort → clear pendings; withdrawing the prompt is optional.
 
 R2 acceptance closes the loop here: without an approval plugin installed, the `approval/request` event is never emitted at all (`ctx.tools` degrades to deny on its own), so this plugin's answerer sits idle on the event at zero cost — send/receive is unaffected (A3).
@@ -436,7 +440,6 @@ Establish the rule first (§4: "prefer deriving from the session log; don't buil
 
 ```ts
 export interface ChannelStore {
-  // inbound dedupe (ring cap, im-bridge's 1000/500 pruning strategy)
   // inbound dedupe (TTL map with an outcome; see §13.2)
   seenInbound(messageId: string): boolean
   inboundOutcome(messageId: string): 'handling' | 'done' | 'failed' | undefined
@@ -447,7 +450,7 @@ export interface ChannelStore {
   // explicit binding (/bind exception path)
   setBinding(chatKey: string, sessionId: string | undefined): void
   bindings(): Readonly<Record<string, string>>
-  // outbound ledger (hermes state machine)
+  // outbound ledger (pending → attempting → delivered/failed/abandoned state machine)
   recordDelivery(key: string, out: { chatKey: string; textHash: string }): void   // pending
   markAttempting(key: string): void
   markDelivered(key: string, platformMessageIds: readonly string[]): void
@@ -457,10 +460,10 @@ export interface ChannelStore {
   sweepRecoverable(opts?: { now?: number; minAgeMs?: number }): Array<{ key: string; state: 'pending' | 'attempting' | 'failed'; chatKey: string; attempts?: number; errorKind?: SendErrorKind }>
   flush(): Promise<void>
 }
-export function createJsonFileStore(path: string): ChannelStore   // tmp+rename atomic write, 500ms debounce (im-bridge)
+export function createJsonFileStore(path: string): ChannelStore   // tmp+rename atomic write, 500ms debounce
 ```
 
-The ledger semantics copy hermes's conclusion: an `attempting` crash means the platform **may already have received it** — a redelivery must carry a visible "(recovered resend, may duplicate)" marker; honest at-least-once beats silent duplication or silent loss. attempts are capped, expired entries become `abandoned`, and a ledger failure must never block real sends (everything wrapped in try/catch).
+Ledger semantics: an `attempting` crash means the platform **may already have received it** — a redelivery must carry a visible "(recovered resend, may duplicate)" marker; honest at-least-once beats silent duplication or silent loss. attempts are capped, expired entries become `abandoned`, and a ledger failure must never block real sends (everything wrapped in try/catch).
 
 The interface is pure data operations + an explicit `flush`; unit tests use an in-memory implementation, and `createJsonFileStore` is the only file in the package that touches the filesystem (A6).
 
@@ -481,16 +484,16 @@ Degradation table (v1 scope):
 | Table | degrade to `<pre>` aligned text | as-is | aligned text |
 | Rest / unrecognized | as-is after HTML escaping | as-is | as-is |
 
-Rule: **incomplete structures stay literal** (LoserFox's unbalanced-fence lesson — a fragmentary `<pre>` gets rejected wholesale by Telegram); escaping is done only once per corresponding tier; call order is fixed `format → chunk` (render first, then segment; chunk's fence re-adding guarantees each segment is independently valid).
+Rule: **incomplete structures stay literal** (a fragmentary `<pre>` gets rejected wholesale by Telegram); escaping is done only once per corresponding tier; call order is fixed `format → chunk` (render first, then segment; chunk's fence re-adding guarantees each segment is independently valid).
 
-### 4.7 Bonus: promptHint (a lesson from hermes)
+### 4.7 Bonus: promptHint
 
 ```ts
 export function promptHint(channel: { id; formatTier; maxMessageChars; supportsChoices }): string
 // → "You are talking to the user through Telegram: limited HTML rich text is supported, a single message is capped at 4096 characters, and buttons are supported. Avoid wide tables; long code will be segmented."
 ```
 
-The provider registers this sentence as an agent-scoped systemPrompt context segment via `setup(agentCtx)` when creating the agent (`ctx.inject(['systemPrompt'], …)` on `agentCtx`, optional dependency, skip if missing). Without this step, the model emits markdown tables on plain-text platforms — hermes proved with `PLATFORM_HINTS` that this is a real problem.
+The provider registers this sentence as an agent-scoped systemPrompt context segment via `setup(agentCtx)` when creating the agent (`ctx.inject(['systemPrompt'], …)` on `agentCtx`, optional dependency, skip if missing). Without this step, the model emits markdown tables on plain-text platforms.
 
 ---
 
@@ -504,7 +507,7 @@ export const inject = ['channels', 'agents', 'credentials']   // approval is opt
 import type {} from '@deepseek-ai/dsh-user-approval'          // type-only
 
 export const Config: Schema<TelegramConfig> = Schema.object({
-  /** allowed Telegram user ids. Required, no permissive default (chatnode's stance: this is the front door of prompt injection) */
+  /** allowed Telegram user ids. Required, no permissive default (this is the front door of prompt injection) */
   allowedUserIds: Schema.array(Schema.number()).required(),
   provider: Schema.string().default('deepseek-official'),
   model: Schema.string(),
@@ -528,9 +531,9 @@ export function apply(ctx: Context, config: TelegramConfig) {
 }
 ```
 
-- The token **only goes through `ctx.credentials.resolve(credentialRef('TELEGRAM_BOT_TOKEN'))`**, resolved on every API call (changing the token needs no restart); the config file provides no token field, and logs redact it across the whole path (client-layer `redactToken`, copied from LoserFox).
+- The token **only goes through `ctx.credentials.resolve(credentialRef('TELEGRAM_BOT_TOKEN'))`**, resolved on every API call (changing the token needs no restart); the config file provides no token field, and logs redact it across the whole path (client-layer `redactToken`).
 - `TelegramChannel extends Channel`: `maxMessageChars = 4096`, `formatTier = 'html'`, `supportsChoices = true`, `supportsTyping = true`, `supportsEdit = true` (fact reporting; draft streaming uses it only in v2), `chatTypes = ['direct']` (v1).
-- The client keeps LoserFox's fetch-seam design (constructor-injected `fetch`/`baseUrl`, swapped with fakes in tests), and adds `sendMessage`'s `reply_markup` (inline keyboard) and `answerCallbackQuery`, plus `getUpdates`'s `allowed_updates: ['message', 'callback_query']`.
+- The client uses a fetch-seam design (constructor-injected `fetch`/`baseUrl`, swapped with fakes in tests), and adds `sendMessage`'s `reply_markup` (inline keyboard) and `answerCallbackQuery`, plus `getUpdates`'s `allowed_updates: ['message', 'callback_query']`.
 
 ### 5.2 Inbound Orchestration (the Wiring Order of the Six Grunt-Work Modules)
 
@@ -561,20 +564,20 @@ ctx.on('session/event') filters sessions bound to this channel:
                       deliveryKey = `${sessionId}:${event.seq}`        (seq is a natural idempotency key)
                       store.recordDelivery(key, …)
                       ctx.channels.deliver({ channel:'telegram', chatKey, markdown:text, deliveryKey })
-  turn/end(non-completed) → push a status line (❌/⏹/↯ + reason, im-bridge's label table)
+  turn/end(non-completed) → push a status line (❌/⏹/↯ + reason label table)
 Beyond deliver's innermost (the registry default), the provider side completes:
   renderForTier(markdown,'html') → chunkText({maxChars:4096}) → channel.send per segment
-  1s throttle between segments (Telegram per-chat rate limit); one segment fails → stop sending the rest (prevents reordering, im-bridge's lesson) → markFailed
+  1s throttle between segments (Telegram per-chat rate limit); one segment fails → stop sending the rest (prevents reordering) → markFailed
   all succeed → markDelivered
 At startup store.sweepRecoverable() → redeliver with a "(recovered resend)" marker → no duplicate delivery of already-delivered ones (second half of A4)
 ```
 
-On HTML send failure, automatically degrade to plain text and retry once (LoserFox's `safeSend` two-path approach).
+On HTML send failure, automatically degrade to plain text and retry once (the two-path send).
 
 ### 5.4 Approval and progress
 
-- **Approval**: `supportsChoices = true` → inline keyboard (`callback_data: appr:<num>:<1|0>`, same style as hermes's cross-platform callback id convention); a callback arrives → `answerCallbackQuery` + broker answer + edit the original message to "✅ Approved". Text replies (`approve/reject/1/2`) are valid at the same time — buttons are just a shortcut, keeping the degradation path always available and testable. Timeout → `next()` (§4.4 contract).
-- **progress heartbeat** (optional, off by default): only when a turn has been open longer than `digestIntervalSec`, send a one-line digest ("⏳ turn 3 · 5 tools called · latest: Bash"; chatnode's `digestLine` folds from the log, so it's naturally replayable); fast tasks produce zero noise (openclaw's gating principle).
+- **Approval**: `supportsChoices = true` → inline keyboard (`callback_data: appr:<num>:<1|0>`, a platform-agnostic callback id convention); a callback arrives → `answerCallbackQuery` + broker answer + edit the original message to "✅ Approved". Text replies (`approve/reject/1/2`) are valid at the same time — buttons are just a shortcut, keeping the degradation path always available and testable. Timeout → `next()` (§4.4 contract).
+- **progress heartbeat** (optional, off by default): only when a turn has been open longer than `digestIntervalSec`, send a one-line digest ("⏳ turn 3 · 5 tools called · latest: Bash"; the digest line folds from the log, so it's naturally replayable); fast tasks produce zero noise (the timer-gating principle: only a timer trigger creates progress output).
 
 ### 5.5 Wiring (R9)
 
@@ -636,11 +639,11 @@ Per T7's advice, **T7's interface-call checklist is listed in the first week of 
 | M2 | `dsh-channel-kit`: six modules + T5 all green | A6 |
 | M3 | `dsh-channel-telegram` end-to-end + T1/T3/T4 | A1 A3 A4 |
 | M4 | Next platform (Discord / WeChat / Feishu / …) + T7; from then on **each added platform is one more reproduction of A5**, the repo keeps growing | A5 |
-| M5 | npm publish + `dsh-plugin` topic + awesome-dsh-plugin PR + an "add a new platform" tutorial (hermes's ADDING_A_PLATFORM is the style template: one table for the required surface, one for the optional surface, itemized degradation notes) | — |
+| M5 | npm publish + `dsh-plugin` topic + awesome-dsh-plugin PR + an "add a new platform" tutorial (one table for the required surface, one for the optional surface, itemized degradation notes) | — |
 | M6 | Media (§10): contract adds `InboundMedia`/`OutboundMedia`/`supportsMedia`/`sendMedia`; Telegram `getFile` download + `sendPhoto`/`sendDocument` send | Image end-to-end (inbound lands in the log, outbound reachable) |
 | M7 ✅ | Capability hardening (§12): inbound media size cap, generic outbound retry/backpressure queue, `mentionsBot` fix, reaction-based ack; plus the configuration/settings seam (§11) | P0 hardening green; full suite (channel+kit+config+3 providers) passes |
-| M8–M10 ✅ | Capability reach: multi-account, reconciliation seam, reply/thread/silent delivery, pairing-login interface, outbound proxy (`docs/archive/dsh-channel-capability-roadmap.md`) | Contract additive only; A5 re-checked |
-| M11–M14 ✅ | Mechanism hardening + the `ChannelBridge` handler layer (§13); M14 audits M11–M13 against the tree (`docs/archive/dsh-channel-mechanism-roadmap.md` §10) | Conformance suite + capability proofs per provider; providers hold transport only |
+| M8–M10 ✅ | Capability reach: multi-account, reconciliation seam, reply/thread/silent delivery, pairing-login interface, outbound proxy | Contract additive only; A5 re-checked |
+| M11–M14 ✅ | Mechanism hardening + the `ChannelBridge` handler layer (§13); M14 audits M11–M13 against the tree | Conformance suite + capability proofs per provider; providers hold transport only |
 
 ---
 
@@ -692,7 +695,7 @@ interface InboundMedia {
 ### 10.3 Outbound Send
 
 ```ts
-// Channel abstract class: capability facts + optional methods (conservative base defaults, degrading like hermes's send_image/send_file)
+// Channel abstract class: capability facts + optional methods (conservative base defaults + degradation)
 get supportsMedia(): boolean { return false }
 async sendMedia(_chatKey: string, _media: OutboundMedia, _opts?: { signal?: AbortSignal }): Promise<{ platformMessageId: string }> {
   throw new Error(`${this.id} does not support media`)
@@ -710,7 +713,7 @@ interface OutboundMedia {
 }
 ```
 
-- Aligned with hermes: `send_image/send_file` are **optional adapter methods + base-class degradation** (hermes defaults to "⚠️ Couldn't deliver…" and **never echoes host paths**). Adding methods only one platform can implement to `Channel` is forbidden (R6).
+- Media send is an **optional adapter method + base-class degradation** (the default replies "⚠️ Couldn't deliver…" and **never echoes host paths**). Adding methods only one platform can implement to `Channel` is forbidden (R6).
 - Telegram implementation: `supportsMedia = true`; `getFile` (inbound download) + `sendPhoto`/`sendDocument` (outbound); `filePath` resolution anchored to `meta.cwd`, out-of-bounds rejected.
 
 ---
@@ -780,9 +783,7 @@ Host-side wiring is complete, but rc.6's apiproxy only exposes a hardcoded `WEB_
 
 ## 13. The `ChannelBridge` Handler Layer (M11–M14)
 
-> Status: shipped · Architecture: `docs/archive/dsh-channel-policy-abstraction.md` · Mechanisms and
-> the post-M13 audit: `docs/archive/dsh-channel-mechanism-roadmap.md` §10 (both archived — history,
-> not plans).
+> Status: shipped (M11–M14).
 
 §5.2/§5.3 describe the inbound and outbound orchestration as Telegram's. It is no longer:
 `dsh-channel-kit`'s `ChannelBridge` is that orchestration, written once, and the providers are
@@ -834,8 +835,6 @@ either one inline would let a status line land between two chunks of the answer 
 ## Appendix A: Reference Index
 
 - dsh: `packages/fs/fs` (definition-package paradigm) · `packages/llm/llm` (registry paradigm) · `packages/interaction/user-approval` (waterfall answerer and audit pair) · `packages/core/agent` (`AgentRegistry`/`Agent`) · `packages/core/session` (`SessionEventMap`/fork) · `packages/credentials/credentials` · `docs/cordis-tutorial/01–07` · `docs/architecture.md`
-- Reference implementations: [LoserFox/telegram](https://github.com/LoserFox/telegram) · [BiBoyang/dsh-im-bridge](https://github.com/BiBoyang/dsh-im-bridge) · [Jesse-njx/dsh-chatnode-wechat](https://github.com/Jesse-njx/dsh-chatnode-wechat) · [nowledge-mem](https://github.com/nowledge-co/nowledge-mem-deepseek-harness)
-- Mature gateways: [hermes-agent](https://github.com/NousResearch/hermes-agent) (`gateway/platforms/ADDING_A_PLATFORM.md`, `gateway/delivery_ledger.py`) · [openclaw](https://github.com/openclaw/openclaw) (`src/channels/plugins/types.plugin.ts`, `src/channels/inbound-debounce-policy.ts`, `src/channels/streaming.ts`)
 
 ---
 

@@ -42,7 +42,7 @@ The rest of this document:
 5. [Tool execution pipeline](#5-tool-execution-pipeline) — `tools/*` events and approval degradation
 6. [Session log and SessionEventMap](#6-session-log-and-sessioneventmap) — single source of truth
 7. [Repo-wide common type patterns](#7-repo-wide-common-type-patterns) — `…Map→union` and Branded ids
-8. [Alignment check against this project's design](#8-alignment-check-against-this-projects-design) — summary (see `archive/dsh-core-alignment-audit.md` for details)
+8. [Alignment check against this project's design](#8-alignment-check-against-this-projects-design) — summary (the item-by-item audit lives in git history)
 
 ---
 
@@ -134,7 +134,7 @@ is the subset of the official full table most relevant to this project/backbone 
 | `ctx.invariants` | **core** | dsh-invariants | `InvariantRegistry` | session, agent, scope, agent-loop | package-owned runtime invariant registry |
 
 > The precise signatures of this project's touchpoints (rc.6 source line numbers) are in §3,
-> §5, §6 and `archive/dsh-core-alignment-audit.md`.
+> §5 and §6.
 
 ---
 
@@ -432,8 +432,8 @@ dependencies). Structurally a string, but not interchangeable at the type level.
 
 ## 8. Alignment check against this project's design
 
-The **item-by-item check** of `dsh-channel-design.md` §1.1/§1.2 and R1–R10 (now design §6) —
-each entry with its rc.6 source line numbers — is in `archive/dsh-core-alignment-audit.md`.
+The **item-by-item check** of `dsh-channel-design.md` §1.1/§1.2 and R1–R10 (now design §6) was
+run against the rc.6 source line by line; the full audit record lives in git history.
 
 Summary conclusion:
 - **The `ChannelRegistry`(core) + `Channel` (plain abstract-class seam) split, the mapping to

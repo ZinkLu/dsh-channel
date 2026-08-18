@@ -4,7 +4,7 @@
  * Today reasoning is only ever *stripped* (never shown): `stream.ts` maps
  * `reasoning-delta` to `noop`, and `assistantMessageText` drops non-`text` blocks.
  * This module is the seam for the opposite direction — presenting thinking as a
- * status line — following openclaw's `ReasoningLevel = off | on | stream`:
+ * status line — a three-level `thinkingLevel = off | on | stream`:
  *
  *   off    → never hand thinking down (the default; no behavior change)
  *   on     → fold the *final* reasoning block into one status line

@@ -24,7 +24,7 @@ export class FeishuChannel extends Channel {
     return this.account
   }
 
-  // Feishu text messages are capped at 4096 chars (same as openclaw/mimiclaw).
+  // Feishu text messages are capped at 4096 chars.
   get maxMessageChars(): number | undefined {
     return 4096
   }

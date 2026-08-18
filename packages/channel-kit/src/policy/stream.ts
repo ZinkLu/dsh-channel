@@ -3,7 +3,7 @@
  *
  * Pure function (timers live outside, as in merge.ts): `streamReduce(state, input, caps, now, render)`
  * returns new state + frames. Frames are presentation intents (final/draft/draft-finalize/
- * status-line/arm-timer), executed by the bridge layer. Gating follows openclaw: in progress
+ * status-line/arm-timer), executed by the bridge layer. Gating rule: in progress
  * mode the first tool event only arms a 1500ms timer, and the draft is created only when the
  * timer fires, so quick answers produce zero noise. block (text-chunk editing) v1 degrades to
  * terminal-state delivery.
@@ -131,8 +131,8 @@ function reduceProgress(
 
     case 'edit-failed': {
       // The bridge supplies what the user actually saw — the last *accepted*
-      // render, never the update that just failed (openclaw: only accepted
-      // renders may become the baseline). Flip to append-tail mode permanently
+      // render, never the update that just failed (only accepted renders may
+      // become the baseline). Flip to append-tail mode permanently
       // this turn, and emit the failed update's own tail so its content still
       // reaches the user instead of dying with the edit.
       const visiblePrefix = input.visiblePrefix ?? state.visiblePrefix

@@ -1,5 +1,5 @@
 /**
- * Draft finalization decision (openclaw message/live.ts:117-236). Decides how
+ * Draft finalization decision. Decides how
  * a preview draft and the final assistant text relate, as a pure function so
  * the four outcomes are explicit and testable.
  */

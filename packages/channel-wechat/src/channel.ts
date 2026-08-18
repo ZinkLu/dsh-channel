@@ -26,7 +26,7 @@ export class WeChatChannel extends Channel {
     return this.account
   }
 
-  // WeChat iLink per-message text limit (hermes weixin MAX_MESSAGE_LENGTH=2000).
+  // WeChat iLink per-message text limit.
   get maxMessageChars(): number | undefined {
     return 2000
   }
@@ -38,7 +38,7 @@ export class WeChatChannel extends Channel {
   get supportsChoices(): boolean {
     return false
   }
-  // WeChat does not support editing sent messages (hermes SUPPORTS_MESSAGE_EDITING=False).
+  // WeChat does not support editing sent messages.
   get supportsEdit(): boolean {
     return false
   }

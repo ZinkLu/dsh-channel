@@ -5,13 +5,11 @@ import { proxiedFetch } from 'dsh-channel-kit'
 /**
  * WeChat (WeChat) iLink Bot API client.
  *
- * WeChat has no public Bot API like Telegram's; hermes' weixin adapter uses Tencent's
+ * WeChat has no public Bot API like Telegram's; this provider uses Tencent's
  * **iLink Bot API** (`https://ilinkai.weixin.qq.com`), long-polling inbound messages
  * with `getupdates` — hence it maps almost one-to-one to Telegram's `getUpdates`, and
  * the bridge can fully reuse the same orchestration (merge / route / approval / ledger),
  * swapping only the transport and capability facts.
- *
- * Reference: NousResearch/hermes-agent `gateway/platforms/weixin.py` (iLink Bot API).
  */
 
 export const DEFAULT_BASE_URL = 'https://ilinkai.weixin.qq.com'
@@ -134,7 +132,7 @@ export class WeixinClient {
   private readonly baseUrl: string
   private readonly fetchImpl: typeof fetch
   private readonly timeoutMs: number
-  /** peer chatKey → most recent inbound context_token (an in-memory version of hermes ContextTokenStore). */
+  /** peer chatKey → most recent inbound context_token (needed to address replies to that peer). */
   private readonly contextTokens = new Map<string, string>()
 
   constructor(opts: WeixinClientOptions = {}) {
@@ -202,7 +200,7 @@ export class WeixinClient {
     }, { timeoutMs: 10_000, signal })
   }
 
-  /** Fetch the peer's typing ticket (required by sendtyping; same as hermes' `_get_config`). */
+  /** Fetch the peer's typing ticket (required by sendtyping). */
   async getConfig(
     token: string,
     chatKey: string,
@@ -282,7 +280,7 @@ export function chatTypeOf(message: WeixinMessage, accountId: string): 'direct' 
   const roomId = String(message.room_id ?? message.chat_room_id ?? '').trim()
   if (roomId) return 'group'
   const toUserId = String(message.to_user_id ?? '').trim()
-  // hermes _guess_chat_type: treat as a group chat when to_user_id is not self and it is a user message.
+  // Treat as a group chat when to_user_id is not self and it is a user message.
   if (toUserId && accountId && toUserId !== accountId && message.msg_type === MSG_TYPE_USER) return 'group'
   return 'direct'
 }

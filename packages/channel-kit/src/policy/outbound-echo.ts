@@ -1,5 +1,5 @@
 /**
- * Outbound echo suppression (openclaw `outbound-echo.ts`): remember the
+ * Outbound echo suppression: remember the
  * platform message ids of our own sends for a short TTL, and drop inbound
  * messages that match. This is for platforms without a reliable bot flag
  * (WeChat personal accounts) where the platform replays the bot's own sends

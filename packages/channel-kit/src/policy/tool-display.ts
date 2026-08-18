@@ -1,7 +1,7 @@
 /**
  * Tool call/result → a single line of "human-readable" text.
  *
- * Aligned with openclaw's `tool-display.ts`: `resolveToolDisplay` splits name+args into
+ * `resolveToolDisplay` splits name+args into
  * `{emoji,label,detail}`; the shell family (bash/exec/shell/pwsh, or arguments with a
  * `command`) puts the command on its own line; `formatToolLine` / `formatToolResultLine`
  * produce the final text, always truncated + redacted.

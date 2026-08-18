@@ -8,7 +8,6 @@ import { proxiedFetch } from 'dsh-channel-kit'
  * Sending goes over HTTP (authenticated with tenant_access_token), while inbound uses
  * **long-connection mode** (fetch the wss address from `callback/ws/endpoint`, then open a
  * persistent connection), so like Telegram/WeChat it needs **no public address and no webhook**.
- * Reference: the openclaw Feishu plugin (`@larksuiteoapi/node-sdk`) / mimiclaw feishu_bot.c.
  */
 
 export type FeishuDomain = 'feishu' | 'lark'

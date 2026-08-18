@@ -16,7 +16,6 @@
  * Only the two wire types this envelope needs — varint and length-delimited — are implemented,
  * without pulling in a third-party protobuf library (keeping the provider dependency-free at
  * runtime, consistent with the Telegram/WeChat fetch seam).
- * Reference: the openclaw community Feishu plugin / mimiclaw feishu_bot.c frame parsing.
  */
 
 export interface FeishuWsFrame {

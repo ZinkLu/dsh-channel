@@ -1,5 +1,5 @@
 /**
- * Adaptive draft-edit throttle (hermes stream_consumer.py:2328-2367): flood →
+ * Adaptive draft-edit throttle: flood →
  * interval doubles; any success → strikes reset to zero; server `retry_after`
  * is honored only up to a ceiling. Beyond the ceiling the reducer reports
  * `fail-over` instead of stalling the user.

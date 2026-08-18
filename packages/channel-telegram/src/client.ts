@@ -402,8 +402,8 @@ export interface ClassifiedSendError {
 }
 
 /**
- * Telegram send-error classification table (hermes platforms/base.py:2484-2520,
- * adapted to Bot API error_code + description). `not_found` is split by blast
+ * Telegram send-error classification table: map Bot API error_code + description
+ * onto the contract's SendErrorKind taxonomy. `not_found` is split by blast
  * radius in the caller when it has both a chat and an edit target.
  */
 export function classifyTelegramSendError(error: TelegramApiError): ClassifiedSendError {

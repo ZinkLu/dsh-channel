@@ -33,7 +33,7 @@ export interface MergeOptions {
   /**
    * Hard cap on how long a buffered run may live: `firstAt + windowMs * maxWindowMultiplier`.
    * Continuous typing keeps resetting `deadline`; `firstAt` stays fixed so the lane
-   * cannot be held open forever. openclaw caps the total wait the same way. Default 5.
+   * cannot be held open forever. Default 5.
    */
   maxWindowMultiplier?: number
 }
@@ -54,7 +54,7 @@ export function mergeReduce(state: MergeState, input: MergeInput, opts: MergeOpt
 
   const deadlineFor = (firstAt: number, now: number) => Math.min(now + windowMs, firstAt + windowMs * maxWindowMultiplier)
 
-  // Two of openclaw's three iron rules share one shape: commands must not be
+  // Two of the three merge iron rules share one shape: commands must not be
   // delayed by debouncing, and a media message must not be merged into the text
   // batch. Both flush what is buffered and then bypass with their own text.
   if (isCommand || hasMedia) {

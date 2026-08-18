@@ -35,9 +35,8 @@ export function stripToolCallMarkup(text: string): string {
 }
 
 /**
- * Strip reasoning/thinking content from *visible* text (same as openclaw's
- * `stripReasoningTagsFromText`): remove `<reasoning>`/`<thinking>` tag blocks and
- * `Reasoning:`/`Thinking:` preamble lines.
+ * Strip reasoning/thinking content from *visible* text: remove
+ * `<reasoning>`/`<thinking>` tag blocks and `Reasoning:`/`Thinking:` preamble lines.
  *
  * `mode:'preserve'` protects code fences with placeholders so tags inside fences stay
  * literal; `strict` strips everywhere. Together with `stripToolCallMarkup` this is the

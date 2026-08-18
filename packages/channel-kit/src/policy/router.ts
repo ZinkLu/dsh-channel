@@ -29,7 +29,7 @@ export function route(
 
   if (text === '') return { kind: 'drop', reason: 'empty' }
 
-  // v1 does not route group chats (chatnode's stance: iLink group semantics are unclear + large prompt-injection surface).
+  // v1 does not route group chats (unclear ownership semantics + a large prompt-injection surface).
   if (msg.chatType !== 'direct') {
     return { kind: 'drop', reason: 'group-unsupported' }
   }
