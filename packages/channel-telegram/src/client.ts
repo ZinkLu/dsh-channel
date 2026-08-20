@@ -134,6 +134,9 @@ export class TelegramApiError extends Error {
   }
 }
 
+/** Slack over the server-side long-poll hold before the HTTP deadline fires (network + queueing). */
+const LONG_POLL_GRACE_MS = 10_000
+
 export class TelegramClient {
   private readonly baseUrl: string
   private readonly fetchImpl: typeof fetch
@@ -156,11 +159,16 @@ export class TelegramClient {
   }
 
   async getUpdates(token: string, opts: { offset?: number; timeoutSec?: number; allowedUpdates?: readonly string[]; signal?: AbortSignal } = {}): Promise<TelegramUpdate[]> {
+    const holdSec = opts.timeoutSec ?? 30
     const query = new URLSearchParams()
     if (opts.offset !== undefined) query.set('offset', String(opts.offset))
-    query.set('timeout', String(opts.timeoutSec ?? 30))
+    query.set('timeout', String(holdSec))
     query.set('allowed_updates', JSON.stringify(opts.allowedUpdates ?? ['message', 'callback_query']))
-    const result = await this.callApi(token, `getUpdates?${query.toString()}`, undefined, opts.signal)
+    // The server holds an idle long poll for the FULL `timeout` before answering
+    // empty, so the HTTP deadline must exceed the hold — a flat client timeout
+    // equal to it makes every idle poll die at the wire and the bot look
+    // permanently disconnected the moment traffic pauses.
+    const result = await this.callApi(token, `getUpdates?${query.toString()}`, undefined, opts.signal, holdSec * 1000 + LONG_POLL_GRACE_MS)
     return (result as TelegramUpdate[]) ?? []
   }
 
@@ -327,10 +335,10 @@ export class TelegramClient {
     }
   }
 
-  private async callApi<T>(token: string, method: string, body: unknown, signal?: AbortSignal): Promise<T> {
+  private async callApi<T>(token: string, method: string, body: unknown, signal?: AbortSignal, timeoutMs = this.timeoutMs): Promise<T> {
     const url = `${this.baseUrl}/bot${token}/${method}`
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(new Error(`telegram api timeout after ${this.timeoutMs}ms`)), this.timeoutMs)
+    const timer = setTimeout(() => controller.abort(new Error(`telegram api timeout after ${timeoutMs}ms`)), timeoutMs)
     timer.unref?.()
     const onOuterAbort = () => controller.abort(signal?.reason)
     signal?.addEventListener('abort', onOuterAbort, { once: true })

@@ -72,9 +72,12 @@ export class WeChatBridge extends ChannelBridge<WeChatBridgeConfig> {
     while (!signal.aborted) {
       try {
         const token = await this.requireToken()
+        // Margin over the poll window: iLink decides the server-side hold, and a
+        // deadline equal to it would kill every idle poll at the wire (the
+        // Telegram client had exactly that pathology).
         const response = await this.client.getUpdates(token, {
           syncBuf,
-          timeoutMs: this.config.pollingTimeoutSec * 1000,
+          timeoutMs: this.config.pollingTimeoutSec * 1000 + 10_000,
           signal,
         })
 

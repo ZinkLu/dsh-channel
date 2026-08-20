@@ -237,3 +237,31 @@ test('classifyTelegramSendError maps flood control and forbidden to the taxonomy
   assert.equal(classifyTelegramSendError(new TelegramApiError('long', 'message is too long', 400)).errorKind, 'too_long')
   assert.equal(classifyTelegramSendError(new TelegramApiError('parse', "can't parse entities", 400)).errorKind, 'bad_format')
 })
+
+test('getUpdates outlives the flat client timeout for the long-poll hold', async () => {
+  // A fetch that answers only after 200ms and honors aborts, over a client whose
+  // flat timeout (50ms) is far below that: the long-poll deadline (hold + grace)
+  // must keep the poll alive; every other call still dies at the flat timeout.
+  const slowFetch = ((/* url */ _u: string | URL | Request, init?: RequestInit) =>
+    new Promise<Response>((resolve, reject) => {
+      const timer = setTimeout(() => resolve(new Response(JSON.stringify({ ok: true, result: [] }), { status: 200 })), 200)
+      init?.signal?.addEventListener('abort', () => {
+        clearTimeout(timer)
+        reject(init.signal!.reason ?? new Error('aborted'))
+      }, { once: true })
+    })) as typeof fetch
+
+  const client = new TelegramClient({ baseUrl: 'https://example.test', fetch: slowFetch, timeoutMs: 50 })
+
+  const updates = await client.getUpdates('tok', { timeoutSec: 0 })
+  assert.deepEqual(updates, [])
+
+  await assert.rejects(
+    () => client.getMe('tok'),
+    (error: unknown) => {
+      assert.ok(error instanceof TelegramApiError)
+      assert.ok(error.message.includes('timeout after 50ms'))
+      return true
+    },
+  )
+})
