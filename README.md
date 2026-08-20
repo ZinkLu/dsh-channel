@@ -127,7 +127,14 @@ the repo tree. Credentials come from your `$DSH_HOME` as usual (`dsh credentials
 npm run build
 scripts/run-dev-bot.sh               # web UI + Telegram bridge, full agent
 scripts/run-dev-bot.sh --port 5299   # extra args go to the web app
+DEV_BOT_LOG_LEVEL=2 scripts/run-dev-bot.sh   # runtime log threshold (0 error · 1 info · 2 warn · 3 debug; default 3)
 ```
+
+Runtime logs: dsh itself ships no log sink — `ctx.logger` only fills an in-memory buffer, so a bare
+host prints nothing beyond `dsh web: http://…`. The dev bot therefore inserts
+[`scripts/dev-logger.mjs`](./scripts/dev-logger.mjs), a dev-only stderr exporter (the script copies it
+into the profile directory; `dev-bot.yaml` references it as `./dev-logger.mjs`). Any other debugging
+profile can take the same file plus that one patch row.
 
 Note: two processes long-polling the same bot token fight over `getUpdates` (Telegram 409) — stop any
 other instance using the token first.
@@ -310,7 +317,13 @@ profile（web profile 同款 bundle 栈 + 本仓库四个包的 `file:` 依赖�
 npm run build
 scripts/run-dev-bot.sh               # web UI + Telegram bridge，完整 agent
 scripts/run-dev-bot.sh --port 5299   # 额外参数透传给 web app
+DEV_BOT_LOG_LEVEL=2 scripts/run-dev-bot.sh   # 运行时日志阈值（0 error · 1 info · 2 warn · 3 debug；默认 3）
 ```
+
+运行时日志：dsh 自身没有日志 sink——`ctx.logger` 只写一个内存 buffer，裸宿主除了 `dsh web: http://…`
+什么都不打印。因此 dev bot 插入了 [`scripts/dev-logger.mjs`](./scripts/dev-logger.mjs)，一个仅供调试的
+stderr 导出器（脚本会把它拷进 profile 目录，`dev-bot.yaml` 以 `./dev-logger.mjs` 引用）。其他调试
+profile 拿同一个文件加同一行 patch 即可。
 
 注意：两个进程用同一个 bot token 长轮询会互抢 `getUpdates`（Telegram 409）——先停掉占用
 该 token 的其他实例。

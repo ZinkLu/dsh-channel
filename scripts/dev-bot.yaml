@@ -6,6 +6,16 @@
 # Secrets never go here: `dsh credentials set TELEGRAM_BOT_TOKEN ...` or the
 # TELEGRAM_BOT_TOKEN environment variable.
 
+# Runtime logs: dsh ships no log sink (ctx.logger only fills an in-memory
+# buffer), so this dev-only row attaches a stderr exporter. The script copies
+# scripts/dev-logger.mjs into the profile directory, which `./` resolves against.
+- insert:
+    - id: dev-logger
+      name: ./dev-logger.mjs
+      config:
+        level: !!js Number(process.env.DEV_BOT_LOG_LEVEL ?? 3)   # 0 error · 1 info · 2 warn · 3 debug
+        levels:
+          hmr: 1                       # per-logger overrides by logger name
 - insert:
     - id: channel
       name: dsh-channel

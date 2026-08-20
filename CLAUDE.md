@@ -37,7 +37,7 @@ TELEGRAM_BOT_TOKEN='...' node scripts/run-echo-bot.mjs   # echo bot, no model
 scripts/run-dev-bot.sh                                     # full agent via the real dsh launcher + scripts/dev-bot.yaml
 ```
 
-`run-dev-bot.sh` maintains a `dev-bot` profile under `$DSH_HOME` with this repo's packages as `file:` deps (copies, refreshed from `packages/*/lib` each launch) and runs from the gitignored `agent-workspace/`. Two processes long-polling one bot token collide (Telegram 409).
+`run-dev-bot.sh` maintains a `dev-bot` profile under `$DSH_HOME` with this repo's packages as `file:` deps (copies, refreshed from `packages/*/lib` each launch) and runs from the gitignored `agent-workspace/`. Two processes long-polling one bot token collide (Telegram 409) — check `ps` for a running `dsh` before starting another. dsh rc.6 has no log sink (`ctx.logger` only fills an in-memory buffer); `scripts/dev-logger.mjs` is the dev-only stderr exporter the dev bot inserts (`DEV_BOT_LOG_LEVEL`, default 3=debug; cordis levels are error 0 < info 1 < warn 2 < debug 3, default threshold 1 drops `warn`).
 
 ## Architecture
 

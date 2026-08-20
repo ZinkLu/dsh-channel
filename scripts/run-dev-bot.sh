@@ -8,6 +8,10 @@
 #   npm run build                        # after code changes
 #   scripts/run-dev-bot.sh               # web UI + Telegram bridge, full agent
 #   scripts/run-dev-bot.sh --port 5299   # extra args go to the web app
+#   DEV_BOT_LOG_LEVEL=2 scripts/run-dev-bot.sh   # runtime log threshold (default 3 = debug)
+#
+# Runtime logs go to stderr through scripts/dev-logger.mjs (dsh itself ships no
+# log sink); session transcripts stay under $DSH_HOME/sessions as usual.
 #
 # Credentials (shared with your other profiles via $DSH_HOME):
 #   npx -y @deepseek-ai/dsh credentials set TELEGRAM_BOT_TOKEN '...'
@@ -62,6 +66,11 @@ packages:
 nodeLinker: hoisted
 autoInstallPeers: false
 EOF
+
+# The dev logger sink is a plain file the loader imports relative to the
+# profile directory (`name: ./dev-logger.mjs` in dev-bot.yaml), so ship the
+# current copy alongside the manifest.
+cp "$REPO/scripts/dev-logger.mjs" "$PROFILE_DIR/dev-logger.mjs"
 
 # pnpm's file: dependencies are copies, not links — refresh from the current
 # build on every launch so the bot never runs stale code.
