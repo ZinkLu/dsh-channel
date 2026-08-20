@@ -16,6 +16,7 @@ import { SessionId, type Session, type SessionEvent } from '@deepseek-ai/dsh-ses
 import type {} from '@deepseek-ai/dsh-user-approval'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type { Channel, InboundMessage, OutboundMessage, PresentationFrame, SendErrorKind } from 'dsh-channel'
+import type { AgentRoutingConfig, ChannelBehaviorConfig } from '../config/common.js'
 import { chunkText } from '../format/chunk.js'
 import { renderForTier } from '../format/format.js'
 import { promptHint } from '../format/prompt-hint.js'
@@ -47,17 +48,14 @@ import { InteractionBroker, type AskUserQuestionRequestLike, type AskUserQuestio
 import { KeyedTimers, settledWithin } from './timing.js'
 import type { ChannelStore } from './store.js'
 
-/** Common config surface the base handler reads; providers widen it with their own fields. */
-export interface BridgeConfig {
-  readonly provider: string
-  readonly model?: string
-  readonly cwd?: string
-  readonly agentPreset?: string
-  readonly mergeWindowSec: number
-  readonly approvalTimeoutSec: number
-  /** Max wait to acquire the per-sessionId turn guard before a visible rejection. Default 120. */
-  readonly sessionTurnTimeoutSec?: number
-}
+/**
+ * Common config surface the base handler reads; providers widen it with their own
+ * fields. Derived from the shared `config/` fragments so the field set cannot
+ * drift from the schema every provider composes.
+ */
+export interface BridgeConfig
+  extends AgentRoutingConfig,
+    Pick<ChannelBehaviorConfig, 'mergeWindowSec' | 'approvalTimeoutSec' | 'sessionTurnTimeoutSec'> {}
 
 /** The two policy seams; each defaults to today's behavior. */
 export interface BridgePolicyOverrides {

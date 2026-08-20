@@ -3,7 +3,7 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { CHANNEL_WECHAT_NS, CREDENTIAL_WECHAT_TOKEN, wechatConfigSchema, type WeChatConfig } from 'dsh-channel-config'
+import { CHANNEL_WECHAT_NS, CREDENTIAL_WECHAT_TOKEN, wechatConfigSchema, type WeChatConfig } from './config.js'
 import { createJsonFileStore } from 'dsh-channel-kit'
 import { WeChatBridge, type WeChatBridgeConfig } from './bridge.js'
 import { WeChatChannel } from './channel.js'
@@ -13,7 +13,8 @@ export const name = 'dsh-channel-wechat'
 export const inject = ['channels', 'agents', 'credentials'] as const
 
 export const Config = wechatConfigSchema()
-export type { WeChatConfig } from 'dsh-channel-config'
+export { CHANNEL_WECHAT_NS, CREDENTIAL_WECHAT_ACCOUNT_ID, CREDENTIAL_WECHAT_TOKEN, wechatConfigSchema } from './config.js'
+export type { WeChatConfig } from './config.js'
 
 export function resolveStatePath(config: WeChatConfig): string {
   if (config.statePath) return config.statePath

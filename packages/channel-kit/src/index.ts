@@ -1,11 +1,13 @@
 // dsh-channel-kit public surface.
 //
-// Directory layout (one-way dependency direction: bridge → policy → format):
+// Directory layout (one-way dependency direction: bridge → policy → format; config is a leaf):
 //   format/  leaf text & transport shaping, no decisions, no state
 //   policy/  decision logic as pure functions + the policy interfaces
+//   config/  shared schemastery fragments every provider composes its Config from
 //   bridge/  the handler: ChannelBridge base + store
 //
 // Every export below keeps its historical name so existing providers/tests stay green.
+export * from './config/common.js'
 export * from './format/chunk.js'
 export * from './format/format.js'
 export * from './format/http-proxy.js'

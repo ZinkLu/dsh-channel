@@ -720,24 +720,23 @@ interface OutboundMedia {
 
 ## 11. Configuration and Settings Seam
 
-> Status: shipped (M7) · The three providers' config is consolidated into one leaf package and wired into dsh's `settings` seam.
+> Status: shipped (M7); config ownership revised 2026-08-20 — shared fragments live in the kit, every platform schema lives in its provider.
 
-### 11.1 `dsh-channel-config` (leaf package)
+### 11.1 Config fragments (`dsh-channel-kit/config/`) and per-provider `Config`
 
-One source of truth for every channel config shape. It depends only on `@deepseek-ai/schemastery` (peer) and exports three things:
+Configuration has two layers, and the split follows who consumes each piece:
 
-1. Shared schema constructors — `agentRoutingSchema()` / `channelBehaviorSchema()` / `allowedUserIdsSchema(elem)`.
-2. Per-provider config schemas + their TS types — `telegramConfigSchema()`/`TelegramConfig`, `wechatConfigSchema()`/`WeChatConfig`, `feishuConfigSchema()`/`FeishuConfig`.
-3. Namespace + credential-ref string constants (`CHANNEL_TELEGRAM_NS`, `CREDENTIAL_TELEGRAM_BOT_TOKEN`, …), zero-dependency so both the host (Node) and a future client bundle can reuse them.
+1. **Shared fragments** — `agentRoutingSchema()` / `channelBehaviorSchema()` / `allowedUserIdsSchema(elem)` with their business interfaces `AgentRoutingConfig` / `ChannelBehaviorConfig`. They live in the kit (`src/config/common.ts`), because every provider composes its `Config` from them and the bridge reads them: `BridgeConfig` is *derived* from these interfaces, so the field set the handler reads and the schema a provider exposes cannot drift.
+2. **Per-provider schema + names** — each provider's `src/config.ts` spreads the fragments into a `Schema.object` with its platform fields, and declares its own settings namespace (`CHANNEL_<PLATFORM>_NS`) and credential-ref constants (`CREDENTIAL_*`). Each of these has exactly one consumer — that provider — so it is not shared.
 
-Why not inside `dsh-channel-kit`: kit is a zero-runtime-dependency pure-function library; config schemas need schemastery. Keeping them apart preserves the one-way dependency direction `provider → config / kit / channel`.
+Why there is no separate config package: the only thing a `dsh-channel-config` package would hold beyond the fragments is a list of every platform's schema and namespace — a shared package that must change for each new platform, which is the built-in platform list §1.3 rules out and the A5 promise ("a new platform adds one package and touches no shared one") forbids. The fragments alone are ~60 lines and follow the same rule of three the backlog applies to the kit itself (§3.2: directories, not packages). The kit peers on `@deepseek-ai/schemastery` for this; every provider and `dsh-settings` already did.
 
-Common base shared by all three providers:
+Common base shared by every provider:
 
 | Fragment | Fields |
 |---|---|
 | Agent routing | `provider` (default `deepseek-official`), `model?`, `cwd?`, `agentPreset?` |
-| Behavior + persistence | `mergeWindowSec` (5), `approvalTimeoutSec` (120), `statePath?`, `maxInboundMediaBytes` (20 MiB), `accountId?` (multi-account instance discriminator), `proxyUrl?` (outbound proxy) |
+| Behavior + persistence | `mergeWindowSec` (5), `approvalTimeoutSec` (120), `sessionTurnTimeoutSec?` (bridge default 120), `statePath?`, `maxInboundMediaBytes` (20 MiB), `accountId?` (multi-account instance discriminator), `proxyUrl?` (outbound proxy) |
 | Allowlist | `allowedUserIds` (required; Telegram `number[]`, WeChat/Feishu `string[]`) |
 
 Platform differences stay per-provider: Telegram `pollingTimeoutSec` (30); WeChat `pollingTimeoutSec` + `platformAccountId?` (iLink account); Feishu `domain: 'feishu'|'lark'` and no long-poll timeout (WebSocket).

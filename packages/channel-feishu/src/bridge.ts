@@ -3,6 +3,7 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { ChannelBridge, type BridgeConfig, type BridgePolicyOverrides, type ChannelStore } from 'dsh-channel-kit'
 import type { InboundMessage } from 'dsh-channel'
 import type { FeishuChannel } from './channel.js'
+import { CREDENTIAL_FEISHU_APP_ID, CREDENTIAL_FEISHU_APP_SECRET } from './config.js'
 import type { FeishuCredentials, FeishuEventV2, FeishuMessageEvent } from './client.js'
 import { FeishuWsClient, chatTypeOf, hasMedia, mediaFacts, messageText, senderId } from './client.js'
 
@@ -56,8 +57,8 @@ export class FeishuBridge extends ChannelBridge<FeishuBridgeConfig> {
   }
 
   private async resolveCredentials(): Promise<FeishuCredentials | undefined> {
-    const appId = await this.ctx.credentials.resolve(credentialRef('FEISHU_APP_ID'))
-    const appSecret = await this.ctx.credentials.resolve(credentialRef('FEISHU_APP_SECRET'))
+    const appId = await this.ctx.credentials.resolve(credentialRef(CREDENTIAL_FEISHU_APP_ID))
+    const appSecret = await this.ctx.credentials.resolve(credentialRef(CREDENTIAL_FEISHU_APP_SECRET))
     if (!appId?.value || !appSecret?.value) return undefined
     return { appId: appId.value, appSecret: appSecret.value }
   }

@@ -7,9 +7,13 @@ import Schema from '@deepseek-ai/schemastery'
  * return type TS infers — the two are kept separate on purpose, since
  * schemastery's `ObjectT` marks every field required even when no `default` is
  * declared. The field names must stay in sync; the test suite guards that.
+ *
+ * A provider composes its own config from these fragments plus its platform
+ * fields (see any provider's `src/config.ts`); nothing platform-specific lives
+ * here, so adding a platform touches no line of this file.
  */
 
-/** Agent routing shared by all three providers. */
+/** Agent routing shared by every provider. */
 export interface AgentRoutingConfig {
   provider: string
   model?: string
@@ -26,10 +30,12 @@ export function agentRoutingSchema() {
   }
 }
 
-/** Channel behavior and persistence shared by all three providers. */
+/** Channel behavior and persistence shared by every provider. */
 export interface ChannelBehaviorConfig {
   mergeWindowSec: number
   approvalTimeoutSec: number
+  /** Max wait to acquire the per-sessionId turn guard before a visible rejection. Default 120 (bridge-side). */
+  sessionTurnTimeoutSec?: number
   statePath?: string
   /** Inbound media size cap in bytes (providers that download media enforce it). Default 20 MiB. */
   maxInboundMediaBytes: number
@@ -43,6 +49,7 @@ export function channelBehaviorSchema() {
   return {
     mergeWindowSec: Schema.number().default(5),
     approvalTimeoutSec: Schema.number().default(120),
+    sessionTurnTimeoutSec: Schema.number(),
     statePath: Schema.string(),
     maxInboundMediaBytes: Schema.number().default(20 * 1024 * 1024),
     accountId: Schema.string(),

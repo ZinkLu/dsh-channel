@@ -1,6 +1,12 @@
 import Schema from '@deepseek-ai/schemastery'
-import { agentRoutingSchema, channelBehaviorSchema, allowedUserIdsSchema } from './common.js'
-import type { AgentRoutingConfig, ChannelBehaviorConfig } from './common.js'
+import { agentRoutingSchema, allowedUserIdsSchema, channelBehaviorSchema } from 'dsh-channel-kit'
+import type { AgentRoutingConfig, ChannelBehaviorConfig } from 'dsh-channel-kit'
+
+/** Settings namespace this provider registers (one per provider instance). */
+export const CHANNEL_FEISHU_NS = 'channel-feishu'
+/** Credential references resolved through `ctx.credentials`; never part of the settings document. */
+export const CREDENTIAL_FEISHU_APP_ID = 'FEISHU_APP_ID'
+export const CREDENTIAL_FEISHU_APP_SECRET = 'FEISHU_APP_SECRET'
 
 export interface FeishuConfig extends AgentRoutingConfig, ChannelBehaviorConfig {
   /** Feishu user open_ids (starting with ou_) allowed to use the bot. Required. */

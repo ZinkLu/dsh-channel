@@ -3,7 +3,7 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { CHANNEL_FEISHU_NS, CREDENTIAL_FEISHU_APP_ID, CREDENTIAL_FEISHU_APP_SECRET, feishuConfigSchema, type FeishuConfig } from 'dsh-channel-config'
+import { CHANNEL_FEISHU_NS, CREDENTIAL_FEISHU_APP_ID, CREDENTIAL_FEISHU_APP_SECRET, feishuConfigSchema, type FeishuConfig } from './config.js'
 import { createJsonFileStore } from 'dsh-channel-kit'
 import { FeishuBridge, type FeishuBridgeConfig } from './bridge.js'
 import { FeishuChannel } from './channel.js'
@@ -13,7 +13,8 @@ export const name = 'dsh-channel-feishu'
 export const inject = ['channels', 'agents', 'credentials'] as const
 
 export const Config = feishuConfigSchema()
-export type { FeishuConfig } from 'dsh-channel-config'
+export { CHANNEL_FEISHU_NS, CREDENTIAL_FEISHU_APP_ID, CREDENTIAL_FEISHU_APP_SECRET, feishuConfigSchema } from './config.js'
+export type { FeishuConfig } from './config.js'
 
 export function resolveStatePath(config: FeishuConfig): string {
   if (config.statePath) return config.statePath

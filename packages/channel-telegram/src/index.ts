@@ -5,7 +5,7 @@ import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-sett
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path'
-import { CHANNEL_TELEGRAM_NS, CREDENTIAL_TELEGRAM_BOT_TOKEN, telegramConfigSchema, type TelegramConfig } from 'dsh-channel-config'
+import { CHANNEL_TELEGRAM_NS, CREDENTIAL_TELEGRAM_BOT_TOKEN, telegramConfigSchema, type TelegramConfig } from './config.js'
 import { createJsonFileStore } from 'dsh-channel-kit'
 import { TelegramBridge, type TelegramBridgeConfig } from './bridge.js'
 import { TelegramChannel } from './channel.js'
@@ -15,7 +15,8 @@ export const name = 'dsh-channel-telegram'
 export const inject = ['channels', 'agents', 'credentials'] as const
 
 export const Config = telegramConfigSchema()
-export type { TelegramConfig } from 'dsh-channel-config'
+export { CHANNEL_TELEGRAM_NS, CREDENTIAL_TELEGRAM_BOT_TOKEN, telegramConfigSchema } from './config.js'
+export type { TelegramConfig } from './config.js'
 
 export function resolveStatePath(config: TelegramConfig): string {
   if (config.statePath) return config.statePath

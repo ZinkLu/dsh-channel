@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
 import { ChannelRegistry } from 'dsh-channel'
-import { CHANNEL_TELEGRAM_NS } from 'dsh-channel-config'
+import { CHANNEL_TELEGRAM_NS } from '../src/config.ts'
 import { apply, type TelegramConfig } from '../src/index.ts'
 
 interface RegisterCall {

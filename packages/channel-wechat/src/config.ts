@@ -1,6 +1,12 @@
 import Schema from '@deepseek-ai/schemastery'
-import { agentRoutingSchema, channelBehaviorSchema, allowedUserIdsSchema } from './common.js'
-import type { AgentRoutingConfig, ChannelBehaviorConfig } from './common.js'
+import { agentRoutingSchema, allowedUserIdsSchema, channelBehaviorSchema } from 'dsh-channel-kit'
+import type { AgentRoutingConfig, ChannelBehaviorConfig } from 'dsh-channel-kit'
+
+/** Settings namespace this provider registers (one per provider instance). */
+export const CHANNEL_WECHAT_NS = 'channel-wechat'
+/** Credential references resolved through `ctx.credentials`; never part of the settings document. */
+export const CREDENTIAL_WECHAT_TOKEN = 'WECHAT_TOKEN'
+export const CREDENTIAL_WECHAT_ACCOUNT_ID = 'WECHAT_ACCOUNT_ID'
 
 export interface WeChatConfig extends AgentRoutingConfig, ChannelBehaviorConfig {
   /** WeChat user ids allowed to use the bot (iLink-side from_user_id). Required. */

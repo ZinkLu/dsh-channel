@@ -1,6 +1,11 @@
 import Schema from '@deepseek-ai/schemastery'
-import { agentRoutingSchema, channelBehaviorSchema, allowedUserIdsSchema } from './common.js'
-import type { AgentRoutingConfig, ChannelBehaviorConfig } from './common.js'
+import { agentRoutingSchema, allowedUserIdsSchema, channelBehaviorSchema } from 'dsh-channel-kit'
+import type { AgentRoutingConfig, ChannelBehaviorConfig } from 'dsh-channel-kit'
+
+/** Settings namespace this provider registers (one per provider instance). */
+export const CHANNEL_TELEGRAM_NS = 'channel-telegram'
+/** Credential reference resolved through `ctx.credentials`; never part of the settings document. */
+export const CREDENTIAL_TELEGRAM_BOT_TOKEN = 'TELEGRAM_BOT_TOKEN'
 
 export interface TelegramConfig extends AgentRoutingConfig, ChannelBehaviorConfig {
   /** Allowed Telegram user ids. Required, no permissive default. */

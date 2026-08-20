@@ -4,6 +4,7 @@ import type { ImageAttachmentRef, ImageMediaType } from '@deepseek-ai/dsh-attach
 import { ChannelBridge, DEFAULT_MAX_INBOUND_MEDIA_BYTES, renderForTier, sleepWithAbort, type BridgeConfig, type BridgePolicyOverrides, type ChannelStore } from 'dsh-channel-kit'
 import type { InboundMedia, InboundMessage } from 'dsh-channel'
 import type { TelegramChannel } from './channel.js'
+import { CREDENTIAL_TELEGRAM_BOT_TOKEN } from './config.js'
 import type { TelegramCallbackQuery, TelegramClient, TelegramMessage, TelegramPhotoSize } from './client.js'
 import { hasMedia, messageText, senderName, toChatKey } from './client.js'
 
@@ -116,7 +117,7 @@ export class TelegramBridge extends ChannelBridge<TelegramBridgeConfig> {
   }
 
   private async resolveToken(): Promise<string | undefined> {
-    const resolved = await this.ctx.credentials.resolve(credentialRef('TELEGRAM_BOT_TOKEN'))
+    const resolved = await this.ctx.credentials.resolve(credentialRef(CREDENTIAL_TELEGRAM_BOT_TOKEN))
     return resolved?.value
   }
 

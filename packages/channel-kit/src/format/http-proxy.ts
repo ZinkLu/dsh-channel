@@ -2,7 +2,7 @@
  * Minimal HTTP(S) proxy transport for provider clients.
  *
  * The three provider clients already accept an injectable `fetch`; when the
- * deployment configures `proxyUrl` (dsh-channel-config's `ChannelBehaviorConfig`),
+ * deployment configures `proxyUrl` (the kit's shared `ChannelBehaviorConfig` fragment),
  * the client wraps its fetch with `proxiedFetch(proxyUrl)` so every API call —
  * JSON RPC and media downloads/uploads — routes through the proxy.
  *

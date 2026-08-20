@@ -3,6 +3,7 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { ChannelBridge, sleepWithAbort, type BridgeConfig, type BridgePolicyOverrides, type ChannelStore } from 'dsh-channel-kit'
 import type { InboundMessage } from 'dsh-channel'
 import type { WeChatChannel } from './channel.js'
+import { CREDENTIAL_WECHAT_ACCOUNT_ID, CREDENTIAL_WECHAT_TOKEN } from './config.js'
 import type { WeixinClient, WeixinMessage } from './client.js'
 import { chatTypeOf, hasMedia, mediaFacts, messageText, senderId, toChatKey } from './client.js'
 
@@ -104,13 +105,13 @@ export class WeChatBridge extends ChannelBridge<WeChatBridgeConfig> {
   }
 
   private async resolveToken(): Promise<string | undefined> {
-    const resolved = await this.ctx.credentials.resolve(credentialRef('WECHAT_TOKEN'))
+    const resolved = await this.ctx.credentials.resolve(credentialRef(CREDENTIAL_WECHAT_TOKEN))
     return resolved?.value
   }
 
   private async resolveAccountId(): Promise<string | undefined> {
     if (this.config.platformAccountId) return this.config.platformAccountId
-    const resolved = await this.ctx.credentials.resolve(credentialRef('WECHAT_ACCOUNT_ID'))
+    const resolved = await this.ctx.credentials.resolve(credentialRef(CREDENTIAL_WECHAT_ACCOUNT_ID))
     return resolved?.value
   }
 
