@@ -115,16 +115,23 @@ TELEGRAM_BOT_TOKEN='...' node scripts/run-echo-bot.mjs
 
 It loads `dsh-channel` + `dsh-agent` + `dsh-credentials-local` + `dsh-channel-telegram`, and substitutes an echo factory for the real agent loop. Ordinary messages are replied with `[echo mode] You said: ...`; local commands (`/help`, `/start`, etc.) work.
 
-For shared debugging there is also a config-file variant, `run-dev-bot.mjs`: same wiring, but everything
-a debugger would edit lives in [`scripts/dev-bot.yaml`](./scripts/dev-bot.yaml) (allowlist, model routing,
-timing, `accountId`, `proxyUrl`) instead of environment variables, and the agent's workspace is pinned to
-the gitignored `agent-workspace/` directory inside the repo — the bot never writes into the repo tree.
-The delivery ledger and the optional `.credentials.yaml` live under `agent-workspace/.dsh-home/`:
+For shared debugging with the **full agent** there is `run-dev-bot.sh` — the real `dsh` launcher plus a
+patch YAML, the exact path a user takes (no hand-assembled Context). The script maintains a `dev-bot`
+profile under `$DSH_HOME` (the web profile's bundle stack + this repo's packages as `file:` deps),
+refreshes the installed copies from `packages/*/lib` on every launch, and boots with
+[`scripts/dev-bot.yaml`](./scripts/dev-bot.yaml) as the patch layer — the same document shape as any
+profile `cordis.patch.yml`; edit it (allowlist, model, `accountId`, `proxyUrl`, …) and restart. The
+script stands in the gitignored `agent-workspace/` so the agent's cwd-derived workspace never touches
+the repo tree. Credentials come from your `$DSH_HOME` as usual (`dsh credentials set` or env vars).
 
 ```bash
 npm run build
-TELEGRAM_BOT_TOKEN='...' node scripts/run-dev-bot.mjs   # or put the token in agent-workspace/.dsh-home/.credentials.yaml
+scripts/run-dev-bot.sh               # web UI + Telegram bridge, full agent
+scripts/run-dev-bot.sh --port 5299   # extra args go to the web app
 ```
+
+Note: two processes long-polling the same bot token fight over `getUpdates` (Telegram 409) — stop any
+other instance using the token first.
 
 ---
 
@@ -153,9 +160,9 @@ TELEGRAM_BOT_TOKEN='...' node scripts/run-dev-bot.mjs   # or put the token in ag
 │   ├── channel-wechat/   # dsh-channel-wechat (WeChat iLink Bot API)
 │   └── channel-feishu/   # dsh-channel-feishu (Feishu / Lark long-lived connection)
 ├── scripts/
-│   ├── run-echo-bot.mjs  # local debug echo bot (env-configured)
-│   ├── run-dev-bot.mjs   # config-file debug bot (reads dev-bot.yaml, workspace-isolated)
-│   └── dev-bot.yaml      # its editable configuration
+│   ├── run-echo-bot.mjs  # local debug echo bot (no model, env-configured)
+│   ├── run-dev-bot.sh    # full-agent debug bot: real dsh launcher + patch YAML
+│   └── dev-bot.yaml      # its patch layer (standard cordis.patch.yml shape)
 ├── dsh-channel-design.md
 ├── tsconfig.base.json
 └── package.json
@@ -294,16 +301,23 @@ TELEGRAM_BOT_TOKEN='...' node scripts/run-echo-bot.mjs
 并用一个 echo factory 代替真实 agent loop。普通消息会回复 `[echo mode] You said: ...`
 （即"[echo 模式] 你说：…"），本地命令（`/help`、`/start` 等）可用。
 
-面向多人协作调试还有一个配置文件版：`run-dev-bot.mjs`。装配相同，但调试者要改的东西全部
-集中在 [`scripts/dev-bot.yaml`](./scripts/dev-bot.yaml)（allowlist、模型路由、时序参数、
-`accountId`、`proxyUrl`），不再依赖环境变量；agent 的工作区固定为仓库内 gitignored 的
-`agent-workspace/` 目录——bot 永远不会往仓库树里写文件。delivery ledger 和可选的
-`.credentials.yaml` 都在 `agent-workspace/.dsh-home/` 下：
+面向多人协作、带**完整 agent** 的调试用 `run-dev-bot.sh`——真实 `dsh` 启动器 + patch YAML，
+和用户使用的完全是同一条路（不手工拼 Context）。脚本会在 `$DSH_HOME` 下维护一个 `dev-bot`
+profile（web profile 同款 bundle 栈 + 本仓库四个包的 `file:` 依赖），每次启动前从
+`packages/*/lib` 刷新安装拷贝，然后以 [`scripts/dev-bot.yaml`](./scripts/dev-bot.yaml)
+作为补丁层启动——它就是标准的 profile `cordis.patch.yml` 文档形状；改它（allowlist、模型、
+`accountId`、`proxyUrl`……）再重启即可。脚本会站在 gitignored 的 `agent-workspace/` 里启动，
+因此 agent 按 cwd 推导的工作区永远不会碰到仓库树。凭证照常走你的 `$DSH_HOME`
+（`dsh credentials set` 或环境变量）。
 
 ```bash
 npm run build
-TELEGRAM_BOT_TOKEN='...' node scripts/run-dev-bot.mjs   # 或把 token 写进 agent-workspace/.dsh-home/.credentials.yaml
+scripts/run-dev-bot.sh               # web UI + Telegram bridge，完整 agent
+scripts/run-dev-bot.sh --port 5299   # 额外参数透传给 web app
 ```
+
+注意：两个进程用同一个 bot token 长轮询会互抢 `getUpdates`（Telegram 409）——先停掉占用
+该 token 的其他实例。
 
 ---
 
@@ -332,9 +346,9 @@ TELEGRAM_BOT_TOKEN='...' node scripts/run-dev-bot.mjs   # 或把 token 写进 ag
 │   ├── channel-wechat/   # dsh-channel-wechat（微信 iLink Bot API）
 │   └── channel-feishu/   # dsh-channel-feishu（飞书 / Lark 长连接）
 ├── scripts/
-│   ├── run-echo-bot.mjs  # 本地调试 echo bot（环境变量配置）
-│   ├── run-dev-bot.mjs   # 配置文件版调试 bot（读 dev-bot.yaml，工作区隔离）
-│   └── dev-bot.yaml      # 它的可编辑配置
+│   ├── run-echo-bot.mjs  # 本地调试 echo bot（不接模型，环境变量配置）
+│   ├── run-dev-bot.sh    # 完整 agent 调试 bot：真实 dsh 启动器 + patch YAML
+│   └── dev-bot.yaml      # 它的补丁层（标准 cordis.patch.yml 形状）
 ├── dsh-channel-design.md
 ├── tsconfig.base.json
 └── package.json
