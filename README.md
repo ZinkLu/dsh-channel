@@ -115,6 +115,17 @@ TELEGRAM_BOT_TOKEN='...' node scripts/run-echo-bot.mjs
 
 It loads `dsh-channel` + `dsh-agent` + `dsh-credentials-local` + `dsh-channel-telegram`, and substitutes an echo factory for the real agent loop. Ordinary messages are replied with `[echo mode] You said: ...`; local commands (`/help`, `/start`, etc.) work.
 
+For shared debugging there is also a config-file variant, `run-dev-bot.mjs`: same wiring, but everything
+a debugger would edit lives in [`scripts/dev-bot.yaml`](./scripts/dev-bot.yaml) (allowlist, model routing,
+timing, `accountId`, `proxyUrl`) instead of environment variables, and the agent's workspace is pinned to
+the gitignored `agent-workspace/` directory inside the repo — the bot never writes into the repo tree.
+The delivery ledger and the optional `.credentials.yaml` live under `agent-workspace/.dsh-home/`:
+
+```bash
+npm run build
+TELEGRAM_BOT_TOKEN='...' node scripts/run-dev-bot.mjs   # or put the token in agent-workspace/.dsh-home/.credentials.yaml
+```
+
 ---
 
 ### Test coverage
@@ -142,7 +153,9 @@ It loads `dsh-channel` + `dsh-agent` + `dsh-credentials-local` + `dsh-channel-te
 │   ├── channel-wechat/   # dsh-channel-wechat (WeChat iLink Bot API)
 │   └── channel-feishu/   # dsh-channel-feishu (Feishu / Lark long-lived connection)
 ├── scripts/
-│   └── run-echo-bot.mjs  # local debug echo bot
+│   ├── run-echo-bot.mjs  # local debug echo bot (env-configured)
+│   ├── run-dev-bot.mjs   # config-file debug bot (reads dev-bot.yaml, workspace-isolated)
+│   └── dev-bot.yaml      # its editable configuration
 ├── dsh-channel-design.md
 ├── tsconfig.base.json
 └── package.json
@@ -281,6 +294,17 @@ TELEGRAM_BOT_TOKEN='...' node scripts/run-echo-bot.mjs
 并用一个 echo factory 代替真实 agent loop。普通消息会回复 `[echo mode] You said: ...`
 （即"[echo 模式] 你说：…"），本地命令（`/help`、`/start` 等）可用。
 
+面向多人协作调试还有一个配置文件版：`run-dev-bot.mjs`。装配相同，但调试者要改的东西全部
+集中在 [`scripts/dev-bot.yaml`](./scripts/dev-bot.yaml)（allowlist、模型路由、时序参数、
+`accountId`、`proxyUrl`），不再依赖环境变量；agent 的工作区固定为仓库内 gitignored 的
+`agent-workspace/` 目录——bot 永远不会往仓库树里写文件。delivery ledger 和可选的
+`.credentials.yaml` 都在 `agent-workspace/.dsh-home/` 下：
+
+```bash
+npm run build
+TELEGRAM_BOT_TOKEN='...' node scripts/run-dev-bot.mjs   # 或把 token 写进 agent-workspace/.dsh-home/.credentials.yaml
+```
+
 ---
 
 ### 测试覆盖
@@ -308,7 +332,9 @@ TELEGRAM_BOT_TOKEN='...' node scripts/run-echo-bot.mjs
 │   ├── channel-wechat/   # dsh-channel-wechat（微信 iLink Bot API）
 │   └── channel-feishu/   # dsh-channel-feishu（飞书 / Lark 长连接）
 ├── scripts/
-│   └── run-echo-bot.mjs  # 本地调试 echo bot
+│   ├── run-echo-bot.mjs  # 本地调试 echo bot（环境变量配置）
+│   ├── run-dev-bot.mjs   # 配置文件版调试 bot（读 dev-bot.yaml，工作区隔离）
+│   └── dev-bot.yaml      # 它的可编辑配置
 ├── dsh-channel-design.md
 ├── tsconfig.base.json
 └── package.json

@@ -1,3 +1,6 @@
 node_modules/
 packages/*/lib/
 *.log
+# dev-bot agent workspace: everything the debugging agent reads/writes lives here,
+# never in the repo tree (scripts/run-dev-bot.mjs, scripts/dev-bot.yaml).
+agent-workspace/

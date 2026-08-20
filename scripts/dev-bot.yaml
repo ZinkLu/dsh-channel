@@ -1,0 +1,28 @@
+# Dev-bot configuration — the single file a debugger edits (scripts/run-dev-bot.mjs reads it).
+#
+# The secret never goes here: set TELEGRAM_BOT_TOKEN in the environment, or put it in
+# <workspace>/.dsh-home/.credentials.yaml (hot-reloaded, no restart needed).
+
+# Agent workspace: every file the agent reads/writes lands here, never in the repo tree.
+# Relative paths resolve against the repository root. The directory is gitignored.
+workspace: ./agent-workspace
+
+telegram:
+  # Telegram user ids allowed to talk to the bot (everyone else is rejected).
+  allowedUserIds: [5002186681]
+
+  # Model routing, used once a real agent factory is plugged in (the dev bot's
+  # echo factory ignores these but keeps the config shape identical to production).
+  provider: deepseek-official
+  model: deepseek-v4-flash
+
+  # Long-poll / merge / approval timing (seconds).
+  pollingTimeoutSec: 30
+  mergeWindowSec: 5
+  approvalTimeoutSec: 120
+
+  # Uncomment to run a second bot of the same platform side by side.
+  # accountId: dev
+
+  # Uncomment to reach api.telegram.org through an outbound proxy.
+  # proxyUrl: http://127.0.0.1:7890
