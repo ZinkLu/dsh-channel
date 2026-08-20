@@ -831,6 +831,17 @@ Both agent output (`sendOutbound`, ledger-tracked) and bridge-authored text (`se
 replies, `⏹ Turn ended`, warnings) enqueue onto the same per-chatKey queue from §12.2. Sending
 either one inline would let a status line land between two chunks of the answer it follows.
 
+### 13.5 Startup recovery resumes conventional sessions
+
+`restore()` only resumes sessions in `store.bindings()` — the `/bind` and `/new` exceptions. But
+ledger entries name sessions by the *conventional* id (`channel:<id>:<chatKey>`, the default
+route), which is deliberately not persisted (§4.5: recoverable from the id). So before the
+recovery policy decides, the bridge resumes every session a swept delivery key parses to
+(resume-only, never create): otherwise the second half of A4 would silently abandon exactly the
+common case. A session that genuinely cannot be resumed is then the policy's to abandon. Newly
+resumed logs are refolded into the seen set, so the log stays the dedupe baseline (R7) for
+conventional sessions too — not just the explicitly bound ones.
+
 ---
 
 ## Appendix A: Reference Index

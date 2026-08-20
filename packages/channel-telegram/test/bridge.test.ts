@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
-import { ChannelRegistry } from 'dsh-channel'
+import { ChannelRegistry, type InboundMessage } from 'dsh-channel'
 import { createMemoryStore } from 'dsh-channel-kit'
 import { TelegramBridge } from '../src/bridge.ts'
 import { TelegramChannel } from '../src/channel.ts'
@@ -806,4 +806,236 @@ test('bridge consults reconcile before resending a failed delivery', async () =>
   assert.equal(channel.reconciled[0]!.key, `${sessionId}:1`)
   // Reconcile reported confirmed-sent → no blind resend.
   assert.equal(client.sends.length, 0)
+})
+
+/** Test-only bridge that exposes the protected approval hook and inbound entry. */
+class AnswerableBridge extends TelegramBridge {
+  answerApproval(num: number, outcome: 'allowed-once' | 'rejected'): void {
+    this.resolveApproval(num, outcome)
+  }
+
+  async feedInbound(inbound: InboundMessage): Promise<void> {
+    await this.handleInbound(inbound)
+  }
+}
+
+test('recovery resumes a conventional session before deciding, instead of abandoning it', async () => {
+  const root = new Context()
+  new ChannelRegistry(root)
+
+  const sessionId = 'channel:telegram:42'
+  // Dense log per the rc.6 seq = log.length contiguity contract.
+  const events: any[] = [
+    { type: 'user/message', seq: 0, time: Date.now(), data: { role: 'user', content: [{ type: 'text', text: 'q' }], source: { kind: 'channel', channel: 'telegram', chatKey: '42', senderId: '123', messageIds: ['77'] } } },
+    { type: 'turn/start', seq: 1, time: Date.now(), data: {} },
+    { type: 'assistant/message', seq: 2, time: Date.now(), data: { message: { role: 'assistant', content: [{ type: 'text', text: 'the lost answer' }] } } },
+  ]
+  const fakeAgent = { id: sessionId, status: 'idle' as const, session: { events } }
+  let resumedWith: string | undefined
+  root.provide('agents', {
+    list: () => (resumedWith !== undefined ? [fakeAgent] : []),
+    get: () => (resumedWith !== undefined ? fakeAgent : undefined),
+    resume: async (opts: any) => {
+      resumedWith = String(opts.resumeSessionId)
+      return { agent: fakeAgent, dispose: async () => {} }
+    },
+    create: async () => {
+      throw new Error('recovery must never create a session')
+    },
+  })
+  root.provide('credentials', { resolve: async () => ({ value: 'test-token', source: 'test' }) })
+
+  // No explicit /bind entry: the session exists only by the channel:<id>:<chatKey> convention.
+  const store = createMemoryStore()
+  store.recordDelivery(`${sessionId}:2`, { chatKey: '42', textHash: 'abc' })
+  store.markFailed(`${sessionId}:2`, 'boom')
+
+  const client = createFakeClient([])
+  const channel = new TelegramChannel({ client, resolveToken: async () => 'test-token' })
+  root.channels.register(channel)
+  const bridge = new TelegramBridge(
+    root,
+    () => ({ allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 5, approvalTimeoutSec: 120 }),
+    store,
+    channel,
+    client,
+  )
+
+  await bridge.start()
+  await waitFor(() => client.sends.length === 1)
+  await bridge.stop()
+
+  assert.equal(resumedWith, sessionId)
+  assert.ok(client.sends[0]!.text.includes('the lost answer'))
+  assert.ok(client.sends[0]!.text.includes('resumed resend'))
+  // The resumed log was refolded into the seen set (R7).
+  assert.equal(store.seenInbound('77'), true)
+})
+
+test('an approval answered while the prompt send is in flight is honored, not dropped', async () => {
+  const root = new Context()
+  new ChannelRegistry(root)
+  root.provide('agents', { list: () => [], get: () => undefined, resume: async () => { throw new Error('no persistence') }, create: async () => { throw new Error('not used') } })
+  root.provide('credentials', { resolve: async () => ({ value: 'test-token', source: 'test' }) })
+
+  const store = createMemoryStore()
+  store.setBinding('42', 'channel:telegram:42')
+
+  const client = createFakeClient([])
+  // Hold the prompt send open until the test releases it.
+  let releaseSend!: () => void
+  const sendGate = new Promise<void>((resolve) => { releaseSend = resolve })
+  const originalSend = client.sendMessage.bind(client)
+  ;(client as any).sendMessage = async (token: string, chatId: string, text: string, opts?: unknown) => {
+    const result = await originalSend(token, chatId, text, opts as never)
+    await sendGate
+    return result
+  }
+
+  const channel = new TelegramChannel({ client, resolveToken: async () => 'test-token' })
+  root.channels.register(channel)
+  const bridge = new AnswerableBridge(
+    root,
+    () => ({ allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 5, approvalTimeoutSec: 120 }),
+    store,
+    channel,
+    client,
+  )
+  await bridge.start()
+
+  const verdict = root.waterfall('approval/request', { agent: { id: 'channel:telegram:42' }, toolName: 'Bash' }, async () => 'unavailable' as const)
+  await waitFor(() => client.sends.length === 1)
+  bridge.answerApproval(1, 'allowed-once')
+  releaseSend()
+
+  assert.equal(await verdict, 'allowed-once')
+  await bridge.stop()
+})
+
+test('a redelivered unauthorized message is rejected only once (dedupe before allowlist)', async () => {
+  const root = new Context()
+  new ChannelRegistry(root)
+  root.provide('agents', { list: () => [], get: () => undefined, resume: async () => { throw new Error('no persistence') }, create: async () => { throw new Error('should not create') } })
+  root.provide('credentials', { resolve: async () => ({ value: 'test-token', source: 'test' }) })
+
+  const duplicated = {
+    message_id: 200,
+    from: { id: 999, is_bot: false, first_name: 'Mallory' },
+    chat: { id: 42, type: 'private' as const },
+    date: 1_700_000_000,
+    text: 'hi',
+  }
+  const client = createFakeClient([
+    { update_id: 5, message: duplicated },
+    { update_id: 6, message: duplicated },
+  ])
+  const channel = new TelegramChannel({ client, resolveToken: async () => 'test-token' })
+  root.channels.register(channel)
+  const bridge = new TelegramBridge(
+    root,
+    () => ({ allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 0.05, approvalTimeoutSec: 120 }),
+    createMemoryStore(),
+    channel,
+    client,
+  )
+
+  await bridge.start()
+  await waitFor(() => client.sends.length >= 1)
+  await new Promise((resolve) => setTimeout(resolve, 150))
+  await bridge.stop()
+
+  const rejects = client.sends.filter((send) => send.text.includes('not authorized'))
+  assert.equal(rejects.length, 1)
+})
+
+test('inbound order per §5.2: approval replies are ingested, group messages broadcast once', async () => {
+  const root = new Context()
+  new ChannelRegistry(root)
+  root.provide('agents', { list: () => [], get: () => undefined, resume: async () => { throw new Error('no persistence') }, create: async () => { throw new Error('not used') } })
+  root.provide('credentials', { resolve: async () => ({ value: 'test-token', source: 'test' }) })
+
+  const store = createMemoryStore()
+  store.setBinding('42', 'channel:telegram:42')
+
+  const client = createFakeClient([])
+  const channel = new TelegramChannel({ client, resolveToken: async () => 'test-token' })
+  root.channels.register(channel)
+  const bridge = new AnswerableBridge(
+    root,
+    () => ({ allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 5, approvalTimeoutSec: 120 }),
+    store,
+    channel,
+    client,
+  )
+
+  const emitted: any[] = []
+  root.on('channel/message', (msg) => { emitted.push(msg) })
+
+  await bridge.start()
+
+  // A group message is broadcast for audit exactly once, behind the same dedupe.
+  const group = { channel: 'telegram', chatKey: '-100', senderId: '999', messageId: '300', chatType: 'group' as const, text: 'group hello', timestamp: Date.now(), hasMedia: false }
+  await bridge.feedInbound(group)
+  await bridge.feedInbound(group)
+  assert.equal(emitted.filter((msg) => msg.messageId === '300').length, 1)
+
+  // An approval reply passes through ingest before the broker resolves it.
+  const verdict = root.waterfall('approval/request', { agent: { id: 'channel:telegram:42' }, toolName: 'Bash' }, async () => 'unavailable' as const)
+  await waitFor(() => client.sends.length === 1)
+  await bridge.feedInbound({ channel: 'telegram', chatKey: '42', senderId: '123', messageId: '900', chatType: 'direct', text: 'approve', timestamp: Date.now(), hasMedia: false })
+  assert.equal(await verdict, 'allowed-once')
+  assert.equal(emitted.filter((msg) => msg.messageId === '900').length, 1)
+
+  await bridge.stop()
+})
+
+test('poll loop re-announces connected after a transient failure', async () => {
+  const root = new Context()
+  new ChannelRegistry(root)
+  root.provide('agents', {
+    list: () => [],
+    get: () => undefined,
+    resume: async () => {
+      throw new Error('no persistence')
+    },
+    create: async () => ({ agent: { id: 'x', status: 'idle' as const, session: { events: [] } }, dispose: async () => {} }),
+  })
+  root.provide('credentials', {
+    resolve: async () => ({ value: 'test-token', source: 'test' }),
+  })
+
+  const client = createFakeClient([])
+  let calls = 0
+  client.getUpdates = async (_token: string, opts: { signal?: AbortSignal } = {}) => {
+    calls++
+    if (calls === 1) return []
+    if (calls === 2) throw new Error('transient network failure')
+    if (calls === 3) return []
+    return new Promise<TelegramUpdate[]>((resolve) => {
+      const onAbort = () => resolve([])
+      if (opts.signal?.aborted) return resolve([])
+      opts.signal?.addEventListener('abort', onAbort, { once: true })
+    })
+  }
+
+  const channel = new TelegramChannel({ client, resolveToken: async () => 'test-token' })
+  root.channels.register(channel)
+  const bridge = new TelegramBridge(
+    root,
+    () => ({ allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 0.05, approvalTimeoutSec: 120 }),
+    createMemoryStore(),
+    channel,
+    client,
+  )
+
+  const statuses: string[] = []
+  root.on('channel/status', (_id: string, status: string) => { statuses.push(status) })
+
+  await bridge.start()
+  // Failure → backoff (~1-1.5s) → successful poll must re-announce connected.
+  await waitFor(() => statuses.filter((s) => s === 'connected').length === 2, 5000)
+  await bridge.stop()
+
+  const relevant = statuses.filter((s) => s !== 'connecting')
+  assert.deepEqual(relevant, ['connected', 'disconnected', 'connected'])
 })

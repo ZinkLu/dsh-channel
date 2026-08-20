@@ -214,6 +214,19 @@ test('ChannelRegistry.bindChatKey/chatKeyOf expose the proactive-push binding', 
   assert.deepEqual(root.channels.chatKeyOf('sess-2'), { channel: 'telegram', chatKey: '7' })
 })
 
+test('ChannelRegistry.bindChatKey returns an identity-checked disposer', () => {
+  const root = new Context()
+  new ChannelRegistry(root)
+  const dispose1 = root.channels.bindChatKey('sess-1', 'telegram', '42')
+  const dispose2 = root.channels.bindChatKey('sess-1', 'telegram', '43')
+  // A stale disposer from before the re-bind must not clobber the live binding.
+  dispose1()
+  assert.deepEqual(root.channels.chatKeyOf('sess-1'), { channel: 'telegram', chatKey: '43' })
+  dispose2()
+  assert.equal(root.channels.chatKeyOf('sess-1'), undefined)
+  dispose2() // idempotent
+})
+
 test('presentation capability facts default conservatively and reconcile returns unknown', async () => {
   const channel = new FakeChannel()
   assert.equal(channel.supportsReply, false)

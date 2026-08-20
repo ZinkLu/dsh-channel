@@ -103,15 +103,18 @@ export class InteractionBroker {
     req.signal?.addEventListener('abort', onAbort, { once: true })
 
     await this.sendApprovalPrompt(entry, req)
-    if (!this.pendingApprovals.has(num)) {
-      req.signal?.removeEventListener('abort', onAbort)
-      return next()
+    // The entry can already be gone here for two reasons: the send failed /
+    // the request aborted (both settled 'deferred' → fall back to the
+    // waterfall), or the user answered while the prompt send was in flight
+    // (the verdict already holds their answer — honor it, never discard it).
+    // Every removal path settles the verdict first, so awaiting it below
+    // distinguishes the two without a race.
+    if (this.pendingApprovals.has(num)) {
+      entry.timer = this.armTimeout(() => {
+        this.pendingApprovals.delete(num)
+        settle('deferred')
+      })
     }
-
-    entry.timer = this.armTimeout(() => {
-      this.pendingApprovals.delete(num)
-      settle('deferred')
-    })
 
     const outcome = await verdict
     req.signal?.removeEventListener('abort', onAbort)

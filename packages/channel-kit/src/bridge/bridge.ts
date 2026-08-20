@@ -40,7 +40,7 @@ import {
   type PresentationPolicy,
 } from '../policy/presentation.js'
 import type { PromptAnswer } from '../policy/prompt-render.js'
-import { chunkDeliveryKey, chunkIndexOf, defaultRecoveryPolicy, hashText, type RecoveryPolicy } from '../policy/recovery.js'
+import { chunkDeliveryKey, chunkIndexOf, defaultRecoveryPolicy, hashText, splitDeliveryKey, type RecoverableDelivery, type RecoveryPolicy } from '../policy/recovery.js'
 import { route, type RouteDecision } from '../policy/router.js'
 import { emptyStreamState, type StreamFrame, type StreamInput, type StreamState } from '../policy/stream.js'
 import { InteractionBroker, type AskUserQuestionRequestLike, type AskUserQuestionAnswerLike } from './interaction-broker.js'
@@ -139,6 +139,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
   private readonly sessionTurnTails = new Map<string, Promise<void>>()
   private readonly statusWaiters: Array<() => void> = []
   private readonly disposers: Array<() => void> = []
+  private readonly registryBindings = new Map<string, () => void>()
 
   private localSeq = 0
   private recoverPromise: Promise<void> | undefined
@@ -221,6 +222,15 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     for (const resolve of this.statusWaiters.splice(0)) resolve()
     this.broker.settleAll()
 
+    for (const dispose of this.registryBindings.values()) {
+      try {
+        dispose()
+      } catch {
+        // Ignore binding disposer errors.
+      }
+    }
+    this.registryBindings.clear()
+
     for (const [sessionId, handle] of [...this.ownedHandles]) {
       try {
         await handle.dispose()
@@ -272,9 +282,14 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     return account !== 'default' ? { accountId: account } : {}
   }
 
-  /** Mirror a sessionId → chatKey binding into the registry (cross-provider proactive-push seam). */
+  /**
+   * Mirror a sessionId → chatKey binding into the registry (cross-provider
+   * proactive-push seam). The registry outlives this bridge, so the disposer is
+   * kept and fired on stop() — a stopped provider leaves no stale push targets.
+   */
   protected registerSessionBinding(sessionId: string, chatKey: string): void {
-    this.ctx.channels.bindChatKey(sessionId, this.channel.id, chatKey, this.channel.accountId)
+    this.registryBindings.get(sessionId)?.()
+    this.registryBindings.set(sessionId, this.ctx.channels.bindChatKey(sessionId, this.channel.id, chatKey, this.channel.accountId))
   }
 
   private warn(message: string): void {
@@ -363,6 +378,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
   /** Execute the recovery policy's decisions against the ledger (look up text, resend/skip/abandon). */
   private async recover(): Promise<void> {
     const recoverable = this.store.sweepRecoverable()
+    await this.resumeRecoverableSessions(recoverable)
     const actions = await this.recovery.sweep(recoverable, {
       channel: this.channel,
       resolveText: (sessionId, seq) => this.resolveAssistantText(sessionId, seq),
@@ -388,6 +404,33 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     }
   }
 
+  /**
+   * Ledger entries can outlive the live agents: sessions on the conventional
+   * `channel:<id>:<chatKey>` id (no explicit /bind) are not in `store.bindings()`,
+   * so `restore()` never resumed them. Resume them here (resume-only, never
+   * create) so the recovery policy can read their session log instead of
+   * abandoning the delivery as "session event unavailable".
+   */
+  private async resumeRecoverableSessions(recoverable: readonly RecoverableDelivery[]): Promise<void> {
+    const attempted = new Set<string>()
+    let resumedAny = false
+    for (const item of recoverable) {
+      const { sessionId } = splitDeliveryKey(item.key)
+      if (sessionId === undefined || attempted.has(sessionId)) continue
+      attempted.add(sessionId)
+      if (this.ctx.agents.get(SessionId(sessionId))) continue
+      try {
+        const agent = await this.ensureAgent(sessionId, item.chatKey, false)
+        if (agent) resumedAny = true
+      } catch {
+        // A session that cannot be resumed is the policy's to abandon; keep going.
+      }
+    }
+    // A resumed session brings its log with it: refold so the seen set regains
+    // the log-derived dedupe baseline (R7) for conventional sessions too.
+    if (resumedAny) this.markSeenFromSessionLogs()
+  }
+
   private resolveAssistantText(sessionId: string, seq: number): string {
     const agent = this.ctx.agents.get(SessionId(sessionId))
     const event = agent?.session.events[seq]
@@ -399,40 +442,49 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
 
   /**
    * The shared inbound pipeline. Providers normalize their transport payload
-   * into an `InboundMessage` and hand it here; the order below is the design's,
-   * not theirs to vary:
+   * into an `InboundMessage` and hand it here; the order below is the design's
+   * (§5.2), not theirs to vary:
    *
-   *   group drop → allowlist → echo suppression → dedupe → approval/prompt reply
-   *   → ingest → command → media → merge
+   *   echo suppression → dedupe → group drop → allowlist → ingest
+   *   → approval/prompt reply → command → media → merge
    *
-   * Two orderings are load-bearing. Approval/prompt answers are resolved *before*
-   * merge/router, so a "yes" can never queue behind the very turn that is blocked
-   * waiting for it. And commands and media both flush the merge buffer first, so
-   * nothing is delayed by the debounce window or welded onto an attachment's batch.
+   * Three orderings are load-bearing. Dedupe runs before everything that can
+   * reply or broadcast, so a webhook redelivery repeats neither the rejection
+   * notice nor the `channel/message` fact. Ingest runs before the route split,
+   * so audit plugins see every deduplicated direct message — approval answers
+   * included. And approval/prompt answers are resolved *before* merge/router,
+   * so a "yes" can never queue behind the very turn that is blocked waiting
+   * for it. Commands and media both flush the merge buffer first, so nothing
+   * is delayed by the debounce window or welded onto an attachment's batch.
    *
    * @param raw the untouched platform message, handed back to `downloadInboundImages`.
    */
   protected async handleInbound(inbound: InboundMessage, raw?: unknown): Promise<void> {
     const { chatKey, senderId, messageId } = inbound
 
+    if (messageId !== '') {
+      if (this.isOwnEcho(chatKey, messageId)) return
+      if (this.store.seenInbound(messageId)) return
+    }
+
     // v1 does not route group chats (unclear ownership semantics + a large
     // prompt-injection surface), but the fact is still broadcast so policy
-    // plugins can audit them.
+    // plugins can audit them — exactly once, behind the same dedupe as
+    // direct traffic.
     if (inbound.chatType !== 'direct') {
       this.ctx.channels.ingest(inbound)
+      if (messageId !== '') this.store.markInbound(messageId)
       return
     }
 
     if (!this.isAllowed(senderId)) {
+      // Remember the rejection so a redelivery does not repeat the reply.
+      if (messageId !== '') this.store.markInbound(messageId)
       this.sendLocal(chatKey, '⚠️ You are not authorized to use this bot.')
       return
     }
 
-    if (messageId !== '') {
-      if (this.isOwnEcho(chatKey, messageId)) return
-      if (this.store.seenInbound(messageId)) return
-      this.store.markInbound(messageId, 'handling')
-    }
+    if (messageId !== '') this.store.markInbound(messageId, 'handling')
 
     try {
       await this.routeInbound(inbound, raw)
@@ -449,9 +501,11 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     const { chatKey, senderId, messageId, text } = inbound
     const messageIds = messageId !== '' ? [messageId] : []
 
-    if (await this.handleInboundReply(text)) return
-
+    // Broadcast first (§5.2): ingest is a pure fact emit that decides nothing,
+    // and audit plugins should see approval answers like any other message.
     this.ctx.channels.ingest(inbound)
+
+    if (await this.handleInboundReply(text)) return
 
     const trimmed = text.trim()
     if (trimmed.startsWith('/')) {
@@ -603,14 +657,11 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
 
     await this.runSerializedSessionTurn(agent.id, chatKey, async () => {
       if (action === 'steer') {
-        // Mandatory fallback: if steer is unavailable or fails, buffer the
-        // message behind the running turn — never drop it.
+        // steer() itself never rejects a message (an inconvenient moment parks
+        // it in the agent's inbox for the next wake-up); only a throw (agent
+        // released mid-dispatch) needs the buffer fallback — never drop it.
         try {
-          const accepted = (await agent.steer(message)) as unknown
-          if (accepted === false) {
-            this.queueBehindRunningTurn(agent, queued)
-            return
-          }
+          agent.steer(message)
         } catch {
           this.queueBehindRunningTurn(agent, queued)
           return

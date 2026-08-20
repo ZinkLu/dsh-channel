@@ -410,13 +410,22 @@ export class ChannelRegistry extends Service {
    * Register a sessionId → (channel, chatKey) binding so policy plugins (monitor,
    * reminder, cron) can discover where to push a proactive message without poking
    * into a bridge's private maps. Idempotent; re-established on restore.
+   *
+   * Returns a disposer (R1): the registry outlives any one provider fiber, so a
+   * bridge that stops must be able to take its stale push targets with it. The
+   * disposer is identity-checked — it only removes the binding it installed, so
+   * a later re-bind is never clobbered by an earlier disposer firing late.
    */
-  bindChatKey(sessionId: string, channelId: string, chatKey: string, accountId?: string): void {
-    this.sessionBindings.set(sessionId, {
+  bindChatKey(sessionId: string, channelId: string, chatKey: string, accountId?: string): () => void {
+    const binding = {
       channel: channelId,
       ...(accountId !== undefined && accountId !== 'default' ? { accountId } : {}),
       chatKey,
-    })
+    }
+    this.sessionBindings.set(sessionId, binding)
+    return () => {
+      if (this.sessionBindings.get(sessionId) === binding) this.sessionBindings.delete(sessionId)
+    }
   }
 
   /** Read-only reverse lookup: which channel + chatKey is this session bound to. */
