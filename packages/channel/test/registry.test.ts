@@ -85,28 +85,23 @@ class MediaChannel extends FakeChannel {
   }
 }
 
-test('Channel supportsReactions defaults to false and react is a no-op', async () => {
+test('Channel ackInbound defaults to false (nothing shown) and never throws', async () => {
   const channel = new FakeChannel()
-  assert.equal(channel.supportsReactions, false)
-  // The base no-op must never throw.
-  await assert.doesNotReject(() => channel.react('42', 'm1', '👀'))
+  assert.equal(await channel.ackInbound('42', 'm1'), false)
 })
 
-class ReactChannel extends FakeChannel {
-  readonly reacted: Array<{ chatKey: string; messageId: string; emoji: string }> = []
-  get supportsReactions(): boolean {
+class AckChannel extends FakeChannel {
+  readonly acked: Array<{ chatKey: string; messageId: string }> = []
+  async ackInbound(chatKey: string, messageId: string): Promise<boolean> {
+    this.acked.push({ chatKey, messageId })
     return true
-  }
-  async react(chatKey: string, messageId: string, emoji: string): Promise<void> {
-    this.reacted.push({ chatKey, messageId, emoji })
   }
 }
 
-test('supportsReactions platform implements react with chatKey/messageId/emoji', async () => {
-  const channel = new ReactChannel()
-  assert.equal(channel.supportsReactions, true)
-  await channel.react('42', 'm1', '👀')
-  assert.deepEqual(channel.reacted, [{ chatKey: '42', messageId: 'm1', emoji: '👀' }])
+test('a platform with a cheap ack implements ackInbound and reports true', async () => {
+  const channel = new AckChannel()
+  assert.equal(await channel.ackInbound('42', 'm1'), true)
+  assert.deepEqual(channel.acked, [{ chatKey: '42', messageId: 'm1' }])
 })
 
 test('ChannelRegistry.deliver sends media via sendMedia when supported', async () => {

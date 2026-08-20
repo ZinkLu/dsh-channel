@@ -769,10 +769,11 @@ Host-side wiring is complete, but rc.6's apiproxy only exposes a hardcoded `WEB_
 - Effects: `attempt` / `retry-after` / `give-up` / `reject-backpressure`; options `maxRetries` (3), `baseDelayMs` (1s → 1/2/4s exponential), `maxQueue` (32), `spacingMs` (1s, preserving the inter-chunk rate limit).
 - All three providers route ledger-tracked `sendOutbound` through the queue. The queue decides *when* to call `deliver()`; the `channel/deliver` waterfall still decides *what happens* on an attempt — no event-contract change.
 
-### 12.3 Reactions (cheap ack)
+### 12.3 Cheap inbound ack (`ackInbound`)
 
-- `Channel` gains `get supportsReactions()` (default `false`) and `async react(chatKey, messageId, emoji)` (default no-op; implementations throw so the caller can fall back).
-- Telegram (`setMessageReaction`) and Feishu (`message_reaction.create`) implement it; WeChat has no reaction API. The merge `ack-long` effect now reacts instead of sending a text `Received, working on it…`, falling back to text when unsupported or on failure.
+- `Channel` gains `async ackInbound(chatKey, messageId): Promise<boolean>` (default `false`). It is a semantic hook, not a reaction primitive: the provider decides *how* a cheap "received" is shown — Telegram reacts 👀 via `setMessageReaction`, Feishu creates an `ONLOOKER` reaction via `message_reaction.create`, WeChat has no reaction API and keeps the default. A `false` return and a throw both mean "nothing shown"; the bridge treats them alike.
+- Timing stays in the bridge: the merge `ack-long` effect calls `ackInbound` on the over-long inbound message and sends the text `Received, working on it…` only when the hook reports `false`.
+- This replaced an earlier `supportsReactions` fact + `react(chatKey, messageId, emoji)` primitive. An emoji is not shared vocabulary (Telegram accepts a fixed allow-list, Feishu wants an `emoji_type` key), so the generic primitive made every provider translate the bridge's choice back into its dialect — and the boolean fact never gated anything the failure fallback did not already cover. The shape was retired while `ack-long` was its only consumer (backlog §3.1); a reaction primitive returns to the contract only with a consumer that needs reactions *as such*.
 
 ### 12.4 `mentionsBot` observation
 

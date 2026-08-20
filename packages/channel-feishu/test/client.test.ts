@@ -95,24 +95,23 @@ test('FeishuClient.createReaction maps the ack emoji to an emoji_type', async ()
     }) as typeof fetch,
   })
 
-  await client.createReaction('tok', 'om_1', '👀')
+  await client.createReaction('tok', 'om_1', 'ONLOOKER')
   assert.equal(calls[0]!.url, 'https://open.feishu.cn/open-apis/im/v1/messages/om_1/reactions')
   assert.deepEqual(calls[0]!.body, { reaction_type: { emoji_type: 'ONLOOKER' } })
 })
 
-test('FeishuChannel.react resolves credentials and calls createReaction', async () => {
-  const reacted: Array<{ messageId: string; emoji: string }> = []
+test('FeishuChannel.ackInbound resolves credentials and creates an ONLOOKER reaction', async () => {
+  const reacted: Array<{ messageId: string; emojiType: string }> = []
   const client = {
     async getTenantAccessToken(): Promise<string> { return 'tok' },
-    async createReaction(_token: string, messageId: string, emoji: string): Promise<void> {
-      reacted.push({ messageId, emoji })
+    async createReaction(_token: string, messageId: string, emojiType: string): Promise<void> {
+      reacted.push({ messageId, emojiType })
     },
   } as any
 
   const channel = new FeishuChannel({ client, resolveCredentials: async () => ({ appId: 'cli_a', appSecret: 'secret_b' }) })
-  assert.equal(channel.supportsReactions, true)
-  await channel.react('oc_chat1', 'om_1', '👀')
-  assert.deepEqual(reacted, [{ messageId: 'om_1', emoji: '👀' }])
+  assert.equal(await channel.ackInbound('oc_chat1', 'om_1'), true)
+  assert.deepEqual(reacted, [{ messageId: 'om_1', emojiType: 'ONLOOKER' }])
 })
 
 test('FeishuChannel.send uses replyMessage when replyTo is provided', async () => {

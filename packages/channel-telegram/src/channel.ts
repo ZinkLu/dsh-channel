@@ -62,9 +62,6 @@ export class TelegramChannel extends Channel {
   get supportsMedia(): boolean {
     return true
   }
-  get supportsReactions(): boolean {
-    return true
-  }
   get supportsReply(): boolean {
     return true
   }
@@ -72,10 +69,12 @@ export class TelegramChannel extends Channel {
     return true
   }
 
-  async react(chatKey: string, messageId: string, emoji: string): Promise<void> {
+  /** Cheap ack: a 👀 reaction (one of the Bot API's allow-listed emoji). */
+  async ackInbound(chatKey: string, messageId: string): Promise<boolean> {
     const token = await this.opts.resolveToken()
     if (!token) throw new Error('TELEGRAM_BOT_TOKEN is not configured')
-    await this.opts.client.setMessageReaction(token, chatKey, Number(messageId), emoji)
+    await this.opts.client.setMessageReaction(token, chatKey, Number(messageId), '👀')
+    return true
   }
 
   async sendMedia(

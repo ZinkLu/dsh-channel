@@ -535,14 +535,13 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     }
   }
 
-  /** ack-long: react to the inbound message when supported, otherwise fall back to a text ack. */
+  /** ack-long: let the provider show a cheap "received" on the inbound message; text ack only when it cannot. */
   private async ackLong(chatKey: string, messageId?: string): Promise<void> {
-    if (this.channel.supportsReactions && messageId !== undefined && messageId !== '') {
+    if (messageId !== undefined && messageId !== '') {
       try {
-        await this.channel.react(chatKey, messageId, '👀')
-        return
+        if (await this.channel.ackInbound(chatKey, messageId)) return
       } catch {
-        // Reaction failed (decorative); fall through to the text ack.
+        // Decorative; a failed ack falls through to the text ack.
       }
     }
     this.sendLocal(chatKey, 'Received, working on it…')

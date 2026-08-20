@@ -256,10 +256,6 @@ export abstract class Channel {
   get supportsMedia(): boolean {
     return false
   }
-  /** Whether reacting to an inbound message with an emoji is supported (the cheap alternative to a text ack). */
-  get supportsReactions(): boolean {
-    return false
-  }
   /** Whether replying to (quoting) a specific inbound message is supported on the outbound side. */
   get supportsReply(): boolean {
     return false
@@ -317,11 +313,15 @@ export abstract class Channel {
   }
 
   /**
-   * React to an inbound message with an emoji (the ack-long UX). No-op by default;
-   * supportsReactions platforms implement it and throw on failure so the caller can
-   * fall back to a text ack.
+   * Cheaply acknowledge an inbound message (the ack-long UX) in whatever form the
+   * platform has — a reaction, a marker, nothing. Returns true when something
+   * visible was shown; false (the default) or a throw both tell the caller to
+   * fall back to a text ack. The platform vocabulary (which emoji, which API)
+   * stays inside the provider; the caller only owns the timing.
    */
-  async react(_chatKey: string, _messageId: string, _emoji: string): Promise<void> {}
+  async ackInbound(_chatKey: string, _messageId: string): Promise<boolean> {
+    return false
+  }
 
   /**
    * Reconcile a prior delivery by querying the platform before a blind resend

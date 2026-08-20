@@ -66,11 +66,6 @@ export function domainBase(domain: FeishuDomain = 'feishu'): string {
   return domain === 'lark' ? 'https://open.larksuite.com' : 'https://open.feishu.cn'
 }
 
-const FEISHU_EMOJI_TYPES: Record<string, string> = {
-  '👀': 'ONLOOKER',
-  '👍': 'THUMBSUP',
-}
-
 export function resolveReceiveIdType(receiveId: string): 'chat_id' | 'open_id' | 'union_id' | 'user_id' {
   if (receiveId.startsWith('oc_')) return 'chat_id'
   if (receiveId.startsWith('ou_')) return 'open_id'
@@ -148,18 +143,15 @@ export class FeishuClient {
   }
 
   /**
-   * React to a message with an emoji (Feishu message_reaction.create).
-   * Feishu expects a predefined `emoji_type`; a small map translates the common
-   * ack emoji, and anything unknown is passed through unchanged (a failure just
-   * degrades to the caller's text ack).
+   * React to a message (Feishu message_reaction.create). `emojiType` is Feishu's
+   * own predefined key (`ONLOOKER`, `THUMBSUP`, …), not a Unicode emoji.
    */
   async createReaction(
     token: string,
     messageId: string,
-    emoji: string,
+    emojiType: string,
     opts: { signal?: AbortSignal } = {},
   ): Promise<void> {
-    const emojiType = FEISHU_EMOJI_TYPES[emoji] ?? emoji
     await this.callApi(
       token,
       `/im/v1/messages/${messageId}/reactions`,

@@ -85,6 +85,12 @@ stated reason, not rediscovering the option.
 - **A structural-typing (duck-typed protocol) contract** — the dsh ecosystem's own convention is
   abstract classes with capability-fact getters (`LlmAdapter`, `FileSystem`). Switching styles
   would diverge from every other dsh definition package for no gain.
+- **A generic `react(chatKey, messageId, emoji)` primitive gated by a `supportsReactions` fact** —
+  shipped once for the `ack-long` UX and retired (design §12.3). Emoji are platform dialect, not
+  shared vocabulary, so the bridge's choice leaked into every provider as a translation table, and
+  the fact was redundant with the failure fallback. The contract carries the *intent*
+  (`ackInbound`); the provider owns the rendering. Re-add a reaction primitive only for a consumer
+  that needs reactions as such (the agent reacting on request), never as a means to acknowledge.
 - **Default-auto-approve on unanswered confirmation** — the exact opposite of R8/A6's "never
   default to allowing". Kept here as a negative example: the `next()`-on-timeout-and-no-answerer
   design is correct and must not be softened toward it.

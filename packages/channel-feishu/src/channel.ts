@@ -56,18 +56,17 @@ export class FeishuChannel extends Channel {
   get supportsMultiSelect(): boolean {
     return false
   }
-  get supportsReactions(): boolean {
-    return true
-  }
   get supportsReply(): boolean {
     return true
   }
 
-  async react(chatKey: string, messageId: string, emoji: string): Promise<void> {
+  /** Cheap ack: an `ONLOOKER` (👀) reaction — Feishu's own emoji_type key, no translation. */
+  async ackInbound(_chatKey: string, messageId: string): Promise<boolean> {
     const credentials = await this.opts.resolveCredentials()
     if (!credentials) throw new Error('FEISHU_APP_ID / FEISHU_APP_SECRET are not configured')
     const token = await this.opts.client.getTenantAccessToken(credentials)
-    await this.opts.client.createReaction(token, messageId, emoji)
+    await this.opts.client.createReaction(token, messageId, 'ONLOOKER')
+    return true
   }
 
   async send(
