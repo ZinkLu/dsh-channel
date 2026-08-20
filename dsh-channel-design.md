@@ -842,6 +842,19 @@ common case. A session that genuinely cannot be resumed is then the policy's to 
 resumed logs are refolded into the seen set, so the log stays the dedupe baseline (R7) for
 conventional sessions too — not just the explicitly bound ones.
 
+Two boundedness rules keep the sweep honest (both e2e casualties before they were rules):
+
+- **Each host resume runs under a deadline** (`resumeTimeoutMs`, 15s). `agents.resume` belongs to
+  the host and may hang; without the deadline one wedged resume silently wedges the whole sweep —
+  no marks, no warning, and the ledger looks untouched. On timeout the sweep warns and moves on;
+  the policy then abandons that delivery visibly instead of nothing happening at all.
+- **The sweep re-runs on every reconnect, not only at boot.** A mid-run disconnect window fails
+  ledger deliveries fast (`channel not connected`) and can burn a delivery's queue retries into
+  `failed`; a boot-only sweep would never revisit those until the next restart. `recoverOnce`
+  holds only the *in-flight* sweep (startup and a racing first `connected` still share one pass),
+  and each later `connected` starts a fresh one. The re-sweep skips keys a live deliver queue
+  still owns (in flight or waiting), so an ongoing retry is never doubled.
+
 ---
 
 ## Appendix A: Reference Index

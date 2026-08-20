@@ -143,6 +143,8 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
 
   private localSeq = 0
   private recoverPromise: Promise<void> | undefined
+  /** Deadline for one host `agents.resume` during recovery; a wedged resume must not wedge the sweep. */
+  protected resumeTimeoutMs = 15_000
   private started = false
   private channelStatus: 'connecting' | 'connected' | 'disconnected' | 'fatal' = 'disconnected'
 
@@ -364,20 +366,30 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
   }
 
   /**
-   * Startup recovery, exactly once per boot, whether it is `start()` or a later
-   * `connected` transition that gets there first. Both await the same promise,
-   * so a slow first connect defers recovery rather than losing it.
+   * Coalesced recovery sweep: one in flight at a time. The startup call and a
+   * racing first `connected` transition share a single pass (a slow connect
+   * defers recovery rather than losing it), and every later reconnect starts a
+   * fresh one. `recover()` skips keys still queued in memory, so a live retry
+   * is never doubled by a re-sweep.
    */
   private recoverOnce(): Promise<void> {
-    this.recoverPromise ??= this.recover().catch((error: unknown) => {
-      this.warn(`startup recovery failed: ${error instanceof Error ? error.message : String(error)}`)
-    })
+    this.recoverPromise ??= this.recover()
+      .catch((error: unknown) => {
+        this.warn(`recovery sweep failed: ${error instanceof Error ? error.message : String(error)}`)
+      })
+      .finally(() => {
+        // Only the in-flight sweep is held: a later `connected` transition starts
+        // a fresh one. A mid-run disconnect window can burn a delivery's queue
+        // retries into `failed`; a startup-only sweep would never revisit those.
+        this.recoverPromise = undefined
+      })
     return this.recoverPromise
   }
 
   /** Execute the recovery policy's decisions against the ledger (look up text, resend/skip/abandon). */
   private async recover(): Promise<void> {
-    const recoverable = this.store.sweepRecoverable()
+    const queued = this.liveQueuedDeliveryKeys()
+    const recoverable = this.store.sweepRecoverable().filter((item) => !queued.has(item.key))
     await this.resumeRecoverableSessions(recoverable)
     const actions = await this.recovery.sweep(recoverable, {
       channel: this.channel,
@@ -420,10 +432,12 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
       attempted.add(sessionId)
       if (this.ctx.agents.get(SessionId(sessionId))) continue
       try {
-        const agent = await this.ensureAgent(sessionId, item.chatKey, false)
+        const agent = await withDeadline(this.ensureAgent(sessionId, item.chatKey, false), this.resumeTimeoutMs, `resume ${sessionId}`)
         if (agent) resumedAny = true
-      } catch {
-        // A session that cannot be resumed is the policy's to abandon; keep going.
+      } catch (error) {
+        // A session that cannot be resumed — or whose host resume hangs past the
+        // deadline — is the policy's to abandon; the sweep itself keeps going.
+        this.warn(`recovery: ${error instanceof Error ? error.message : String(error)}`)
       }
     }
     // A resumed session brings its log with it: refold so the seen set regains
@@ -1103,6 +1117,16 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     return { maxRetries: 3, baseDelayMs: 1000, maxQueue: 32, spacingMs: 1000 }
   }
 
+  /** Keys a live deliver queue still owns (in flight or waiting); a recovery re-sweep must not double them. */
+  private liveQueuedDeliveryKeys(): Set<string> {
+    const keys = new Set<string>()
+    for (const state of this.deliverQueueStates.values()) {
+      if (state.inFlight !== null) keys.add(state.inFlight.key)
+      for (const item of state.waiting) keys.add(item.key)
+    }
+    return keys
+  }
+
   /** The one reduce-and-run step every deliver-queue input goes through. */
   private feedDeliverQueue(chatKey: string, input: DeliverQueueInput<BridgeDelivery>): void {
     const state = this.deliverQueueStates.get(chatKey) ?? emptyDeliverQueueState<BridgeDelivery>()
@@ -1259,4 +1283,25 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
   protected handleInboundChoice(choiceId: string): PromptAnswer | null {
     return this.broker.handleInboundChoice(choiceId)
   }
+}
+
+/** Race a promise against a deadline. The loser keeps running; its eventual rejection is swallowed. */
+function withDeadline<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      promise.catch(() => {})
+      reject(new Error(`${what} timed out after ${ms}ms`))
+    }, ms)
+    timer.unref?.()
+    promise.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (error: unknown) => {
+        clearTimeout(timer)
+        reject(error instanceof Error ? error : new Error(String(error)))
+      },
+    )
+  })
 }

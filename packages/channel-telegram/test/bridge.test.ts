@@ -1039,3 +1039,94 @@ test('poll loop re-announces connected after a transient failure', async () => {
   const relevant = statuses.filter((s) => s !== 'connecting')
   assert.deepEqual(relevant, ['connected', 'disconnected', 'connected'])
 })
+
+test('a hung host resume cannot wedge the recovery sweep', async () => {
+  const root = new Context()
+  new ChannelRegistry(root)
+
+  const sessionId = 'channel:telegram:42'
+  root.provide('agents', {
+    list: () => [],
+    get: () => undefined,
+    // The host resume never settles — recovery must abandon past the deadline, not hang.
+    resume: () => new Promise(() => {}),
+    create: async () => {
+      throw new Error('recovery must never create a session')
+    },
+  })
+  root.provide('credentials', { resolve: async () => ({ value: 'test-token', source: 'test' }) })
+
+  const store = createMemoryStore()
+  store.recordDelivery(`${sessionId}:2`, { chatKey: '42', textHash: 'abc' })
+  store.markFailed(`${sessionId}:2`, 'channel not connected', 'transient')
+  const marked: string[] = []
+  const originalMarkFailed = store.markFailed.bind(store)
+  store.markFailed = (key: string, error: string, errorKind?: 'transient' | 'permanent' | 'retryable') => {
+    marked.push(error)
+    originalMarkFailed(key, error, errorKind as never)
+  }
+
+  const client = createFakeClient([])
+  const channel = new TelegramChannel({ client, resolveToken: async () => 'test-token' })
+  root.channels.register(channel)
+  const bridge = new TelegramBridge(
+    root,
+    () => ({ allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 5, approvalTimeoutSec: 120 }),
+    store,
+    channel,
+    client,
+  )
+  ;(bridge as unknown as { resumeTimeoutMs: number }).resumeTimeoutMs = 50
+
+  await bridge.start()
+  // The sweep completed despite the wedged resume: the policy abandoned the entry visibly.
+  await waitFor(() => marked.some((reason) => reason.includes('unavailable')))
+  await bridge.stop()
+
+  assert.equal(client.sends.length, 0)
+})
+
+test('a delivery failed mid-run is re-swept on reconnect, not only at startup', async () => {
+  const root = new Context()
+  new ChannelRegistry(root)
+
+  const sessionId = 'channel:telegram:42'
+  const events: any[] = [
+    { type: 'turn/start', seq: 0, time: Date.now(), data: {} },
+    { type: 'assistant/message', seq: 1, time: Date.now(), data: { message: { role: 'assistant', content: [{ type: 'text', text: 'the lost mid-run answer' }] } } },
+  ]
+  const fakeAgent = { id: sessionId, status: 'idle' as const, session: { events } }
+  root.provide('agents', {
+    list: () => [fakeAgent],
+    get: () => fakeAgent,
+    resume: async () => ({ agent: fakeAgent, dispose: async () => {} }),
+    create: async () => {
+      throw new Error('not used')
+    },
+  })
+  root.provide('credentials', { resolve: async () => ({ value: 'test-token', source: 'test' }) })
+
+  const store = createMemoryStore()
+  const client = createFakeClient([])
+  const channel = new TelegramChannel({ client, resolveToken: async () => 'test-token' })
+  root.channels.register(channel)
+  const bridge = new TelegramBridge(
+    root,
+    () => ({ allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 5, approvalTimeoutSec: 120 }),
+    store,
+    channel,
+    client,
+  )
+
+  await bridge.start()
+
+  // Mid-run: a disconnect window burned this delivery's retries into `failed`.
+  store.recordDelivery(`${sessionId}:1`, { chatKey: '42', textHash: 'abc' })
+  store.markFailed(`${sessionId}:1`, 'channel not connected', 'transient')
+
+  // The reconnect must trigger a fresh sweep that resends it.
+  root.emit('channel/status', 'telegram', 'disconnected', new Error('transient'))
+  root.emit('channel/status', 'telegram', 'connected')
+  await waitFor(() => client.sends.some((send) => send.text.includes('the lost mid-run answer')))
+  await bridge.stop()
+})
