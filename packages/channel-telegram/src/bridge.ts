@@ -76,7 +76,10 @@ export class TelegramBridge extends ChannelBridge<TelegramBridgeConfig> {
   private async pollLoop(signal: AbortSignal): Promise<void> {
     let offset = 0
     let backoff = 1000
-    let first = true
+    // Re-announced after every gap, not just the first poll: the kit bridge
+    // gates ledger deliveries on `connected`, so a status that never comes back
+    // would fail every outbound reply while inbound keeps working.
+    let connected = false
 
     while (!signal.aborted) {
       try {
@@ -91,8 +94,8 @@ export class TelegramBridge extends ChannelBridge<TelegramBridgeConfig> {
           signal,
         })
 
-        if (first) {
-          first = false
+        if (!connected) {
+          connected = true
           this.ctx.emit('channel/status', 'telegram', 'connected')
         }
 
@@ -104,6 +107,7 @@ export class TelegramBridge extends ChannelBridge<TelegramBridgeConfig> {
         backoff = 1000
       } catch (error) {
         if (signal.aborted) return
+        connected = false
         this.ctx.emit('channel/status', 'telegram', 'disconnected', error instanceof Error ? error : new Error(String(error)))
         await sleepWithAbort(backoff + Math.random() * 500, signal)
         backoff = Math.min(15_000, backoff * 2)
