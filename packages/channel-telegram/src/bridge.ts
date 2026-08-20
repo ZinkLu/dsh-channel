@@ -227,6 +227,7 @@ export class TelegramBridge extends ChannelBridge<TelegramBridgeConfig> {
   // ---- callback buttons (approval/prompt) ----
 
   private async processCallbackQuery(callbackQuery: TelegramCallbackQuery): Promise<void> {
+    this.debug(`callback_query ${callbackQuery.id} from ${callbackQuery.from?.id ?? '?'}: ${callbackQuery.data ?? '<no data>'}`)
     try {
       await this.client.answerCallbackQuery(await this.requireToken(), callbackQuery.id)
     } catch {
@@ -242,7 +243,9 @@ export class TelegramBridge extends ChannelBridge<TelegramBridgeConfig> {
       const chatKey = callbackQuery.message ? toChatKey(callbackQuery.message.chat) : undefined
       const messageId = callbackQuery.message?.message_id
 
-      this.resolveApproval(num, outcome)
+      // Only a live pending approval gets the "answered" face; a tap on an
+      // expired/foreign card must not look like it took effect.
+      const settled = this.resolveApproval(num, outcome)
 
       if (chatKey && messageId !== undefined) {
         try {
@@ -251,7 +254,7 @@ export class TelegramBridge extends ChannelBridge<TelegramBridgeConfig> {
             token,
             chatKey,
             messageId,
-            outcome === 'allowed-once' ? '✅ Approved' : '⛔ Denied',
+            !settled ? `⚠️ Approval #${num} is no longer pending (expired or already answered)` : outcome === 'allowed-once' ? '✅ Approved' : '⛔ Denied',
             { parseMode: 'HTML' },
           )
         } catch {

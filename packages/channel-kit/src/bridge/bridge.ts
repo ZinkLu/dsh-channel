@@ -159,6 +159,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
       deliver: (out) => this.ctx.channels.deliver(out),
       rememberOwnSends: (chatKey, ids) => this.rememberOwnSends(chatKey, ids),
       accountQualifier: () => this.accountQualifier,
+      log: (level, message) => (level === 'warn' ? this.warn(message) : this.debug(message)),
     })
   }
 
@@ -172,8 +173,11 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
       this.onSessionEvent(session, event)
     }))
     this.disposers.push(this.ctx.on('approval/request', async (req, next) => this.broker.handleApprovalRequest(req, next)))
-    this.disposers.push(this.ctx.on('channel/status', (channelId: string, status: 'connecting' | 'connected' | 'disconnected' | 'fatal') => {
+    this.disposers.push(this.ctx.on('channel/status', (channelId: string, status: 'connecting' | 'connected' | 'disconnected' | 'fatal', error?: Error) => {
       if (channelId !== this.channel.id) return
+      // Transport failures used to be status-only and therefore invisible; every
+      // provider reports them through this one event, so log them once here.
+      if ((status === 'disconnected' || status === 'fatal') && error) this.warn(`channel ${status}: ${error.message}`)
       this.channelStatus = status
       if (status === 'connected') {
         for (const resolve of this.statusWaiters.splice(0)) resolve()
@@ -294,6 +298,11 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
 
   private warn(message: string): void {
     this.ctx.logger(`dsh-channel-${this.channel.id}`).warn(message)
+  }
+
+  /** Diagnostic trace for providers (no-op unless a log exporter raises the threshold to debug). */
+  protected debug(message: string): void {
+    this.ctx.logger(`dsh-channel-${this.channel.id}`).debug(message)
   }
 
   // ---- startup recovery ----
@@ -1264,8 +1273,9 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
 
   // ---- approval / prompt (delegated to the broker) ----
 
-  protected resolveApproval(num: number, outcome: 'allowed-once' | 'rejected'): void {
-    this.broker.resolveApproval(num, outcome)
+  /** Settle a pending approval; false when nothing is pending under `num` (expired, already answered, or another instance's). */
+  protected resolveApproval(num: number, outcome: 'allowed-once' | 'rejected'): boolean {
+    return this.broker.resolveApproval(num, outcome)
   }
 
   protected resolvePrompt(num: number, answer: PromptAnswer): void {

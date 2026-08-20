@@ -9,7 +9,7 @@
  * waterfall, prompt → empty selection), never to an allow.
  */
 import type { ApprovalOutcome, ApprovalRequest } from '@deepseek-ai/dsh-user-approval'
-import type { Channel, OutboundMessage } from 'dsh-channel'
+import type { Channel, DeliveryReceipt, OutboundMessage } from 'dsh-channel'
 import { renderForTier } from '../format/format.js'
 import { parseApprovalReply, renderApproval, type PendingApproval } from '../policy/approval-render.js'
 import { parsePromptReply, renderPrompt, type PendingPrompt, type PromptAnswer, type PromptOptions } from '../policy/prompt-render.js'
@@ -40,10 +40,12 @@ export interface InteractionHost {
   timeoutMs(): number
   /** The chatKey the given agent's conversation is bound to, if any. */
   chatKeyForAgent(agentId: string): string | undefined
-  deliver(out: OutboundMessage): Promise<{ platformMessageIds?: readonly string[] }>
+  deliver(out: OutboundMessage): Promise<DeliveryReceipt>
   /** Record our own platform message ids for outbound-echo suppression. */
   rememberOwnSends(chatKey: string, platformMessageIds: readonly string[]): void
   accountQualifier(): { accountId?: string }
+  /** Diagnostics sink (`debug` for the normal path, `warn` for anything that loses an answer). */
+  log(level: 'debug' | 'warn', message: string): void
 }
 
 interface ApprovalEntry extends PendingApproval {
@@ -77,9 +79,13 @@ export class InteractionBroker {
   /** `approval/request` waterfall handler: prompt the chat, or `next()` when this bridge does not own the agent. */
   async handleApprovalRequest(req: ApprovalRequest, next: () => Promise<ApprovalOutcome>): Promise<ApprovalOutcome> {
     const chatKey = this.host.chatKeyForAgent(req.agent.id)
-    if (!chatKey) return next()
+    if (!chatKey) {
+      this.host.log('debug', `approval/request for ${req.agent.id} (${req.toolName}) is not ours → next()`)
+      return next()
+    }
 
     const num = ++this.seq
+    this.host.log('debug', `approval #${num} for ${req.agent.id} (${req.toolName}) → chat ${chatKey}, timeout ${this.host.timeoutMs()}ms`)
     const entry: ApprovalEntry = {
       num,
       requestId: this.requestId(num),
@@ -96,6 +102,7 @@ export class InteractionBroker {
     })
 
     const onAbort = () => {
+      this.host.log('warn', `approval #${num} withdrawn by the request signal → next()`)
       this.pendingApprovals.delete(num)
       if (entry.timer) clearTimeout(entry.timer)
       settle('deferred')
@@ -103,6 +110,7 @@ export class InteractionBroker {
     req.signal?.addEventListener('abort', onAbort, { once: true })
 
     await this.sendApprovalPrompt(entry, req)
+    this.host.log('debug', `approval #${num} prompt sent as platform message ${entry.messageId ?? '?'}`)
     // The entry can already be gone here for two reasons: the send failed /
     // the request aborted (both settled 'deferred' → fall back to the
     // waterfall), or the user answered while the prompt send was in flight
@@ -111,12 +119,14 @@ export class InteractionBroker {
     // distinguishes the two without a race.
     if (this.pendingApprovals.has(num)) {
       entry.timer = this.armTimeout(() => {
+        this.host.log('warn', `approval #${num} unanswered after ${this.host.timeoutMs()}ms → next()`)
         this.pendingApprovals.delete(num)
         settle('deferred')
       })
     }
 
     const outcome = await verdict
+    this.host.log('debug', `approval #${num} settled: ${outcome}`)
     req.signal?.removeEventListener('abort', onAbort)
     if (entry.timer) clearTimeout(entry.timer)
     if (outcome === 'deferred') return next()
@@ -203,9 +213,10 @@ export class InteractionBroker {
     )
     try {
       await this.sendInteraction(entry.chatKey, rendered, `approval:${entry.requestId}`, entry)
-    } catch {
+    } catch (error) {
       // Fail-fast: if the prompt cannot be delivered the user demonstrably cannot
       // answer, so resolve `deferred` immediately instead of waiting out the timeout.
+      this.host.log('warn', `approval #${entry.num} prompt could not be delivered (${error instanceof Error ? error.message : String(error)}) → next()`)
       this.pendingApprovals.delete(entry.num)
       if (entry.timer) clearTimeout(entry.timer)
       entry.resolve?.('deferred')
@@ -228,17 +239,24 @@ export class InteractionBroker {
       deliveryKey,
     }
     const receipt = await this.host.deliver(out)
+    // The registry's deliver never throws: a failed send comes back as a receipt.
+    if (receipt.status === 'failed') throw new Error(receipt.error ?? 'delivery failed')
     const platformId = receipt.platformMessageIds?.[0]
     if (platformId) entry.messageId = Number(platformId)
     this.host.rememberOwnSends(chatKey, receipt.platformMessageIds ?? [])
   }
 
-  resolveApproval(num: number, outcome: 'allowed-once' | 'rejected'): void {
+  /** Settle a pending approval; false when `num` is unknown (already settled, timed out, or from another instance). */
+  resolveApproval(num: number, outcome: 'allowed-once' | 'rejected'): boolean {
     const entry = this.pendingApprovals.get(num)
-    if (!entry) return
+    if (!entry) {
+      this.host.log('warn', `approval reply for #${num} matches no pending approval (pending: [${[...this.pendingApprovals.keys()].join(', ')}])`)
+      return false
+    }
     this.pendingApprovals.delete(num)
     if (entry.timer) clearTimeout(entry.timer)
     entry.resolve?.(outcome)
+    return true
   }
 
   resolvePrompt(num: number, answer: PromptAnswer): void {
