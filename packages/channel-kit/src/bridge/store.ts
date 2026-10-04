@@ -32,6 +32,8 @@ export interface ChannelStore {
   markAttempting(key: string): void
   markDelivered(key: string, platformMessageIds: readonly string[]): void
   markFailed(key: string, error: string, errorKind?: SendErrorKind): void
+  /** Terminally abandon an entry, recording a visible reason (the recovery hash guard's outlet). */
+  markAbandoned(key: string, reason: string): void
   /**
    * Reclaim at startup. A failed/attempting/pending entry becomes abandoned only when
    * BOTH the attempt cap is reached AND the entry is old enough (otherwise a short
@@ -179,6 +181,13 @@ export function createMemoryStore(opts: MemoryStoreOptions = {}): ChannelStore {
       if (errorKind !== undefined) record.errorKind = errorKind
       record.updatedAt = Date.now()
     },
+    markAbandoned(key: string, reason: string) {
+      const record = deliveries.get(key)
+      if (!record) return
+      record.state = 'abandoned'
+      record.error = reason
+      record.updatedAt = Date.now()
+    },
     sweepRecoverable(opts: { now?: number; minAgeMs?: number } = {}) {
       const now = opts.now ?? Date.now()
       const minAgeMs = opts.minAgeMs ?? abandonMinAgeMs
@@ -191,7 +200,7 @@ export function createMemoryStore(opts: MemoryStoreOptions = {}): ChannelStore {
             record.updatedAt = now
             continue
           }
-          result.push({ key, state: record.state, chatKey: record.chatKey, attempts: record.attempts, errorKind: record.errorKind })
+          result.push({ key, state: record.state, chatKey: record.chatKey, textHash: record.textHash, attempts: record.attempts, errorKind: record.errorKind })
         }
       }
       return result

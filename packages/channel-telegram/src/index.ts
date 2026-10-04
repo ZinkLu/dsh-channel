@@ -1,7 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
-import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path'
@@ -31,12 +30,9 @@ export function apply(ctx: Context, config: TelegramConfig) {
   const client = new TelegramClient({ proxyUrl: config.proxyUrl })
   const cwd = config.cwd ?? process.cwd()
 
-  // Settings seam: resolved value = schema defaults < base(config) < user document.
+  // 0.2 settings model: config comes from the plugin entry in the profile's
+  // cordis.patch.yml; any change restarts the plugin with the new config.
   let source: () => TelegramConfig = () => config
-  installSettingsSection(ctx, settingsNamespace(CHANNEL_TELEGRAM_NS), Config, config, {
-    setSource: (current) => { source = current },
-    onChange: () => {},
-  })
 
   const channel = new TelegramChannel({
     client,

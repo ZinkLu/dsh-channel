@@ -60,7 +60,9 @@ export function projectSessionEvent(event: SessionEventLike, toolNameOf: ToolNam
         arguments: String(data?.arguments ?? ''),
       }]
     case 'tool/result': {
-      const callId = String(data?.message?.content?.[0]?.toolCallId ?? '')
+      // 0.2 ToolResultMessage: role 'tool', the call id at the top level (mirrored in source.callId).
+      const message = data?.message
+      const callId = String(message?.toolCallId ?? message?.source?.callId ?? '')
       return [{
         kind: 'tool-result',
         callId,
@@ -78,16 +80,8 @@ export function projectSessionEvent(event: SessionEventLike, toolNameOf: ToolNam
       if (text !== '') inputs.push({ kind: 'assistant-message', text })
       return inputs
     }
-    case 'assistant/chunk': {
-      // Streaming deltas (v2). Only the thinking tier is projected here; token/text deltas are not presented in v1.
-      const chunk = data?.chunk
-      if (chunk?.type === 'reasoning-delta' && typeof chunk.text === 'string' && chunk.text !== '') {
-        return [{ kind: 'reasoning-delta', text: chunk.text }]
-      }
-      return []
-    }
     case 'turn/end':
-      return [{ kind: 'turn-end', reason: (data?.reason?.kind ?? 'completed') as 'completed' | 'aborted' | 'blocked' | 'error' | 'max-tokens' | 'interrupted' }]
+      return [{ kind: 'turn-end', reason: (data?.reason?.kind ?? 'completed') as 'completed' | 'aborted' | 'blocked' | 'error' | 'max-tokens' | 'interrupted' | 'forked' }]
     default:
       return []
   }
@@ -129,6 +123,8 @@ export function turnEndLabel(kind: string): string {
       return 'Max tokens'
     case 'interrupted':
       return 'Interrupted'
+    case 'forked':
+      return 'Forked'
     default:
       return kind
   }

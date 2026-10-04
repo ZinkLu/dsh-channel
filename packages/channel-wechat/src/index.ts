@@ -1,6 +1,5 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
-import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { CHANNEL_WECHAT_NS, CREDENTIAL_WECHAT_TOKEN, wechatConfigSchema, type WeChatConfig } from './config.js'
@@ -28,12 +27,9 @@ export function apply(ctx: Context, config: WeChatConfig) {
   const store = createJsonFileStore(resolveStatePath(config))
   const client = new WeixinClient({ proxyUrl: config.proxyUrl })
 
-  // Settings seam: resolved value = schema defaults < base(config) < user document.
+  // 0.2 settings model: config comes from the plugin entry in the profile's
+  // cordis.patch.yml; any change restarts the plugin with the new config.
   let source: () => WeChatConfig = () => config
-  installSettingsSection(ctx, settingsNamespace(CHANNEL_WECHAT_NS), Config, config, {
-    setSource: (current) => { source = current },
-    onChange: () => {},
-  })
 
   const channel = new WeChatChannel({
     client,

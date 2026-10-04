@@ -242,6 +242,14 @@ export function createJsonFileStore(path: string): ChannelStore {
       record.updatedAt = Date.now()
       scheduleWrite()
     },
+    markAbandoned(key: string, reason: string) {
+      const record = deliveries.get(key)
+      if (!record) return
+      record.state = 'abandoned'
+      record.error = reason
+      record.updatedAt = Date.now()
+      scheduleWrite()
+    },
     sweepRecoverable(opts: { now?: number; minAgeMs?: number } = {}): RecoverableDelivery[] {
       const now = opts.now ?? Date.now()
       const minAgeMs = opts.minAgeMs ?? abandonMinAgeMs
@@ -255,7 +263,7 @@ export function createJsonFileStore(path: string): ChannelStore {
             scheduleWrite()
             continue
           }
-          result.push({ key, state: record.state, chatKey: record.chatKey, attempts: record.attempts, errorKind: record.errorKind })
+          result.push({ key, state: record.state, chatKey: record.chatKey, textHash: record.textHash, attempts: record.attempts, errorKind: record.errorKind })
         }
       }
       return result

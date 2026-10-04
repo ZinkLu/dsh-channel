@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
 import { ChannelRegistry, type InboundMessage } from 'dsh-channel'
-import { createMemoryStore } from 'dsh-channel-kit'
+import { createMemoryStore, hashText } from 'dsh-channel-kit'
 import { TelegramBridge } from '../src/bridge.ts'
 import { TelegramChannel } from '../src/channel.ts'
 import type { TelegramClient, TelegramUpdate } from '../src/client.ts'
@@ -349,18 +349,30 @@ test('bridge joins the host default agent preset when creating an agent', async 
   const mountCalls: Array<string | undefined> = []
   const metaPresets: Array<string | undefined> = []
 
-  const fakeAgent = { id: 'channel:telegram:42', status: 'idle' as const, session: { events: [] as any[] }, followup() {}, steer() {} }
+  const fakeAgentCtx = {
+    get: (name: string) => (name === 'agentPresets' ? presetsFake : undefined),
+    on: () => () => {},
+  }
   root.provide('agents', {
     list: () => [],
     get: () => undefined,
     resume: async () => { throw new Error('no persistence') },
     create: async (opts: any) => {
       metaPresets.push(opts.meta?.agentPreset)
-      if (opts.setup) await opts.setup({ get: () => undefined })
+      // The factory writes meta.agentPreset into the durable session header;
+      // setup then mounts the preset recorded there.
+      const fakeAgent = {
+        id: 'channel:telegram:42',
+        status: 'idle' as const,
+        session: { events: [] as any[], header: { agentPreset: opts.meta?.agentPreset } },
+        followup() {},
+        steer() {},
+      }
+      if (opts.setup) await opts.setup(fakeAgentCtx, fakeAgent)
       return { agent: fakeAgent, dispose: async () => {} }
     },
   })
-  root.provide('agentPresets', {
+  const presetsFake = {
     resolve: async (id?: string) => {
       resolveCalls.push(id)
       return { id: 'standard' }
@@ -368,7 +380,8 @@ test('bridge joins the host default agent preset when creating an agent', async 
     mount: async (_agentCtx: any, id?: string) => {
       mountCalls.push(id)
     },
-  })
+  }
+  root.provide('agentPresets', presetsFake)
   root.provide('credentials', { resolve: async () => ({ value: 'test-token', source: 'test' }) })
 
   const updates: TelegramUpdate[] = [
@@ -435,7 +448,7 @@ test('bridge shows a progress draft for tool calls and finalizes it on the answe
   await waitFor(() => client.sends.some((s) => s.text.includes('Working…')), 2500)
   assert.ok(client.sends.some((s) => s.text.includes('🛠️ Bash')))
 
-  root.emit('session/event', { id: sessionId }, { type: 'tool/result', seq: 3, time: Date.now(), data: { turn: 1, step: 1, message: { role: 'user', content: [{ type: 'tool-result', toolCallId: 'c1', content: [] }] } } })
+  root.emit('session/event', { id: sessionId }, { type: 'tool/result', seq: 3, time: Date.now(), data: { turn: 1, step: 1, message: { role: 'tool', toolCallId: 'c1', content: [] } } })
   await waitFor(() => client.edits.length >= 1, 2000)
 
   root.emit('session/event', { id: sessionId }, { type: 'assistant/message', seq: 4, time: Date.now(), data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: 'done' }] } } })
@@ -474,7 +487,7 @@ test('bridge retains the preview instead of deleting it when edit-in-place died'
   await waitFor(() => client.sends.some((s) => s.text.includes('Working…')), 2500)
 
   // The follow-up draft update fails, flipping the reducer to append-tail mode.
-  root.emit('session/event', { id: sessionId }, { type: 'tool/result', seq: 3, time: Date.now(), data: { turn: 1, step: 1, message: { role: 'user', content: [{ type: 'tool-result', toolCallId: 'c1', content: [] }] } } })
+  root.emit('session/event', { id: sessionId }, { type: 'tool/result', seq: 3, time: Date.now(), data: { turn: 1, step: 1, message: { role: 'tool', toolCallId: 'c1', content: [] } } })
   await waitFor(() => client.sends.some((s) => s.text.includes('✅ Bash')), 3000)
 
   root.emit('session/event', { id: sessionId }, { type: 'assistant/message', seq: 4, time: Date.now(), data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: 'done' }] } } })
@@ -484,14 +497,19 @@ test('bridge retains the preview instead of deleting it when edit-in-place died'
   assert.deepEqual(client.deletes, [], 'the retained preview must not be deleted')
 })
 
-test('bridge registers a user-questions provider and renders an option prompt', async () => {
+test('bridge answers the user-questions waterfall and renders an option prompt', async () => {
   const root = new Context()
   new ChannelRegistry(root)
   const sessionId = 'channel:telegram:42'
 
-  let registeredProvider: { ask: (request: any) => Promise<any> } | null = null
-  const fakeUq = { registerProvider(provider: any) { registeredProvider = provider; return () => {} } }
-  const fakeAgentCtx = { get: (name: string) => (name === 'userQuestions' ? fakeUq : undefined) }
+  let answerer: ((request: any, next: () => Promise<any>) => Promise<any>) | null = null
+  const fakeAgentCtx = {
+    get: () => undefined,
+    on: (event: string, handler: any) => {
+      if (event === 'user-questions/request') answerer = handler
+      return () => {}
+    },
+  }
   const fakeAgent = { id: sessionId, status: 'idle' as const, session: { events: [] as any[] }, followup() {}, steer() {} }
 
   root.provide('agents', {
@@ -499,7 +517,7 @@ test('bridge registers a user-questions provider and renders an option prompt', 
     get: () => undefined,
     resume: async () => { throw new Error('no persistence') },
     create: async (opts: any) => {
-      if (opts.setup) await opts.setup(fakeAgentCtx)
+      if (opts.setup) await opts.setup(fakeAgentCtx, fakeAgent)
       return { agent: fakeAgent, dispose: async () => {} }
     },
   })
@@ -519,13 +537,15 @@ test('bridge registers a user-questions provider and renders an option prompt', 
     client,
   )
   await bridge.start()
-  await waitFor(() => registeredProvider !== null, 2000)
+  await waitFor(() => answerer !== null, 2000)
 
-  // Agent created → provider registered; ask() renders the option prompt.
-  const answerPromise = registeredProvider!.ask({
-    questions: [{ id: 'q1', question: 'pick <a> or <b>', options: [{ label: 'A' }, { label: 'B' }] }],
-    agent: { id: sessionId },
-  })
+  // Agent created → answerer registered on the agent scope; the request renders the option prompt.
+  const answerPromise = answerer!(
+    { questions: [{ id: 'q1', question: 'pick <a> or <b>', options: [{ label: 'A' }, { label: 'B' }] }], agent: { id: sessionId } },
+    async () => { throw new Error('the bridge owns this agent and must not delegate') },
+  )
+  // bridge.stop() rejects the pending question; the test never answers it.
+  answerPromise.catch(() => {})
   await waitFor(() => client.sends.some((s) => s.text.includes('pick')), 2000)
 
   // Text reply "2" → parsed to the prompt → returns selected ['B'].
@@ -534,7 +554,6 @@ test('bridge registers a user-questions provider and renders an option prompt', 
   // Question text is LLM-generated and must be HTML-escaped before HTML delivery.
   assert.ok(client.sends.some((s) => s.text.includes('&lt;a&gt; or &lt;b&gt;')))
   assert.ok(!client.sends.some((s) => s.text.includes('<a> or <b>')))
-  void answerPromise
   await bridge.stop()
 })
 
@@ -773,7 +792,7 @@ test('bridge consults reconcile before resending a failed delivery', async () =>
   const fakeAgent = {
     id: sessionId,
     status: 'idle' as const,
-    session: { events },
+    session: { events, snapshotEvents: () => events, eventAt: (seq: number) => events[seq] },
   }
   root.provide('agents', {
     list: () => [],
@@ -830,7 +849,7 @@ test('recovery resumes a conventional session before deciding, instead of abando
     { type: 'turn/start', seq: 1, time: Date.now(), data: {} },
     { type: 'assistant/message', seq: 2, time: Date.now(), data: { message: { role: 'assistant', content: [{ type: 'text', text: 'the lost answer' }] } } },
   ]
-  const fakeAgent = { id: sessionId, status: 'idle' as const, session: { events } }
+  const fakeAgent = { id: sessionId, status: 'idle' as const, session: { events, snapshotEvents: () => events, eventAt: (seq: number) => events[seq] } }
   let resumedWith: string | undefined
   root.provide('agents', {
     list: () => (resumedWith !== undefined ? [fakeAgent] : []),
@@ -847,7 +866,7 @@ test('recovery resumes a conventional session before deciding, instead of abando
 
   // No explicit /bind entry: the session exists only by the channel:<id>:<chatKey> convention.
   const store = createMemoryStore()
-  store.recordDelivery(`${sessionId}:2`, { chatKey: '42', textHash: 'abc' })
+  store.recordDelivery(`${sessionId}:2`, { chatKey: '42', textHash: hashText('the lost answer') })
   store.markFailed(`${sessionId}:2`, 'boom')
 
   const client = createFakeClient([])
@@ -870,6 +889,51 @@ test('recovery resumes a conventional session before deciding, instead of abando
   assert.ok(client.sends[0]!.text.includes('resumed resend'))
   // The resumed log was refolded into the seen set (R7).
   assert.equal(store.seenInbound('77'), true)
+})
+
+test('recovery abandons a resend whose recorded hash no longer matches the session text', async () => {
+  const root = new Context()
+  new ChannelRegistry(root)
+
+  const sessionId = 'channel:telegram:42'
+  const events: any[] = [
+    { type: 'turn/start', seq: 0, time: Date.now(), data: {} },
+    { type: 'assistant/message', seq: 1, time: Date.now(), data: { message: { role: 'assistant', content: [{ type: 'text', text: 'the current text' }] } } },
+  ]
+  const fakeAgent = { id: sessionId, status: 'idle' as const, session: { events, snapshotEvents: () => events, eventAt: (seq: number) => events[seq] } }
+  root.provide('agents', {
+    list: () => [fakeAgent],
+    get: () => fakeAgent,
+    resume: async () => ({ agent: fakeAgent, dispose: async () => {} }),
+    create: async () => {
+      throw new Error('not used')
+    },
+  })
+  root.provide('credentials', { resolve: async () => ({ value: 'test-token', source: 'test' }) })
+
+  // The recorded hash names a *different* text — what a seq-renumbering log
+  // migration (0.2 v0→v4) does to a `sessionId:seq` ledger key.
+  const store = createMemoryStore()
+  store.recordDelivery(`${sessionId}:1`, { chatKey: '42', textHash: hashText('the pre-migration text') })
+  store.markFailed(`${sessionId}:1`, 'boom')
+
+  const client = createFakeClient([])
+  const channel = new TelegramChannel({ client, resolveToken: async () => 'test-token' })
+  root.channels.register(channel)
+  const bridge = new TelegramBridge(
+    root,
+    () => ({ allowedUserIds: [123], provider: 'deepseek-official', pollingTimeoutSec: 1, mergeWindowSec: 5, approvalTimeoutSec: 120 }),
+    store,
+    channel,
+    client,
+  )
+
+  // start() awaits the startup sweep, so the abandonment has settled by now.
+  await bridge.start()
+  await bridge.stop()
+
+  assert.equal(client.sends.length, 0, 'a hash-mismatched entry must not be resent')
+  assert.equal(store.sweepRecoverable().length, 0, 'the entry was abandoned, not left recoverable')
 })
 
 test('an approval answered while the prompt send is in flight is honored, not dropped', async () => {
@@ -1095,7 +1159,7 @@ test('a delivery failed mid-run is re-swept on reconnect, not only at startup', 
     { type: 'turn/start', seq: 0, time: Date.now(), data: {} },
     { type: 'assistant/message', seq: 1, time: Date.now(), data: { message: { role: 'assistant', content: [{ type: 'text', text: 'the lost mid-run answer' }] } } },
   ]
-  const fakeAgent = { id: sessionId, status: 'idle' as const, session: { events } }
+  const fakeAgent = { id: sessionId, status: 'idle' as const, session: { events, snapshotEvents: () => events, eventAt: (seq: number) => events[seq] } }
   root.provide('agents', {
     list: () => [fakeAgent],
     get: () => fakeAgent,
@@ -1121,7 +1185,7 @@ test('a delivery failed mid-run is re-swept on reconnect, not only at startup', 
   await bridge.start()
 
   // Mid-run: a disconnect window burned this delivery's retries into `failed`.
-  store.recordDelivery(`${sessionId}:1`, { chatKey: '42', textHash: 'abc' })
+  store.recordDelivery(`${sessionId}:1`, { chatKey: '42', textHash: hashText('the lost mid-run answer') })
   store.markFailed(`${sessionId}:1`, 'channel not connected', 'transient')
 
   // The reconnect must trigger a fresh sweep that resends it.

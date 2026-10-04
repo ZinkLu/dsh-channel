@@ -9,10 +9,10 @@
  * platform-specific behavior is an abstract/protected transport hook.
  */
 import type { Context } from '@deepseek-ai/cordis'
-import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentHandle, AssistantStreamFrame } from '@deepseek-ai/dsh-agent'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm'
-import { SessionId, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
+import { SessionId, SessionSeq, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-user-approval'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type { Channel, InboundMessage, OutboundMessage, PresentationFrame, SendErrorKind } from 'dsh-channel'
@@ -44,7 +44,7 @@ import type { PromptAnswer } from '../policy/prompt-render.js'
 import { chunkDeliveryKey, chunkIndexOf, defaultRecoveryPolicy, hashText, splitDeliveryKey, type RecoverableDelivery, type RecoveryPolicy } from '../policy/recovery.js'
 import { route, type RouteDecision } from '../policy/router.js'
 import { emptyStreamState, type StreamFrame, type StreamInput, type StreamState } from '../policy/stream.js'
-import { InteractionBroker, type AskUserQuestionRequestLike, type AskUserQuestionAnswerLike } from './interaction-broker.js'
+import { InteractionBroker } from './interaction-broker.js'
 import { KeyedTimers, settledWithin } from './timing.js'
 import type { ChannelStore } from './store.js'
 
@@ -89,20 +89,18 @@ interface BusyQueuedMessage {
   images: readonly ImageAttachmentRef[]
 }
 
-interface AgentPresetJoin {
-  presetId?: string
-  mount?: (agentCtx: Context) => Promise<void>
-}
-
-/** Minimal duck type of dsh-agent-presets (optional dependency; the package is not imported). */
+/** Minimal duck type of dsh-agent-preset-registry (optional dependency; the package is not imported). */
 interface AgentPresetsLike {
+  /** Resolve an id (or the registry default) to the id pinned in session meta; throws on unknown id. */
   resolve: (id?: string) => Promise<{ id: string }>
+  /** Bind the agent scope to a preset revision; throws on an unknown or broken preset. */
   mount: (agentCtx: Context, id?: string) => Promise<unknown>
 }
 
-/** Minimal duck type of dsh-user-questions (optional dependency; the package is not imported). */
-interface UserQuestionsLike {
-  registerProvider(provider: { ask(request: AskUserQuestionRequestLike): Promise<AskUserQuestionAnswerLike> }): () => void
+/** Minimal duck type of dsh-session-persistence (optional dependency; the package is not imported). */
+interface SessionPersistenceLike {
+  /** Stored-session snapshot, or undefined when the id is not persisted. */
+  stat: (id: SessionId) => Promise<unknown>
 }
 
 export abstract class ChannelBridge<TCfg extends BridgeConfig> {
@@ -361,7 +359,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     const prefix = `channel:${this.channel.id}${this.accountSegment}:`
     for (const agent of this.ctx.agents.list()) {
       if (!this.sessionChatKeys.has(agent.id) && !agent.id.startsWith(prefix)) continue
-      for (const event of agent.session.events) {
+      for (const event of agent.session.snapshotEvents()) {
         if (event.type !== 'user/message') continue
         const source = event.data.source as { kind?: string; channel?: string; messageIds?: readonly string[] } | undefined
         if (source?.kind !== 'channel' || source.channel !== this.channel.id) continue
@@ -415,12 +413,30 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
         this.store.markFailed(action.item.key, `recovery: empty assistant text ${action.item.key}`)
         continue
       }
+      // The ledger key is `sessionId:{seq}`, and the 0.2 v0→v4 log migration
+      // re-numbers seq — after an upgrade a stale key can name different text.
+      // Resend only when the recomputed chunk still matches the hash recorded at
+      // the original send; a mismatch abandons instead of sending the wrong text.
+      if (!this.matchesLedgerChunk(action.item, action.text)) {
+        this.store.markAbandoned(
+          action.item.key,
+          `recovery: text hash mismatch for ${action.item.key} (session log renumbered or content changed since the send was recorded)`,
+        )
+        continue
+      }
       // Enqueue only; the deliver queue owns the attempt and its ledger marks.
       this.sendOutbound(action.item.chatKey, (action.marker ?? '') + action.text, action.item.key, {
         origin: action.origin,
         recover: action.item.state,
       })
     }
+  }
+
+  /** Recompute the chunk a ledger entry refers to and compare it against the hash recorded at send time. */
+  private matchesLedgerChunk(item: RecoverableDelivery, text: string): boolean {
+    const chunk = this.renderChunks(text)[(chunkIndexOf(item.key) ?? 1) - 1]
+    if (chunk === undefined) return true // nothing would be sent; sendOutbound no-ops on the same pick
+    return hashText(chunk) === item.textHash
   }
 
   /**
@@ -454,8 +470,9 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
 
   private resolveAssistantText(sessionId: string, seq: number): string {
     const agent = this.ctx.agents.get(SessionId(sessionId))
-    const event = agent?.session.events[seq]
-    if (!agent || !event || event.type !== 'assistant/message') return ''
+    if (!agent || !Number.isSafeInteger(seq) || seq < 0) return ''
+    const event = agent.session.eventAt(SessionSeq(seq))
+    if (!event || event.type !== 'assistant/message') return ''
     return assistantMessageText((event.data as { message?: unknown }).message)
   }
 
@@ -797,49 +814,78 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
       ...(this.config.model !== undefined ? { model: this.config.model } : {}),
     }
 
-    const preset = await this.resolveAgentPreset()
-    const setup = (agentCtx: Context) => this.setupAgent(agentCtx, preset.mount)
+    const setup = (agentCtx: Context, agent: Agent) => this.setupAgent(agentCtx, agent)
 
+    // 0.2 resume fails for real reasons (session owned elsewhere, unsupported
+    // format, broken preset); a catch-all that falls through to create() hits
+    // SessionAlreadyExists and buries the cause. Only a session the persistence
+    // layer reports as absent may be created; without a stat service the legacy
+    // try-resume-then-create fallback applies.
+    const persisted = await this.probePersistedSession(sessionId)
+    if (persisted !== false) {
+      try {
+        const handle = await this.ctx.agents.resume({
+          resumeSessionId: SessionId(sessionId),
+          agentOptions,
+          setup,
+        })
+        this.ownedHandles.set(sessionId, handle)
+        return handle.agent
+      } catch (error) {
+        if (persisted === true || !create) {
+          this.warn(`resume ${sessionId} failed: ${error instanceof Error ? error.message : String(error)}`)
+          return undefined
+        }
+      }
+    }
+    if (!create) return undefined
+
+    const agentPreset = await this.resolveConfiguredPresetId()
+    const handle = await this.ctx.agents.create({
+      sessionId: SessionId(sessionId),
+      meta: {
+        cwd: this.config.cwd ?? process.cwd(),
+        ...(agentPreset !== undefined ? { agentPreset } : {}),
+      },
+      agentOptions,
+      setup,
+    })
+    this.ownedHandles.set(sessionId, handle)
+    return handle.agent
+  }
+
+  /** Whether the session exists in durable storage; undefined = no stat service to ask. */
+  private async probePersistedSession(sessionId: string): Promise<boolean | undefined> {
+    const persistence = this.ctx.get('sessionPersistence') as SessionPersistenceLike | undefined
+    if (persistence === undefined) return undefined
     try {
-      const handle = await this.ctx.agents.resume({
-        resumeSessionId: SessionId(sessionId),
-        agentOptions,
-        setup,
-      })
-      this.ownedHandles.set(sessionId, handle)
-      return handle.agent
+      return (await persistence.stat(SessionId(sessionId))) !== undefined
     } catch {
-      if (!create) return undefined
-      const handle = await this.ctx.agents.create({
-        sessionId: SessionId(sessionId),
-        meta: {
-          cwd: this.config.cwd ?? process.cwd(),
-          ...(preset.presetId !== undefined ? { agentPreset: preset.presetId } : {}),
-        },
-        agentOptions,
-        setup,
-      })
-      this.ownedHandles.set(sessionId, handle)
-      return handle.agent
+      return undefined
     }
   }
 
-  private async resolveAgentPreset(): Promise<AgentPresetJoin> {
+  /** The preset id pinned into a fresh session's meta: config's id, else the registry default. */
+  private async resolveConfiguredPresetId(): Promise<string | undefined> {
+    if (this.config.agentPreset !== undefined) return this.config.agentPreset
     const presets = this.ctx.get('agentPresets') as AgentPresetsLike | undefined
-    if (presets === undefined) return {}
-    const resolvedId = (await presets.resolve(this.config.agentPreset)).id
-    return {
-      presetId: resolvedId,
-      mount: (agentCtx) => presets.mount(agentCtx, resolvedId).then(() => {}),
+    if (presets === undefined) return undefined
+    try {
+      return (await presets.resolve(undefined)).id
+    } catch {
+      return undefined
     }
   }
 
-  private async setupAgent(agentCtx: Context, mount?: (agentCtx: Context) => Promise<void>): Promise<void> {
+  private async setupAgent(agentCtx: Context, agent: Agent): Promise<void> {
     try {
       const systemPrompt = agentCtx.get('systemPrompt')
       systemPrompt?.section({
         name: `dsh-channel-${this.channel.id}`,
-        order: 120,
+        // 0.2 first-party sections span -1000…10200 (identity → … → persona
+        // suffix); a channel formatting hint is delivery guidance, so it sits
+        // just ahead of the persona suffix, not in front of every other section.
+        order: 10150,
         text: promptHint({
           id: this.channel.id,
           formatTier: this.channel.formatTier,
@@ -850,19 +896,39 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     } catch {
       // systemPrompt is an optional dependency; a missing/broken one does not block agent creation.
     }
-    this.registerUserQuestionsProvider(agentCtx)
-    if (mount !== undefined) {
-      await mount(agentCtx)
-    }
+    this.registerUserQuestionsAnswerer(agentCtx)
+    this.registerAssistantStreamRelay(agentCtx, agent)
+    await this.mountAgentPreset(agentCtx, agent)
   }
 
-  private registerUserQuestionsProvider(agentCtx: Context): void {
-    const userQuestions = agentCtx.get('userQuestions') as UserQuestionsLike | undefined
-    if (userQuestions === undefined) return
+  /** Agent-scoped answerer for the 0.2 user-questions waterfall (replaces the rc.6 registerProvider slot). */
+  private registerUserQuestionsAnswerer(agentCtx: Context): void {
+    agentCtx.on('user-questions/request', (request, next) => this.broker.handleUserQuestion(request, next))
+  }
+
+  /** 0.2 live deltas are process-local agent events, not session events; relay reasoning deltas into the stream reducer. */
+  private registerAssistantStreamRelay(agentCtx: Context, agent: Agent): void {
+    agentCtx.on('agent/assistant-stream', ({ frame }: { frame: AssistantStreamFrame }) => {
+      if (frame.type !== 'chunk') return
+      const chunk = frame.chunk
+      if (chunk.type !== 'reasoning-delta' || chunk.text === '') return
+      const chatKey = this.sessionChatKeys.get(agent.id)
+      if (chatKey === undefined) return
+      this.feedStream(agent.id, chatKey, { kind: 'reasoning-delta', text: chunk.text })
+    })
+  }
+
+  /** Mount the session's own recorded preset (resume), falling back to config (fresh create). */
+  private async mountAgentPreset(agentCtx: Context, agent: Agent): Promise<void> {
+    const presets = agentCtx.get('agentPresets') as AgentPresetsLike | undefined
+    if (presets === undefined) return
+    const id = agent.session.header?.agentPreset ?? this.config.agentPreset
+    if (id === undefined) return
     try {
-      userQuestions.registerProvider({ ask: (request) => this.broker.ask(request) })
-    } catch {
-      // Single-slot conflict: this scope already has a provider; don't grab it, and don't block agent creation.
+      await presets.mount(agentCtx, id)
+    } catch (error) {
+      // A preset that fails to mount must not block the channel: the agent runs without it.
+      this.warn(`agent preset ${id} could not be mounted: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
 

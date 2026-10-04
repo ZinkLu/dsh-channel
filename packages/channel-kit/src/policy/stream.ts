@@ -40,7 +40,7 @@ export type StreamInput =
   | { readonly kind: 'reasoning-delta'; readonly text: string }
   | { readonly kind: 'reasoning-block'; readonly text: string }
   | { readonly kind: 'assistant-message'; readonly text: string }
-  | { readonly kind: 'turn-end'; readonly reason: 'completed' | 'aborted' | 'blocked' | 'error' | 'max-tokens' | 'interrupted' }
+  | { readonly kind: 'turn-end'; readonly reason: 'completed' | 'aborted' | 'blocked' | 'error' | 'max-tokens' | 'interrupted' | 'forked' }
   | { readonly kind: 'tick' }
   /**
    * The bridge feeds this when `showDraft` (edit-in-place) rejects mid-stream.

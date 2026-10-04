@@ -5,8 +5,10 @@
  * and reply parsing stay in `policy/` pure functions.
  *
  * Fail-closed is the invariant throughout: an unanswered, undeliverable, or
- * aborted interaction resolves to "no answer" (approval → deferred back to the
- * waterfall, prompt → empty selection), never to an allow.
+ * aborted approval resolves to "no answer" (deferred back to the waterfall),
+ * never to an allow. A user question instead *rejects* (ASK_TIMED_OUT /
+ * ASK_ABORTED): dsh 0.2 reads an empty selection as "user skipped", so failing
+ * closed means failing the tool call, not answering for the user.
  */
 import type { ApprovalOutcome, ApprovalRequest } from '@deepseek-ai/dsh-user-approval'
 import type { Channel, DeliveryReceipt, OutboundMessage } from 'dsh-channel'
@@ -31,6 +33,29 @@ export interface AskUserQuestionItemLike {
 }
 export interface AskUserQuestionAnswerLike {
   answers: Array<{ id: string; selected: string[]; custom?: string }>
+}
+
+/**
+ * The 0.2 answerer waterfall, declared structurally: dsh-user-questions is an
+ * optional dependency, and the method-syntax declaration merges cleanly with
+ * the real one when the package is present.
+ */
+declare module '@deepseek-ai/cordis' {
+  interface Events {
+    'user-questions/request'(request: AskUserQuestionRequestLike, next: () => Promise<AskUserQuestionAnswerLike>): Promise<AskUserQuestionAnswerLike>
+  }
+}
+
+/**
+ * UserQuestionError-shaped failure without importing the (optional) package;
+ * the 0.2 service restores answerer rejections by `name === 'UserQuestionError'`
+ * plus a string `code`, and maps ASK_TIMED_OUT to its pending result.
+ */
+function askError(code: 'ASK_TIMED_OUT' | 'ASK_ABORTED', message: string): Error {
+  const error = new Error(message) as Error & { code: string }
+  error.name = 'UserQuestionError'
+  error.code = code
+  return error
 }
 
 /** What the broker needs from its bridge; kept narrow so the broker stays testable. */
@@ -59,6 +84,8 @@ interface PromptEntry extends PendingPrompt {
   chatKey: string
   timer?: NodeJS.Timeout
   messageId?: number
+  /** Fail-closed path: the question rejects rather than resolving with an empty ("skipped") selection. */
+  reject?: (error: Error) => void
 }
 
 export class InteractionBroker {
@@ -133,15 +160,23 @@ export class InteractionBroker {
     return outcome
   }
 
-  /** user-questions provider entry point: ask each question in turn over the agent's bound chat. */
-  async ask(request: AskUserQuestionRequestLike): Promise<AskUserQuestionAnswerLike> {
+  /**
+   * `user-questions/request` waterfall handler: ask each question in turn over
+   * the agent's bound chat, or next() when the agent is not ours. An unanswered
+   * or aborted question rejects — in 0.2 an empty `selected` means "user
+   * skipped", so failing closed means failing the tool call.
+   */
+  async handleUserQuestion(request: AskUserQuestionRequestLike, next: () => Promise<AskUserQuestionAnswerLike>): Promise<AskUserQuestionAnswerLike> {
     const agentId = request.agent?.id
     const chatKey = agentId !== undefined ? this.host.chatKeyForAgent(agentId) : undefined
-    if (chatKey === undefined) return { answers: [] }
+    if (chatKey === undefined) {
+      this.host.log('debug', `user-questions/request for ${agentId ?? '(no agent)'} is not ours → next()`)
+      return next()
+    }
 
     const answers: AskUserQuestionAnswerLike['answers'] = []
     for (const question of request.questions) {
-      if (request.signal?.aborted) break
+      if (request.signal?.aborted) throw askError('ASK_ABORTED', 'ask_user_question was aborted before the user answered')
       const answer = await this.askQuestion(chatKey, question, request.signal)
       answers.push({ id: question.id, selected: answer.selected, custom: answer.custom })
     }
@@ -157,9 +192,14 @@ export class InteractionBroker {
     const options = question.options?.map((option) => option.label) ?? []
 
     let settle!: (selected: readonly string[], custom?: string) => void
-    const verdict = new Promise<{ selected: string[]; custom?: string }>((resolve) => {
+    let fail!: (error: Error) => void
+    const verdict = new Promise<{ selected: string[]; custom?: string }>((resolve, reject) => {
       settle = (selected, custom) => resolve({ selected: [...selected], custom })
+      fail = reject
     })
+    // The verdict outlives its consumer on bridge stop (settleAll rejects every
+    // pending prompt); a rejection nobody awaits must not crash the process.
+    void verdict.catch(() => {})
 
     const entry: PromptEntry = {
       num,
@@ -172,6 +212,7 @@ export class InteractionBroker {
       intent: question.intent,
       expiresAt: Date.now() + this.host.timeoutMs(),
       resolve: (selected, custom) => settle(selected, custom),
+      reject: (error) => fail(error),
       chatKey,
     }
     this.pendingPrompts.set(num, entry)
@@ -179,7 +220,7 @@ export class InteractionBroker {
     const onAbort = () => {
       this.pendingPrompts.delete(num)
       if (entry.timer) clearTimeout(entry.timer)
-      settle([])
+      fail(askError('ASK_ABORTED', 'ask_user_question was aborted before the user answered'))
     }
     signal?.addEventListener('abort', onAbort, { once: true })
 
@@ -195,12 +236,16 @@ export class InteractionBroker {
       },
       this.promptCaps(),
     )
-    // A failed prompt send is not fatal here: the timeout below fails closed with an empty answer.
-    void this.sendInteraction(chatKey, rendered, `prompt:${entry.requestId}`, entry).catch(() => {})
+    // A failed prompt send fails fast: the user demonstrably cannot answer.
+    void this.sendInteraction(chatKey, rendered, `prompt:${entry.requestId}`, entry).catch((error: unknown) => {
+      if (!this.pendingPrompts.delete(num)) return
+      if (entry.timer) clearTimeout(entry.timer)
+      fail(error instanceof Error ? error : new Error(String(error)))
+    })
 
     entry.timer = this.armTimeout(() => {
       this.pendingPrompts.delete(num)
-      settle([])
+      fail(askError('ASK_TIMED_OUT', 'ask_user_question timed out before the user answered'))
     })
 
     return verdict
@@ -299,7 +344,7 @@ export class InteractionBroker {
     this.pendingApprovals.clear()
     for (const entry of this.pendingPrompts.values()) {
       if (entry.timer) clearTimeout(entry.timer)
-      entry.resolve([], undefined)
+      entry.reject?.(askError('ASK_ABORTED', 'ask_user_question was aborted before the user answered'))
     }
     this.pendingPrompts.clear()
   }

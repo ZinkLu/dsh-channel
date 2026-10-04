@@ -20,6 +20,8 @@ export interface RecoverableDelivery {
   key: string
   state: 'pending' | 'attempting' | 'failed'
   chatKey: string
+  /** Hash of the rendered chunk recorded at the original send; the bridge re-validates it before any resend. */
+  textHash: string
   attempts?: number
   errorKind?: SendErrorKind
 }
