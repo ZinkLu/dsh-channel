@@ -13,7 +13,7 @@ Split into five packages per [dsh-channel-design.md](./dsh-channel-design.md).
 
 For the alignment baseline against dsh's own core/seam, see [docs/dsh-core-reference.md](./docs/dsh-core-reference.md)
 (full ctx seam/core table + core packages + lifecycle + tool pipeline + session log, checked line-by-line
-against the rc.6 source). What is deliberately *not* built — open questions, deferred work with its
+against the 0.2.0-rc.2 source). What is deliberately *not* built — open questions, deferred work with its
 trigger, and designs considered and rejected — is in
 [docs/dsh-channel-backlog.md](./docs/dsh-channel-backlog.md).
 
@@ -57,7 +57,7 @@ npm run test -w dsh-channel-feishu
    - `ctx.agents` / agent loop (`@deepseek-ai/dsh-agent-loop`)
    - `ctx.credentials` (`@deepseek-ai/dsh-credentials-local`)
    - `ctx.llm` and the corresponding model adapter
-   - agent preset (`@deepseek-ai/dsh-agent-presets`): standard web deployments default to `standard`.
+   - agent preset (`@deepseek-ai/dsh-agent-preset-registry`): standard web deployments default to `standard`.
      When the Telegram channel creates an agent it **automatically joins the host's default preset**, so the
      full tool/persona/skill capability set matches a Web session — no need to configure tools by hand, and
      don't hand-write a tool plugin just to "give it tools".
@@ -81,9 +81,9 @@ npm run test -w dsh-channel-feishu
        - id: channel-telegram
          name: dsh-channel-telegram
          config:
-           allowedUserIds: [5002186681]   # replace with your Telegram user id
+           allowedUserIds: []   # ← your Telegram user id; empty = the bot answers no one
            provider: deepseek-official
-           model: deepseek-v4-flash
+           model: deepseek-flash
            # cwd / agentPreset unset: use process.cwd() workspace + host default preset
    ```
 
@@ -91,8 +91,7 @@ npm run test -w dsh-channel-feishu
 
    ```bash
    export TELEGRAM_BOT_TOKEN='...'          # process env, takes effect on start
-   # or hot-swap at runtime:
-   dsh credentials set TELEGRAM_BOT_TOKEN '...'
+   # or set it in the web UI's credentials page (0.2 has no `dsh credentials set` subcommand)
    ```
 
    The plugin re-resolves `ctx.credentials.resolve('TELEGRAM_BOT_TOKEN')` before every API call;
@@ -121,7 +120,7 @@ refreshes the installed copies from `packages/*/lib` on every launch, and boots 
 [`scripts/dev-bot.yaml`](./scripts/dev-bot.yaml) as the patch layer — the same document shape as any
 profile `cordis.patch.yml`; edit it (allowlist, model, `accountId`, `proxyUrl`, …) and restart. The
 script stands in the gitignored `agent-workspace/` so the agent's cwd-derived workspace never touches
-the repo tree. Credentials come from your `$DSH_HOME` as usual (`dsh credentials set` or env vars).
+the repo tree. Credentials come from your `$DSH_HOME` as usual (the web UI's credentials page or env vars).
 
 ```bash
 npm run build
@@ -147,7 +146,7 @@ other instance using the token first.
 |---|---|---|
 | `dsh-channel` | 15 | register/unregister, duplicate-registration rejection (incl. `(id, accountId)`), deliver default, waterfall observation and short-circuit, event broadcast, `ackInbound` default + override, multi-account registry + `chatKeyOf`/`bindChatKey`, capability-fact defaults (`supportsReply`/`supportsThreads`/`supportsSilent`/`supportsReconciliation`) |
 | `dsh-channel-kit` | 119 | shared config fragments (defaults, `maxInboundMediaBytes`/`sessionTurnTimeoutSec`/`accountId`/`proxyUrl` overrides, numeric vs string allowlist, interface ↔ schema key parity), chunk fence padding/prefix convergence, merge three iron rules and `..`/`!!`, router decision table (incl. multi-account session ids), approval numbering/timeout, store state machine and JSON file, format three-tier degradation and `<tool_calls>`/reasoning sanitization, prompt-render options/multi-select/free-text, tool-display, stream reducer, deliver-queue retry/backoff/spacing/backpressure, media size guard, http-proxy (CONNECT tunnel + absolute-form + multipart) |
-| `dsh-channel-telegram` | 44 | config schema (shared defaults + numeric allowlist), Telegram API calls and redaction, HTML-failure fallback to plain text, inbound routing/merge/delivery, allowlist, approval answerer timeout `next()`, real `callback_query` approval round-trip, `<tool_calls>` leak interception, agent preset join, progress draft, user-questions provider, settings namespace registration, inbound media size cap (streaming + Content-Length), `getMe`/`setMessageReaction`, group `mentionsBot` observation, ack-long reaction, reply/thread/silent send options, inbound `replyToMessageId`, recovery reconciliation |
+| `dsh-channel-telegram` | 44 | config schema (shared defaults + numeric allowlist), Telegram API calls and redaction, HTML-failure fallback to plain text, inbound routing/merge/delivery, allowlist, approval answerer timeout `next()`, real `callback_query` approval round-trip, `<tool_calls>` leak interception, agent preset join, progress draft, user-questions waterfall answerer, inbound media size cap (streaming + Content-Length), `getMe`/`setMessageReaction`, group `mentionsBot` observation, ack-long reaction, reply/thread/silent send options, inbound `replyToMessageId`, recovery reconciliation + text-hash guard |
 | `dsh-channel-wechat` | 10 | config schema (string allowlist, `platformAccountId`), iLink getupdates/sendmessage calls and redaction, context_token echo, inbound routing/merge/delivery, allowlist |
 | `dsh-channel-feishu` | 20 | config schema (`domain` union), tenant_access_token cache, sendMessage receive_id_type parsing, protobuf frame encode/decode, inbound event routing/delivery, allowlist, `createReaction`/`react`, `replyMessage`/`supportsReply`, inbound `replyToMessageId` (`parent_id`) |
 
@@ -188,8 +187,8 @@ other instance using the token first.
 - Interactive login + proxy (M10): the contract exports a sibling `ChannelLogin` interface (QR/OAuth device flow, CLI-only) — no current provider needs it (static tokens). `proxyUrl` (shared behavior field) threads into each provider client's `fetch` via the kit's `proxiedFetch` (CONNECT tunnel for HTTPS, absolute-form for HTTP), so the Telegram/Feishu APIs can be reached through an outbound proxy.
 - v1 does not route group chats (`chatType !== 'direct'` is dropped directly).
 - The outbound delivery ledger lives in `state.json`; the in-memory `ChannelStore` implementation is available for tests.
-- Dependency direction: each provider (`dsh-channel-telegram` / `-wechat` / `-feishu`) depends only on `dsh-channel` + `dsh-channel-kit`; policy plugins depend only on `dsh-channel`. Each provider owns its own config schema, settings namespace, and credential-ref names in `src/config.ts`, composed from the kit's shared fragments — adding a platform touches no shared package.
-- Each provider registers its config as a dsh `settings` namespace (`channel-telegram` / `channel-wechat` / `channel-feishu`) via `installSettingsSection`; the resolved value layers schema defaults < composition config < user document, and bridges read config through a dynamic `source()` (live fields take effect without restart; `statePath` is restart-only). Secrets stay in `ctx.credentials` (never in the settings document). See [dsh-channel-design.md §11](./dsh-channel-design.md#11-configuration-and-settings-seam). Note: rc.6's apiproxy only exposes a hardcoded `WEB_SETTINGS_NAMESPACES` allowlist, so `channel-*` namespaces do not yet appear in the web UI — `settings-file` still persists the document and the CLI can read it; exposing plugin namespaces is deferred upstream (this repo does not patch dsh core).
+- Dependency direction: each provider (`dsh-channel-telegram` / `-wechat` / `-feishu`) depends only on `dsh-channel` + `dsh-channel-kit`; policy plugins depend only on `dsh-channel`. Each provider owns its own config schema and credential-ref names in `src/config.ts`, composed from the kit's shared fragments — adding a platform touches no shared package.
+- Provider config is the plugin entry's `config:` in the profile's `cordis.patch.yml` (the 0.2 settings model: no separate settings namespace, no live `source()` layering) — the schema still supplies defaults for unset fields, and any config change restarts the plugin with the new value. Secrets stay in `ctx.credentials` (set via the web UI's credentials page or env vars, never in the profile patch). See [dsh-channel-design.md §11](./dsh-channel-design.md#11-configuration-and-settings-seam).
 - Capability differences only go through "capability facts + degradation": Telegram `html`+buttons+progress+reaction ack, WeChat `markdown`+typing+off, Feishu `plain`+off+reaction ack — `dsh-channel`/`dsh-channel-kit` hold the shared facts and hooks (`ackInbound`), providers only fill them in (A5 verified).
 
 ---
@@ -202,7 +201,7 @@ DeepSeek Harness (dsh) 的消息渠道公共层与多个 provider 实现（Teleg
 按照 [dsh-channel-design.md](./dsh-channel-design.md) 拆为五个包。
 
 对 dsh 本身核心/seam 的对齐基线，见 [docs/dsh-core-reference.md](./docs/dsh-core-reference.md)
-（ctx seam/core 全表 + 核心包 + 生命周期 + 工具流水线 + 会话日志，逐条对照 rc.6 源码）。
+（ctx seam/core 全表 + 核心包 + 生命周期 + 工具流水线 + 会话日志，逐条对照 0.2.0-rc.2 源码）。
 刻意**没有**做的部分——待验证的开放问题、带触发条件的延后项、以及已论证并否决的设计——见
 [docs/dsh-channel-backlog.md](./docs/dsh-channel-backlog.md)。
 
@@ -246,7 +245,7 @@ npm run test -w dsh-channel-feishu
    - `ctx.agents` / agent loop（`@deepseek-ai/dsh-agent-loop`）
    - `ctx.credentials`（`@deepseek-ai/dsh-credentials-local`）
    - `ctx.llm` 及对应模型适配器
-   - agent preset（`@deepseek-ai/dsh-agent-presets`）：标准 web 部署默认 `standard`。
+   - agent preset（`@deepseek-ai/dsh-agent-preset-registry`）：标准 web 部署默认 `standard`。
      Telegram 渠道创建 agent 时会**自动 join 宿主默认 preset**，所以工具/人设/技能
      全套能力与 Web 会话一致——无需手动配工具，也不要为了"给工具"而手写 tool 插件。
 
@@ -269,9 +268,9 @@ npm run test -w dsh-channel-feishu
        - id: channel-telegram
          name: dsh-channel-telegram
          config:
-           allowedUserIds: [5002186681]   # 替换为你的 Telegram user id
+           allowedUserIds: []   # ← 填你的 Telegram user id；留空则 bot 不应答任何人
            provider: deepseek-official
-           model: deepseek-v4-flash
+           model: deepseek-flash
            # cwd / agentPreset 不设：沿用 process.cwd() 工作区 + 宿主默认 preset
    ```
 
@@ -279,8 +278,7 @@ npm run test -w dsh-channel-feishu
 
    ```bash
    export TELEGRAM_BOT_TOKEN='...'          # 进程环境，启动时生效
-   # 或运行中热替换：
-   dsh credentials set TELEGRAM_BOT_TOKEN '...'
+   # 或在 web UI 的 credentials 页设置（0.2 没有 `dsh credentials set` 子命令）
    ```
 
    插件每次 API 调用前都会重新 `ctx.credentials.resolve('TELEGRAM_BOT_TOKEN')`，
@@ -311,7 +309,7 @@ profile（web profile 同款 bundle 栈 + 本仓库四个包的 `file:` 依赖�
 作为补丁层启动——它就是标准的 profile `cordis.patch.yml` 文档形状；改它（allowlist、模型、
 `accountId`、`proxyUrl`……）再重启即可。脚本会站在 gitignored 的 `agent-workspace/` 里启动，
 因此 agent 按 cwd 推导的工作区永远不会碰到仓库树。凭证照常走你的 `$DSH_HOME`
-（`dsh credentials set` 或环境变量）。
+（web UI 的 credentials 页或环境变量）。
 
 ```bash
 npm run build
@@ -336,7 +334,7 @@ profile 拿同一个文件加同一行 patch 即可。
 |---|---|---|
 | `dsh-channel` | 15 | 注册/卸载、重复注册拒绝（含 `(id, accountId)`）、deliver 缺省、waterfall 观察与短路、事件广播、`ackInbound` 缺省与覆盖、多账号注册表 + `chatKeyOf`/`bindChatKey`、能力事实缺省（`supportsReply`/`supportsThreads`/`supportsSilent`/`supportsReconciliation`） |
 | `dsh-channel-kit` | 119 | 共享配置片段（默认值、`maxInboundMediaBytes`/`sessionTurnTimeoutSec`/`accountId`/`proxyUrl` 覆盖、数字 vs 字符串 allowlist、接口与 schema 字段一致性）、chunk 围栏补齐/前缀收敛、merge 三铁律与 `..`/`!!`、router 决策表（含多账号会话 id）、approval 编号/超时、store 状态机与 JSON 文件、format 三档降级与 `<tool_calls>`/reasoning 净化、prompt-render 选项/多选/自由文本、tool-display、stream reducer、deliver-queue 重试/退避/间隔/背压、媒体大小守卫、http-proxy（CONNECT 隧道 + absolute-form + multipart） |
-| `dsh-channel-telegram` | 44 | 配置 schema（共享默认值 + 数字 allowlist）、Telegram API 调用与脱敏、HTML 失败降级纯文本、入站路由/merge/投递、allowlist、审批 answerer 超时 `next()`、真实 `callback_query` 审批闭环、`<tool_calls>` 泄漏拦截、agent preset join、progress 草稿、user-questions provider、settings 命名空间注册、入站媒体大小上限（流式 + Content-Length）、`getMe`/`setMessageReaction`、群聊 `mentionsBot` 观察、ack-long 表情回应、回复/话题/静默发送选项、入站 `replyToMessageId`、恢复对账 |
+| `dsh-channel-telegram` | 44 | 配置 schema（共享默认值 + 数字 allowlist）、Telegram API 调用与脱敏、HTML 失败降级纯文本、入站路由/merge/投递、allowlist、审批 answerer 超时 `next()`、真实 `callback_query` 审批闭环、`<tool_calls>` 泄漏拦截、agent preset join、progress 草稿、user-questions waterfall answerer、入站媒体大小上限（流式 + Content-Length）、`getMe`/`setMessageReaction`、群聊 `mentionsBot` 观察、ack-long 表情回应、回复/话题/静默发送选项、入站 `replyToMessageId`、恢复对账 + textHash 守卫 |
 | `dsh-channel-wechat` | 10 | 配置 schema（字符串 allowlist、`platformAccountId`）、iLink getupdates/sendmessage 调用与脱敏、context_token 回显、入站路由/merge/投递、allowlist |
 | `dsh-channel-feishu` | 20 | 配置 schema（`domain` 枚举）、tenant_access_token 缓存、sendMessage receive_id_type 解析、protobuf 帧编解码、入站事件路由/投递、allowlist、`createReaction`/`react`、`replyMessage`/`supportsReply`、入站 `replyToMessageId`（`parent_id`） |
 
@@ -377,6 +375,6 @@ profile 拿同一个文件加同一行 patch 即可。
 - 交互式登录 + 代理（M10）：契约导出兄弟接口 `ChannelLogin`（QR/OAuth device flow，仅供 CLI）——三个 provider 均用静态 token，无需实现。`proxyUrl`（共享行为字段）经 kit 的 `proxiedFetch`（HTTPS 走 CONNECT 隧道、HTTP 走 absolute-form）接入各 provider client 的 `fetch`，使 Telegram/Feishu API 可经出站代理访问。
 - v1 不路由群聊（`chatType !== 'direct'` 直接 drop）。
 - 出站 delivery ledger 存在 `state.json` 中；进程内 `ChannelStore` 纯内存实现可用于测试。
-- 依赖方向：每个 provider（`dsh-channel-telegram` / `-wechat` / `-feishu`）只依赖 `dsh-channel` + `dsh-channel-kit`；策略插件只依赖 `dsh-channel`。每个 provider 在自己的 `src/config.ts` 里用 kit 的共享片段拼出配置 schema、settings 命名空间与凭证 ref 名——新增平台不碰任何公共包。
-- 每个 provider 通过 `installSettingsSection` 把配置注册为 dsh 的 `settings` 命名空间（`channel-telegram` / `channel-wechat` / `channel-feishu`）；解析值 = schema 默认值 < 组合配置 < 用户文档，bridge 经动态 `source()` 读配置（可热生效的字段 getter 化，无需重启；`statePath` 需重启）。secret 仍走 `ctx.credentials`（永不进 settings 文档）。见 [dsh-channel-design.md §11](./dsh-channel-design.md#11-configuration-and-settings-seam)。注意：rc.6 的 apiproxy 只暴露写死的 `WEB_SETTINGS_NAMESPACES` 白名单，`channel-*` 命名空间目前**不会**出现在 web UI——`settings-file` 仍会落盘文档、CLI 可读；插件命名空间的暴露是上游 deferred，本仓库不 patch dsh core。
+- 依赖方向：每个 provider（`dsh-channel-telegram` / `-wechat` / `-feishu`）只依赖 `dsh-channel` + `dsh-channel-kit`；策略插件只依赖 `dsh-channel`。每个 provider 在自己的 `src/config.ts` 里用 kit 的共享片段拼出配置 schema 与凭证 ref 名——新增平台不碰任何公共包。
+- provider 的配置就是 profile `cordis.patch.yml` 里该插件条目的 `config:`（0.2 的 settings 模型：没有独立 settings 命名空间，也没有 `source()` 热更新分层）——schema 仍为未设字段提供默认值，任何配置改动都会以新值重启插件。secret 仍走 `ctx.credentials`（web UI 的 credentials 页或环境变量设置，永不进 profile patch）。见 [dsh-channel-design.md §11](./dsh-channel-design.md#11-configuration-and-settings-seam)。
 - 能力差异只走「能力事实 + 降级」：Telegram `html`+按钮+progress+表情确认、WeChat `markdown`+typing+off、Feishu `plain`+off+表情确认——`dsh-channel`/`dsh-channel-kit` 承载共享事实与钩子（`ackInbound`），provider 只填充（A5 验证）。

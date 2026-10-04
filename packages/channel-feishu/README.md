@@ -38,11 +38,12 @@ export function apply(ctx, config) { ... }
    **App ID / App Secret**.
 2. Enable the `im:message` and `im:message:send_as_bot` scopes (to send and receive messages).
 3. Choose **long-connection mode** for event subscription and subscribe to `im.message.receive_v1`.
-4. Credentials go only through `ctx.credentials`, never into the config file:
+4. Credentials go only through `ctx.credentials`, never into the config file — set them in the
+   web UI's credentials page (0.2 has no `dsh credentials set` subcommand) or as environment variables:
 
 ```bash
-dsh credentials set FEISHU_APP_ID 'cli_xxx'
-dsh credentials set FEISHU_APP_SECRET 'xxx'
+export FEISHU_APP_ID='cli_xxx'
+export FEISHU_APP_SECRET='xxx'
 ```
 
 ## Capability facts (three-platform comparison)

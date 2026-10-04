@@ -2,7 +2,7 @@
 
 > Status: **live** · Date: 2026-08-17 · Baseline: the tree at `b4bc254` (M0–M14 shipped)
 > Upstream: `../dsh-channel-design.md` (architecture, contracts, R1–R10) ·
-> `dsh-core-reference.md` (rc.6 core alignment baseline)
+> `dsh-core-reference.md` (0.2 core alignment baseline)
 >
 > This is the single list of what is **not** built, what is **not verified**, and what was
 > **deliberately rejected** — the only forward-looking list in the repo. The completed roadmaps
@@ -16,8 +16,8 @@
 
 Nothing here blocks the three shipped providers. The list is three kinds of debt:
 
-- **§1 — one real risk** (`userQuestions` provider scope, still unverified since the first
-  interaction design) plus four smaller unknowns.
+- **§1 — four smaller unknowns** (the `userQuestions` scope risk was answered by the 0.2 upgrade:
+  the single-slot provider became an agent-scoped waterfall).
 - **§2 — deferred work, each with a named trigger.** Nothing is scheduled; each item waits for a
   concrete consumer, and the trigger is written down so "is it time yet?" is answerable.
 - **§3 — designs considered and rejected.** These are guardrails against re-proposal, not
@@ -29,9 +29,9 @@ Nothing here blocks the three shipped providers. The list is three kinds of debt
 
 | # | Question | Why it is still open | What would close it |
 |---|---|---|---|
-| Q1 | **`userQuestions` provider scope** | `agentCtx.userQuestions.registerProvider(...)` inside `setup(agentCtx)` is assumed to be **per-agent isolated**. If it is a global single slot, the shared prompt broker in `ChannelBridge` needs a fallback. `dsh-user-questions` / `dsh-tool-ask-user` are still not in local `node_modules` — only the master source was ever read | A spike against a real install. This is the one hard risk carried from the original interaction design; it does not block anything shipped, because the current prompt path goes through `approval/request`, not `userQuestions` |
+| Q1 | ~~**`userQuestions` provider scope**~~ ✅ answered by the 0.2 upgrade (2026-10) | 0.2 replaced the single-slot `registerProvider` with the agent-scoped `user-questions/request` waterfall (scope-filtered dispatch via dsh-scope), so "per-agent isolated" is now structural, not assumed. The broker answers through `InteractionBroker.handleUserQuestion` and delegates non-owned agents via `next()` | — |
 | Q2 | **"Bare events outside a turn are dropped on reload"** | The design's store/log boundary (design §4.5) leans on this, but it was never verified word-for-word in `dsh-session-persistence`. rc.6 evidence is indirect: `TurnEndReasonMap.interrupted` documents that the persistence backend closes crash-orphaned turns on reload | Read the `dsh-session-persistence` source when persistence is actually wired up. The conclusion it supports (ledger belongs in the store, not the log) is independently justified by "delivery status is not a model-visible fact", so a surprise here would not invalidate the design |
-| Q3 | **`assistant/chunk` coalescing parameters** | The `block` streaming tier's `minChars`/`idleMs` were chosen by analogy (1500ms-class defaults), never measured against real token volume | Real-world measurement once block streaming (v2) has a consumer. The shipped `delta`/`status-line` tiers are throttle-gated and unaffected |
+| Q3 | **Stream-chunk coalescing parameters** (the `assistant/chunk` session event is gone in 0.2 — deltas arrive via `agent/assistant-stream`) | The `block` streaming tier's `minChars`/`idleMs` were chosen by analogy (1500ms-class defaults), never measured against real token volume | Real-world measurement once block streaming (v2) has a consumer. The shipped `delta`/`status-line` tiers are throttle-gated and unaffected |
 | Q4 | **Draft transport hooks assume one editable status message per session** | The Telegram model. A platform that streams append-only would need the *hook surface* to grow — which is the intended place for such variance, not the handler | The next streaming-capable platform. This is a shape prediction, not a defect |
 | Q5 | **A5 (add-a-platform costs no contract change) has not been re-run against an `edit` + `threads` platform** | All three shipped providers were added without contract changes, but none of them exercises threads or in-place edit as its primary streaming mode | Adding Discord — `streamingMode='off'`, `supportsStatusText=true`, real thread support — is the designated comparison case |
 
@@ -68,6 +68,7 @@ None of these is a functional gap today; all seven wait on a concrete consumer.
 | **`route()` / resolver chain tri-state + provenance** | `null` = explicit rejection stops the chain, `undefined` = no opinion, plus a provenance tag on the result. **Cheap now, unretrofittable once more resolvers exist** | The second resolver. This is the one item here with a decay cost |
 | **Chunker: single-backtick balancing, mid-stream truncation closure** | `chunk.ts` treats fenced blocks as atomic and re-fences on hard split; inline code spans and mid-stream cuts are not balanced | Block streaming (v2) — only reachable when partial text is rendered mid-turn |
 | **`always` / `session` approval memory** | dsh's `approval/request` has no `always`/`session` outcome. "Remember always for this tool this session" requires the channel to record it in its own store and short-circuit in the answerer, never calling back into `approval/request` | A user asking for it. Interface space is reserved; nothing is built |
+| **0.2 session-projection cache rejects channel session ids** | e2e-observed on 0.2.0-rc.2: its per-record key must match `/^[a-zA-Z0-9_-]+$/`, so our colon-bearing `channel:<id>:<chatKey>` ids never warm the projection cache ("cache stays stale" warnings; titles/projections for channel sessions stay cold). The id grammar is byte-stable by design (§4.5), so the fix belongs upstream or in an id-mapping layer | The projection cache powering something a channel user actually sees (e.g. session titles in web lists) — then raise it upstream |
 
 ---
 
@@ -127,7 +128,7 @@ stated reason, not rediscovering the option.
 | Question | Document |
 |---|---|
 | What the architecture *is*, the R1–R10 constraints, and the design rationale | `../dsh-channel-design.md` |
-| What the rc.6 core actually exposes | `dsh-core-reference.md` |
+| What the 0.2 core actually exposes | `dsh-core-reference.md` |
 | Which capabilities and mechanisms shipped (M7–M14), and how | `../dsh-channel-design.md` §12/§13 + the package READMEs |
 
 Everything older — the completed roadmaps and the original research they came from — lives in git

@@ -36,11 +36,12 @@ export function apply(ctx, config) { ... }
 
 ## Wiring example
 
-See `cordis.patch.yml`. Credentials never land in the config file:
+See `cordis.patch.yml`. Credentials never land in the config file — set them in the web UI's
+credentials page (0.2 has no `dsh credentials set` subcommand) or as environment variables:
 
 ```bash
-dsh credentials set WECHAT_TOKEN '...'        # iLink bot token
-dsh credentials set WECHAT_ACCOUNT_ID '...'   # optional: iLink bot account id
+export WECHAT_TOKEN='...'        # iLink bot token
+export WECHAT_ACCOUNT_ID='...'   # optional: iLink bot account id
 ```
 
 ## Capability facts (compared with Telegram)
@@ -57,7 +58,7 @@ dsh credentials set WECHAT_ACCOUNT_ID '...'   # optional: iLink bot account id
 ## Tool provisioning
 
 Same as Telegram: the channel is a seam and registers no tools; when creating an agent it
-**automatically joins the host default preset** (`dsh-agent-presets`), and `agentPreset` can
+**automatically joins the host default preset** (`dsh-agent-preset-registry`), and `agentPreset` can
 override it explicitly. See the `dsh-channel-telegram` README for details.
 
 ## Security

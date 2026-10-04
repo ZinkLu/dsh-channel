@@ -26,7 +26,7 @@ The dsh loader recognizes `apply` / `inject` / `Config` from the module's named 
 | `provider` | no | `deepseek-official` | agent model provider |
 | `model` | no | none | agent model id |
 | `cwd` | no | host `process.cwd()` | agent working directory (unset = same workspace as Web sessions) |
-| `agentPreset` | no | host default preset | agent preset id; unset = join `dsh-agent-presets`'s default preset (`standard` for a standard deployment) |
+| `agentPreset` | no | host default preset | agent preset id; unset = join `dsh-agent-preset-registry`'s default preset (`standard` for a standard deployment) |
 | `pollingTimeoutSec` | no | `30` | Telegram long-polling timeout |
 | `mergeWindowSec` | no | `5` | burst merge window |
 | `approvalTimeoutSec` | no | `120` | approval timeout |
@@ -39,7 +39,7 @@ See `cordis.patch.yml`.
 ## Tool provisioning (important)
 
 The channel is a seam, not a tool provider — it **does not register tools itself**; but during
-agent creation's `setup` it **auto-joins the host agent preset** (`dsh-agent-presets`):
+agent creation's `setup` it **auto-joins the host agent preset** (`dsh-agent-preset-registry`):
 
 - `agentPreset` unset → join the host default preset (`standard` for a standard web
   deployment); the agent gets the **exact same** tool/persona/skills capabilities as Web sessions.

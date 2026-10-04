@@ -2,7 +2,7 @@
 
 > Version: v0.3 · Date: 2026-08-18
 > The R1–R10 hard constraints and acceptance criteria (A1–A6) have been merged into §6/§7; this document is the single design source. It describes this repo's own design, implementation, and roadmap — nothing else.
-> dsh baseline: deepseek-harness@47f9438 (rc.6); the line-by-line core alignment lives in `docs/dsh-core-reference.md`.
+> dsh baseline: `@deepseek-ai/dsh-*@0.2.0-rc.2`; the line-by-line core alignment lives in `docs/dsh-core-reference.md`.
 
 ---
 
@@ -553,7 +553,7 @@ getUpdates batch
   └─ offset = update_id + 1 (advance only after the whole batch is processed successfully; failed items do not advance the cursor, dedupe prevents re-injection)
 ```
 
-The cold-path log folding after restart: for each actively-bound session, sweep `session.events` once, collect the `messageIds` where `source.kind === 'channel'` and refill the seen set, then everything goes through the hot path. Kill the process and restart → the session is rebuilt from the log via `agents.resume`, and already-injected messages are not re-injected thanks to the seen set (first half of A4).
+The cold-path log folding after restart: for each actively-bound session, sweep `session.snapshotEvents()` once, collect the `messageIds` where `source.kind === 'channel'` and refill the seen set, then everything goes through the hot path. Kill the process and restart → the session is rebuilt from the log via `agents.resume`, and already-injected messages are not re-injected thanks to the seen set (first half of A4).
 
 ### 5.3 Outbound Orchestration
 
@@ -588,9 +588,9 @@ On HTML send failure, automatically degrade to plain text and retry once (the tw
       name: dsh-channel-telegram
       config:
         allowedUserIds: [123456789]
-        model: deepseek-v4-flash
+        model: deepseek-flash
         cwd: !!js process.env.HOME + '/agent-workspace'
-# the token is not in this file: dsh credentials set TELEGRAM_BOT_TOKEN or an environment variable
+# the token is not in this file: the TELEGRAM_BOT_TOKEN credential (web UI credentials page) or an environment variable
 ```
 
 Registration lives on the plugin's own ctx layer (R10): no hardcoded global assumption, so some agent preset can later mount only one channel in an isolated group.
@@ -668,11 +668,11 @@ Per T7's advice, **T7's interface-call checklist is listed in the first week of 
 
 > Status: planned (M6) · Motivation: images/files are high-frequency interactions, so media receive and send are in scope.
 
-### 10.1 dsh Native Ingredients (rc.6 verified)
+### 10.1 dsh Native Ingredients (0.2 verified)
 
 - `ContentBlock` has an `image` block: `ImageBlock { type:'image', attachment: ImageAttachmentRef }` (`dsh-llm/types.d.ts:54`).
 - `ctx.attachments` = `AttachmentStore` (`dsh-attachment`): `saveImage(input) → ImageAttachmentRef` (validate + persist + issue a reference), `readImage(ref)`, `validateImage(input)`.
-- **Key boundary**: rc.6's attachment seam **accepts only images** (`saveImage`/`ImageAttachmentRef`); **documents/audio/video have no first-class storage**; and production adapters declare text-only output, so the model side currently barely emits image blocks. → Media mainly flows **inbound (users send images for the model to see) + outbound (channels/tools send files to users)**.
+- **Key boundary**: the channel side still wires **images only** (`saveImage`/`ImageAttachmentRef`); 0.2's attachment seam grows a file surface (`FileAttachmentRef`) upstream, but these packages don't consume it yet, and production adapters declare text-only output, so the model side currently barely emits image blocks. → Media mainly flows **inbound (users send images for the model to see) + outbound (channels/tools send files to users)**.
 
 ### 10.2 Inbound Receive
 
@@ -727,7 +727,7 @@ interface OutboundMedia {
 Configuration has two layers, and the split follows who consumes each piece:
 
 1. **Shared fragments** — `agentRoutingSchema()` / `channelBehaviorSchema()` / `allowedUserIdsSchema(elem)` with their business interfaces `AgentRoutingConfig` / `ChannelBehaviorConfig`. They live in the kit (`src/config/common.ts`), because every provider composes its `Config` from them and the bridge reads them: `BridgeConfig` is *derived* from these interfaces, so the field set the handler reads and the schema a provider exposes cannot drift.
-2. **Per-provider schema + names** — each provider's `src/config.ts` spreads the fragments into a `Schema.object` with its platform fields, and declares its own settings namespace (`CHANNEL_<PLATFORM>_NS`) and credential-ref constants (`CREDENTIAL_*`). Each of these has exactly one consumer — that provider — so it is not shared.
+2. **Per-provider schema + names** — each provider's `src/config.ts` spreads the fragments into a `Schema.object` with its platform fields, and declares its own plugin-namespace constant (`CHANNEL_<PLATFORM>_NS`) and credential-ref constants (`CREDENTIAL_*`). Each of these has exactly one consumer — that provider — so it is not shared.
 
 Why there is no separate config package: the only thing a `dsh-channel-config` package would hold beyond the fragments is a list of every platform's schema and namespace — a shared package that must change for each new platform, which is the built-in platform list §1.3 rules out and the A5 promise ("a new platform adds one package and touches no shared one") forbids. The fragments alone are ~60 lines and follow the same rule of three the backlog applies to the kit itself (§3.2: directories, not packages). The kit peers on `@deepseek-ai/schemastery` for this; every provider and `dsh-settings` already did.
 
@@ -741,15 +741,16 @@ Common base shared by every provider:
 
 Platform differences stay per-provider: Telegram `pollingTimeoutSec` (30); WeChat `pollingTimeoutSec` + `platformAccountId?` (iLink account); Feishu `domain: 'feishu'|'lark'` and no long-poll timeout (WebSocket).
 
-### 11.2 Settings seam (`installSettingsSection`)
+### 11.2 Settings seam (0.2: the plugin entry IS the config)
 
-- Each provider registers its config as a dsh `settings` namespace (`channel-telegram` / `channel-wechat` / `channel-feishu`) via `installSettingsSection(ctx, settingsNamespace(...), Config, config, { setSource, onChange })`.
-- The resolved value layers schema defaults < composition config < user document. `setSource` swaps the bridge's config source at runtime, and bridges read config through a dynamic `source()` — live fields are getter-ized and take effect without restart; `statePath` is restart-only.
-- Secrets never enter the settings schema: tokens/app secrets stay in `ctx.credentials` (write-only, via the same `CardSecretSpec.write()` path the Models page uses).
+- 0.2 removed the `installSettingsSection`/`settingsNamespace` seam. A provider's config is the `config:` block of its plugin entry in the profile's `cordis.patch.yml`; the provider's `Config` schema still supplies defaults for unset fields.
+- Hot update narrows to schemastery `.volatile()` fields, which the plugin reads through `.get()`; any other field change restarts the plugin with the new value. The channel providers take the minimal form: no volatile fields, config is static for the plugin's lifetime, restart-on-change.
+- A legacy rc.6 `settings.yaml` is imported on first 0.2 boot, but non-volatile values in a plugin section are rejected — hand-migrate any user-tuned `channel-*` values into the profile patch.
+- Secrets never enter the schema: tokens/app secrets stay in `ctx.credentials` (web UI credentials page or env vars; 0.2 has no `dsh credentials set` subcommand).
 
-### 11.3 Current boundary (rc.6)
+### 11.3 Current boundary (0.2)
 
-Host-side wiring is complete, but rc.6's apiproxy only exposes a hardcoded `WEB_SETTINGS_NAMESPACES` allowlist (`agent-loop`/`shell`/`locale`/`permission`/`ui-conversation`/`ui-theme`/`web-search-deepseek`). `channel-*` namespaces are **not** in it, so the config cards do **not** appear in the web UI yet — `settings-file` still persists the user document and the CLI can read it. Exposing plugin namespaces is deferred upstream; this repo does not patch dsh core.
+The rc.6 boundary (apiproxy's hardcoded `WEB_SETTINGS_NAMESPACES` allowlist hiding `channel-*` from the web UI) is gone with the apiproxy itself: there is no per-plugin settings document anymore, so there is nothing to expose — configuration is edited as the profile patch's plugin entry. One new boundary replaces it: because config is the plugin entry, per-field live tweaks now cost a plugin restart unless the field is declared `.volatile()`.
 
 ---
 
@@ -853,6 +854,16 @@ Two boundedness rules keep the sweep honest (both e2e casualties before they wer
   holds only the *in-flight* sweep (startup and a racing first `connected` still share one pass),
   and each later `connected` starts a fresh one. The re-sweep skips keys a live deliver queue
   still owns (in flight or waiting), so an ongoing retry is never doubled.
+
+### 13.6 Recovery re-validates the recorded chunk hash before resending
+
+The ledger key is `sessionId:{seq}`, but the 0.2 v0→v4 log migration re-numbers seq — after an
+upgrade a swept key can silently name a *different* event. So a policy `resend` is no longer
+executed on trust: the bridge recomputes the chunk the key refers to (same render + chunk + index
+path as the original send) and compares it against the `textHash` the ledger recorded. A match
+resends as before; a mismatch marks the entry `abandoned` with the reason in the ledger instead
+of delivering the wrong message. `markAbandoned` (store) is the terminal outlet — `markFailed`
+would be re-swept forever without ever burning an attempt.
 
 ---
 
