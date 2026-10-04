@@ -1,5 +1,7 @@
 # dsh-channel-feishu wiring example (Feishu / Lark, long-connection mode, no public address required).
-# Note: if the host harness already loads dsh-channel (the registry core) or a bundle loads it automatically, delete the first insert below.
+# Note: if the host harness already loads dsh-channel (the registry core) or another
+# channel provider's bundle inserted it, delete the first insert below —
+# `id: channel` must appear only once across all installed provider patches.
 - insert:
     - id: channel
       name: dsh-channel
@@ -9,7 +11,8 @@
       config:
         allowedUserIds: []           # Feishu user open_id (starting with ou_); after receiving a DM, read the open_id from logs and fill it in
         provider: deepseek-official
-        model: deepseek-v4-flash
+        model: deepseek-flash
         # domain unset = feishu; set domain: lark for Lark international
         # cwd / agentPreset unset = inherit the host process.cwd() + host default preset.
-# Credentials are not in this file: dsh credentials set FEISHU_APP_ID / FEISHU_APP_SECRET (or environment variables).
+# Credentials are not in this file: set FEISHU_APP_ID / FEISHU_APP_SECRET in the web
+# UI's credentials page (0.2 has no `dsh credentials set` subcommand) or as environment variables.

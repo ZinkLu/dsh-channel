@@ -3,8 +3,8 @@
 # shape as any profile cordis.patch.yml, composed over the web-identical
 # bundle stack (dsh-base + dsh-web-app). Edit this file, restart the script.
 #
-# Secrets never go here: `dsh credentials set TELEGRAM_BOT_TOKEN ...` or the
-# TELEGRAM_BOT_TOKEN environment variable.
+# Secrets never go here: set TELEGRAM_BOT_TOKEN in the web UI's credentials page
+# (0.2 has no `dsh credentials set` subcommand) or as an environment variable.
 
 # Runtime logs: dsh ships no log sink (ctx.logger only fills an in-memory
 # buffer), so this dev-only row attaches a stderr exporter. The script copies
@@ -25,7 +25,7 @@
       config:
         allowedUserIds: [5002186681]   # ← your Telegram user id
         provider: deepseek-official
-        model: deepseek-v4-flash
+        model: deepseek-flash
         # Dev state stays apart from any other profile sharing this DSH_HOME.
         statePath: !!js dshHomePath('dev-bot', 'channel-telegram', 'state.json')
         # cwd / agentPreset unset: process.cwd() workspace (the script stands in

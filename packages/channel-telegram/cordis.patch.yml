@@ -1,5 +1,10 @@
-# dsh-channel-telegram wiring example (already configured with your user_id).
-# Note: if the host harness already loads dsh-channel (registry core) or it is auto-loaded by a bundle, delete the first insert below.
+# dsh-channel-telegram wiring example.
+# Security: 0.2 enables a bundle's plugins on install, so this template is
+# fail-closed — allowedUserIds starts empty (nobody can drive the bot) until you
+# fill in your own Telegram user id.
+# Note: if the host harness already loads dsh-channel (registry core) or another
+# channel provider's bundle inserted it, delete the first insert below —
+# `id: channel` must appear only once across all installed provider patches.
 - insert:
     - id: channel
       name: dsh-channel
@@ -7,12 +12,13 @@
     - id: channel-telegram
       name: dsh-channel-telegram
       config:
-        allowedUserIds: [5002186681]
+        allowedUserIds: []           # ← your Telegram user id; empty = the bot answers no one
         provider: deepseek-official
-        model: deepseek-v4-flash
+        model: deepseek-flash
         # cwd unset = use the host process.cwd() (the project directory where you start dsh),
         # the same workspace as Web sessions; don't point at a fresh empty ~/agent-workspace directory like the old example did.
-        # agentPreset unset = auto-join the host default preset (dsh-agent-presets's defaultId,
+        # agentPreset unset = auto-join the host default preset (dsh-agent-preset-registry's defaultId,
         # `standard` for a standard web deployment), keeping the full stock tool/persona/skills capabilities.
         # Only override explicitly when you want a separate tool set for Telegram: agentPreset: minimal
-# The token is not in this file: use dsh credentials set TELEGRAM_BOT_TOKEN or the TELEGRAM_BOT_TOKEN environment variable.
+# The token is not in this file: set TELEGRAM_BOT_TOKEN in the web UI's credentials
+# page (0.2 has no `dsh credentials set` subcommand) or as an environment variable.

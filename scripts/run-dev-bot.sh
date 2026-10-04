@@ -13,16 +13,16 @@
 # Runtime logs go to stderr through scripts/dev-logger.mjs (dsh itself ships no
 # log sink); session transcripts stay under $DSH_HOME/sessions as usual.
 #
-# Credentials (shared with your other profiles via $DSH_HOME):
-#   npx -y @deepseek-ai/dsh credentials set TELEGRAM_BOT_TOKEN '...'
-#   npx -y @deepseek-ai/dsh credentials set DEEPSEEK_API_KEY '...'
-# or plain environment variables of the same names.
+# Credentials (shared with your other profiles via $DSH_HOME): set them in the
+# web UI's credentials page (0.2 has no `dsh credentials set` subcommand), or as
+# plain environment variables of the same names:
+#   TELEGRAM_BOT_TOKEN / DEEPSEEK_API_KEY
 #
 # NOTE: two processes long-polling the same bot token fight over getUpdates
 # (Telegram 409) — stop any other instance using this token first.
 set -euo pipefail
 
-DSH_VERSION="${DSH_VERSION:-0.1.0-rc.6}"
+DSH_VERSION="${DSH_VERSION:-0.2.0-rc.2}"
 PROFILE="${DEV_BOT_PROFILE:-dev-bot}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export DSH_HOME="${DSH_HOME:-$HOME/.dsh}"
@@ -81,4 +81,5 @@ rm -rf "$PROFILE_DIR/node_modules"
 # the same rule production uses, so the bot never writes into the repo tree.
 mkdir -p "$WORKSPACE"
 cd "$WORKSPACE"
-exec npx -y "@deepseek-ai/dsh@$DSH_VERSION" --profile "$PROFILE" --patch "$REPO/scripts/dev-bot.yaml" "$@"
+# 0.2's web app opens a browser by default; --no-open keeps the bot headless.
+exec npx -y "@deepseek-ai/dsh@$DSH_VERSION" --profile "$PROFILE" --patch "$REPO/scripts/dev-bot.yaml" --no-open "$@"
