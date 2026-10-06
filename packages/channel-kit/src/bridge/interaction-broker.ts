@@ -63,8 +63,13 @@ export interface InteractionHost {
   readonly channel: Channel
   /** ms until an unanswered approval/prompt fails closed; read per request (config is live). */
   timeoutMs(): number
-  /** The chatKey the given agent's conversation is bound to, if any. */
-  chatKeyForAgent(agentId: string): string | undefined
+  /**
+   * The chatKeys the given agent's interaction should reach. With a session
+   * manager this is every subscriber chat of the session (plus its focus
+   * chat); without one it is the single bound chat. Multiple chats all
+   * receive the prompt; the first answer wins (resolve is single-shot).
+   */
+  chatKeysForAgent(agentId: string, kind: 'approval' | 'question'): string[]
   deliver(out: OutboundMessage): Promise<DeliveryReceipt>
   /** Record our own platform message ids for outbound-echo suppression. */
   rememberOwnSends(chatKey: string, platformMessageIds: readonly string[]): void
@@ -74,14 +79,14 @@ export interface InteractionHost {
 }
 
 interface ApprovalEntry extends PendingApproval {
-  chatKey: string
+  chatKeys: string[]
   timer?: NodeJS.Timeout
   resolve?: (outcome: 'allowed-once' | 'rejected' | 'deferred') => void
   messageId?: number
 }
 
 interface PromptEntry extends PendingPrompt {
-  chatKey: string
+  chatKeys: string[]
   timer?: NodeJS.Timeout
   messageId?: number
   /** Fail-closed path: the question rejects rather than resolving with an empty ("skipped") selection. */
@@ -103,22 +108,22 @@ export class InteractionBroker {
     return parseApprovalReply({ text }, [...this.pendingApprovals.values()]).kind === 'answer'
   }
 
-  /** `approval/request` waterfall handler: prompt the chat, or `next()` when this bridge does not own the agent. */
+  /** `approval/request` waterfall handler: prompt the subscriber chats, or `next()` when this bridge does not own the agent. */
   async handleApprovalRequest(req: ApprovalRequest, next: () => Promise<ApprovalOutcome>): Promise<ApprovalOutcome> {
-    const chatKey = this.host.chatKeyForAgent(req.agent.id)
-    if (!chatKey) {
+    const chatKeys = this.host.chatKeysForAgent(req.agent.id, 'approval')
+    if (chatKeys.length === 0) {
       this.host.log('debug', `approval/request for ${req.agent.id} (${req.toolName}) is not ours → next()`)
       return next()
     }
 
     const num = ++this.seq
-    this.host.log('debug', `approval #${num} for ${req.agent.id} (${req.toolName}) → chat ${chatKey}, timeout ${this.host.timeoutMs()}ms`)
+    this.host.log('debug', `approval #${num} for ${req.agent.id} (${req.toolName}) → chats [${chatKeys.join(', ')}], timeout ${this.host.timeoutMs()}ms`)
     const entry: ApprovalEntry = {
       num,
       requestId: this.requestId(num),
       toolName: req.toolName,
       expiresAt: Date.now() + this.host.timeoutMs(),
-      chatKey,
+      chatKeys,
     }
 
     let settle!: (outcome: 'allowed-once' | 'rejected' | 'deferred') => void
@@ -168,8 +173,8 @@ export class InteractionBroker {
    */
   async handleUserQuestion(request: AskUserQuestionRequestLike, next: () => Promise<AskUserQuestionAnswerLike>): Promise<AskUserQuestionAnswerLike> {
     const agentId = request.agent?.id
-    const chatKey = agentId !== undefined ? this.host.chatKeyForAgent(agentId) : undefined
-    if (chatKey === undefined) {
+    const chatKeys = agentId !== undefined ? this.host.chatKeysForAgent(agentId, 'question') : []
+    if (chatKeys.length === 0) {
       this.host.log('debug', `user-questions/request for ${agentId ?? '(no agent)'} is not ours → next()`)
       return next()
     }
@@ -177,14 +182,14 @@ export class InteractionBroker {
     const answers: AskUserQuestionAnswerLike['answers'] = []
     for (const question of request.questions) {
       if (request.signal?.aborted) throw askError('ASK_ABORTED', 'ask_user_question was aborted before the user answered')
-      const answer = await this.askQuestion(chatKey, question, request.signal)
+      const answer = await this.askQuestion(chatKeys, question, request.signal)
       answers.push({ id: question.id, selected: answer.selected, custom: answer.custom })
     }
     return { answers }
   }
 
   private askQuestion(
-    chatKey: string,
+    chatKeys: string[],
     question: AskUserQuestionItemLike,
     signal?: AbortSignal,
   ): Promise<{ selected: string[]; custom?: string }> {
@@ -213,7 +218,7 @@ export class InteractionBroker {
       expiresAt: Date.now() + this.host.timeoutMs(),
       resolve: (selected, custom) => settle(selected, custom),
       reject: (error) => fail(error),
-      chatKey,
+      chatKeys,
     }
     this.pendingPrompts.set(num, entry)
 
@@ -237,10 +242,12 @@ export class InteractionBroker {
       this.promptCaps(),
     )
     // A failed prompt send fails fast: the user demonstrably cannot answer.
-    void this.sendInteraction(chatKey, rendered, `prompt:${entry.requestId}`, entry).catch((error: unknown) => {
-      if (!this.pendingPrompts.delete(num)) return
+    // With several subscriber chats, only an ALL-chats failure gives up; one
+    // reachable chat keeps the question alive for its answer.
+    void this.sendInteractionToAll(chatKeys, rendered, `prompt:${entry.requestId}`, entry).then((delivered) => {
+      if (delivered > 0 || !this.pendingPrompts.delete(num)) return
       if (entry.timer) clearTimeout(entry.timer)
-      fail(error instanceof Error ? error : new Error(String(error)))
+      fail(new Error('the question prompt could not be delivered to any subscriber chat'))
     })
 
     entry.timer = this.armTimeout(() => {
@@ -257,7 +264,8 @@ export class InteractionBroker {
       { supportsChoices: this.host.channel.supportsChoices },
     )
     try {
-      await this.sendInteraction(entry.chatKey, rendered, `approval:${entry.requestId}`, entry)
+      const delivered = await this.sendInteractionToAll(entry.chatKeys, rendered, `approval:${entry.requestId}`, entry)
+      if (delivered === 0) throw new Error('the approval prompt could not be delivered to any subscriber chat')
     } catch (error) {
       // Fail-fast: if the prompt cannot be delivered the user demonstrably cannot
       // answer, so resolve `deferred` immediately instead of waiting out the timeout.
@@ -266,6 +274,26 @@ export class InteractionBroker {
       if (entry.timer) clearTimeout(entry.timer)
       entry.resolve?.('deferred')
     }
+  }
+
+  /** Deliver one interaction to every subscriber chat; counts the chats that accepted it. */
+  private async sendInteractionToAll(
+    chatKeys: readonly string[],
+    rendered: { kind: 'choices'; text: string; choices: ReadonlyArray<{ id: string; label: string }> } | { kind: 'text'; text: string },
+    deliveryKey: string,
+    entry: { messageId?: number },
+  ): Promise<number> {
+    let delivered = 0
+    for (const chatKey of chatKeys) {
+      try {
+        await this.sendInteraction(chatKey, rendered, delivered === 0 ? deliveryKey : `${deliveryKey}:${chatKey}`, entry)
+        delivered += 1
+      } catch {
+        // One unreachable chat must not mute the others; an all-chats failure
+        // is handled by the caller.
+      }
+    }
+    return delivered
   }
 
   /** Deliver one rendered interaction and record the platform message id on its entry. */

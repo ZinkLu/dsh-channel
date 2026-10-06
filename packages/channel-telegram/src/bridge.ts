@@ -1,7 +1,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { ImageAttachmentRef, ImageMediaType } from '@deepseek-ai/dsh-attachment'
-import { ChannelBridge, DEFAULT_MAX_INBOUND_MEDIA_BYTES, renderForTier, sleepWithAbort, type BridgeConfig, type BridgePolicyOverrides, type ChannelStore } from 'dsh-channel-kit'
+import { ChannelBridge, DEFAULT_MAX_INBOUND_MEDIA_BYTES, renderForeignConfirm, renderForTier, shortenSessionId, sleepWithAbort, type BridgeConfig, type BridgePolicyOverrides, type ChannelStore } from 'dsh-channel-kit'
 import type { InboundMedia, InboundMessage } from 'dsh-channel'
 import type { TelegramChannel } from './channel.js'
 import { CREDENTIAL_TELEGRAM_BOT_TOKEN } from './config.js'
@@ -235,6 +235,26 @@ export class TelegramBridge extends ChannelBridge<TelegramBridgeConfig> {
     }
 
     const data = callbackQuery.data ?? ''
+
+    // /ls inline keyboard: focus:<sessionId> (a separate namespace from appr:/prompt:).
+    // The list card stays intact; the outcome is confirmed as a normal reply.
+    const focusMatch = /^focus:(.+)$/.exec(data)
+    if (focusMatch) {
+      const chatKey = callbackQuery.message ? toChatKey(callbackQuery.message.chat) : undefined
+      if (chatKey === undefined) return
+      const outcome = await this.applyFocusChoice(focusMatch[1]!, chatKey)
+      this.sendLocal(
+        chatKey,
+        outcome === 'focused'
+          ? `✅ Focused ${shortenSessionId(focusMatch[1]!)}`
+          : // A foreign session refuses the tap with the same --take confirmation /use prints.
+            outcome === 'foreign'
+            ? renderForeignConfirm(focusMatch[1]!)
+            : '⚠️ That session could not be focused (stale list or unavailable)',
+      )
+      return
+    }
+
     const apprMatch = /^appr:(\d+):([01])$/.exec(data)
     if (apprMatch) {
       const num = Number(apprMatch[1])

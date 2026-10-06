@@ -19,6 +19,19 @@
 - insert:
     - id: channel
       name: dsh-channel
+# The session manager is channel-agnostic; the Telegram bridge below picks it
+# up through ctx.get('sessionManager') and switches to its upstream (focus
+# pointer, /ls /use /to command table, notification outbox). Remove this row
+# and the bridge falls back to the classic one-chat-one-session behavior.
+- insert:
+    - id: session-manager
+      name: dsh-session-manager
+      config:
+        # notify_user from sessions with no watcher (e.g. opened in the browser)
+        # lands in this DM:
+        defaultSubscribers:
+          - channel:telegram:5002186681
+        statePath: !!js dshHomePath('dev-bot', 'session-manager', 'state.json')
 - insert:
     - id: channel-telegram
       name: dsh-channel-telegram

@@ -1,0 +1,20 @@
+# dsh-session-manager wiring example.
+# The manager is channel-agnostic: it registers ctx.sessionManager, the global
+# notify_user tool, and the session/task/outbox tables. Channel providers pick
+# it up automatically through ctx.get('sessionManager') — no provider config
+# changes are needed. Install it BEFORE the channel rows so the bridge sees it
+# from its first start().
+- insert:
+    - id: session-manager
+      name: dsh-session-manager
+      config:
+        # defaultSubscribers: subscriberKeys that receive `notify`/`error` for
+        # sessions with no watcher of their own (e.g. a browser-opened session
+        # calling notify_user). Channel convention: channel:<id>[:<account>]:<chatKey>.
+        # defaultSubscribers:
+        #   - channel:telegram:5002186681
+        # statePath unset = $DSH_HOME/session-manager/state.json (JSON fallback
+        # store; used only when ctx.storageDomain is absent).
+        # provider / model / cwd / agentPreset: creation defaults for sessions
+        # this manager creates; a channel bridge passes its own config through
+        # create()/dispatch() and wins over these.

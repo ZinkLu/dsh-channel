@@ -113,7 +113,10 @@ export function createJsonFileStore(path: string): ChannelStore {
     if (writeTimer !== undefined) return
     writeTimer = setTimeout(() => {
       writeTimer = undefined
-      void flush()
+      // The rejection surfaces to explicit flush() callers; the debounce path
+      // stays quiet (the failed snapshot is re-dirtied, so the next mutation
+      // or flush retries it).
+      void flush().catch(() => {})
     }, WRITE_DEBOUNCE_MS)
     // Don't let the timer keep the Node process alive on exit.
     writeTimer.unref?.()
@@ -157,12 +160,22 @@ export function createJsonFileStore(path: string): ChannelStore {
     }
     if (!dirty) return
     dirty = false
-    writeChain = writeChain.then(async () => {
-      await mkdir(dirname(path), { recursive: true })
-      const tmp = `${path}.tmp-${process.pid}-${Date.now()}`
-      await writeFile(tmp, JSON.stringify(snapshot(), null, 2), 'utf8')
-      await rename(tmp, path)
-    })
+    // Self-healing chain: one failed write must neither poison later flushes
+    // (the chain is drained before the next write body) nor lose the snapshot
+    // (a failure re-dirties, so the next flush retries it).
+    writeChain = writeChain
+      .catch(() => {})
+      .then(async () => {
+        try {
+          await mkdir(dirname(path), { recursive: true })
+          const tmp = `${path}.tmp-${process.pid}-${Date.now()}`
+          await writeFile(tmp, JSON.stringify(snapshot(), null, 2), 'utf8')
+          await rename(tmp, path)
+        } catch (error) {
+          dirty = true
+          throw error
+        }
+      })
     await writeChain
   }
 

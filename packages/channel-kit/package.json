@@ -23,6 +23,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "tsx --test test/*.test.ts",
+    "pretest": "npm run build --workspace dsh-session-manager",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {},
@@ -35,13 +36,17 @@
     "@deepseek-ai/dsh-system-prompt": "^0.2.0-rc.2",
     "@deepseek-ai/dsh-user-approval": "^0.2.0-rc.2",
     "@deepseek-ai/schemastery": "^3.18.1",
-    "dsh-channel": "0.1.0-rc.0"
+    "dsh-channel": "0.1.0-rc.0",
+    "dsh-session-manager": "0.1.0-rc.0"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh-system-prompt": {
       "optional": true
     },
     "@deepseek-ai/dsh-user-approval": {
+      "optional": true
+    },
+    "dsh-session-manager": {
       "optional": true
     }
   },
@@ -55,6 +60,7 @@
     "@deepseek-ai/dsh-user-approval": "^0.2.0-rc.2",
     "@deepseek-ai/schemastery": "^3.18.1",
     "@types/node": "^24.0.0",
-    "dsh-channel": "0.1.0-rc.0"
+    "dsh-channel": "0.1.0-rc.0",
+    "dsh-session-manager": "0.1.0-rc.0"
   }
 }

@@ -13,9 +13,12 @@ import type { Agent, AgentHandle, AssistantStreamFrame } from '@deepseek-ai/dsh-
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId, SessionSeq, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import type {} from '@deepseek-ai/dsh-user-approval'
 import type {} from '@deepseek-ai/dsh-system-prompt'
-import type { Channel, InboundMessage, OutboundMessage, PresentationFrame, SendErrorKind } from 'dsh-channel'
+import type { Channel, InboundMessage, OutboundChoice, OutboundMessage, PresentationFrame, SendErrorKind } from 'dsh-channel'
+import type { ManagerNotification, SessionManager, SessionView } from 'dsh-session-manager'
 import type { AgentRoutingConfig, ChannelBehaviorConfig } from '../config/common.js'
 import { chunkText } from '../format/chunk.js'
 import { renderForTier } from '../format/format.js'
@@ -32,6 +35,27 @@ import {
 } from '../policy/deliver-queue.js'
 import { draftThrottleReduce, emptyDraftThrottleState, type DraftThrottleState } from '../policy/draft-throttle.js'
 import { resolveFinalization } from '../policy/finalization.js'
+import { resolveFocusPresentation, sessionBadge } from '../policy/focus-presentation.js'
+import {
+  MANAGER_HELP_TEXT,
+  parseManagerCommand,
+  pathLabel,
+  renderDispatchReply,
+  renderFocusReply,
+  renderForeignConfirm,
+  renderNewReply,
+  renderSessionList,
+  renderSessionStatus,
+  renderStopReply,
+  renderTailReply,
+  renderUnknownNumber,
+  renderUnknownSession,
+  renderUnwatchReply,
+  renderWatchReply,
+  renderWorkspaceList,
+  resolveSessionTarget,
+  type SessionListRow,
+} from '../policy/manager-commands.js'
 import { emptyMergeState, mergeReduce, type MergeEffect, type MergeState } from '../policy/merge.js'
 import { emptyOutboundEchoState, outboundEchoReduce, type OutboundEchoState } from '../policy/outbound-echo.js'
 import {
@@ -41,7 +65,7 @@ import {
   type PresentationPolicy,
 } from '../policy/presentation.js'
 import type { PromptAnswer } from '../policy/prompt-render.js'
-import { chunkDeliveryKey, chunkIndexOf, defaultRecoveryPolicy, hashText, splitDeliveryKey, type RecoverableDelivery, type RecoveryPolicy } from '../policy/recovery.js'
+import { chunkDeliveryKey, chunkIndexOf, defaultRecoveryPolicy, hashText, isFatalSendError, splitDeliveryKey, type RecoverableDelivery, type RecoveryPolicy } from '../policy/recovery.js'
 import { route, type RouteDecision } from '../policy/router.js'
 import { emptyStreamState, type StreamFrame, type StreamInput, type StreamState } from '../policy/stream.js'
 import { InteractionBroker } from './interaction-broker.js'
@@ -72,10 +96,22 @@ export interface BridgeDelivery {
   silent?: boolean
   /** True for agent output recorded in the delivery ledger; false for local notices. */
   ledger?: boolean
+  /** Structured choices (the `/ls` inline keyboard); attached to the last chunk only. */
+  choices?: readonly OutboundChoice[]
 }
 
 /** One buffered merge entry: the message text and its platform ids, kept aligned with MergeState.buffer. */
 interface MergeEntry {
+  messageIds: string[]
+  senderId: string
+}
+
+/**
+ * Inbound platform context threaded through command handling, so a dispatching
+ * command (/to, /new <text>) can attribute its user message to the inbound
+ * platform message in the session log (R7) instead of a synthetic empty source.
+ */
+interface CommandContext {
   messageIds: string[]
   senderId: string
 }
@@ -137,6 +173,25 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
   private readonly disposers: Array<() => void> = []
   private readonly registryBindings = new Map<string, () => void>()
 
+  // ---- session-manager upstream (all absent without ctx.sessionManager) ----
+  private managerPump: { manager: SessionManager; dispose: () => void } | undefined
+  /** Live notify deliveries: ledger key → payload (kept for timer re-enqueues; absent = not ours). */
+  private readonly notifyDeliveries = new Map<string, { id: string; chatKey: string; markdown: string }>()
+  private readonly notifyTimers = new KeyedTimers()
+  /** Per-chat session numbering, stable until the next /ls (the `/use n` + badge namespace). */
+  private readonly sessionNumbers = new Map<string, Record<string, number>>()
+  /** Per-chat workspace numbering from the last /ws (the `/new <ws>` namespace). */
+  private readonly workspaceNumbers = new Map<string, Record<string, number>>()
+  /** sessionId → display title cache for notification badges. */
+  private readonly titleCache = new Map<string, string>()
+  /**
+   * Per-chat set of sessions the user explicitly `/unwatch`ed: free-text
+   * dispatches must not silently re-subscribe them with their `watch: true`.
+   * A session leaves the set when the chat `/watch`es it or moves focus to it;
+   * the dead-target cleanup (which unwatches everything) drops the chat's set.
+   */
+  private readonly unwatchedSessions = new Map<string, Set<string>>()
+
   private localSeq = 0
   private recoverPromise: Promise<void> | undefined
   /** Deadline for one host `agents.resume` during recovery; a wedged resume must not wedge the sweep. */
@@ -153,7 +208,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     this.broker = new InteractionBroker({
       channel,
       timeoutMs: () => this.config.approvalTimeoutSec * 1000,
-      chatKeyForAgent: (agentId) => this.sessionChatKeys.get(agentId),
+      chatKeysForAgent: (agentId, kind) => this.chatKeysForAgent(agentId, kind),
       deliver: (out) => this.ctx.channels.deliver(out),
       rememberOwnSends: (chatKey, ids) => this.rememberOwnSends(chatKey, ids),
       accountQualifier: () => this.accountQualifier,
@@ -221,6 +276,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     this.busyQueues.clear()
     this.sessionTurnTails.clear()
     this.outboundEchoStates.clear()
+    this.disposeManagerPump()
     for (const resolve of this.statusWaiters.splice(0)) resolve()
     this.broker.settleAll()
 
@@ -318,10 +374,25 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
       this.armMergeTimer(chatKey, now + this.config.mergeWindowSec * 1000)
     }
 
+    const manager = this.ensureManagerPump()
+    if (manager !== undefined) {
+      try {
+        await manager.ready()
+      } catch {
+        // Fail closed — deliberately NO conventional-path fallback (D4: the
+        // manager's presence is the only switch; creating agents behind its
+        // back would split the session tables). ready() rethrows the same
+        // rejected start, so each binding restore below warns and skips, and
+        // the first inbound message re-attempts through the normal manager
+        // dispatch path, surfacing "Unable to create or resume session".
+      }
+    }
+
     for (const [chatKey, sessionId] of Object.entries(this.store.bindings())) {
       this.sessionChatKeys.set(sessionId, chatKey)
       try {
-        await this.ensureAgent(sessionId, chatKey, false)
+        if (manager !== undefined) await this.ensureAgentManaged(manager, sessionId, chatKey, false)
+        else await this.ensureAgent(sessionId, chatKey, false)
       } catch {
         // A failed restore does not block channel startup; the first message retries create.
       }
@@ -393,6 +464,11 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
 
   /** Execute the recovery policy's decisions against the ledger (look up text, resend/skip/abandon). */
   private async recover(): Promise<void> {
+    // Manager outbox first: un-acked notifications re-deliver through the same
+    // serial queue with the recovery marker (§6.5). They live in the manager's
+    // durable outbox, not the channel ledger, so the sweep below never sees them.
+    await this.redeliverPendingNotifications()
+
     const queued = this.liveQueuedDeliveryKeys()
     const recoverable = this.store.sweepRecoverable().filter((item) => !queued.has(item.key))
     await this.resumeRecoverableSessions(recoverable)
@@ -548,7 +624,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     const trimmed = text.trim()
     if (trimmed.startsWith('/')) {
       await this.flushBuffered(chatKey)
-      await this.handleCommand(trimmed, chatKey)
+      await this.handleCommand(trimmed, chatKey, { messageIds, senderId })
       return
     }
 
@@ -672,7 +748,13 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     if (decision.kind === 'drop') return
     if (decision.kind === 'approval-reply') return
     if (decision.kind === 'command') {
-      await this.handleCommand(`/${decision.command} ${decision.args}`.trim(), chatKey)
+      await this.handleCommand(`/${decision.command} ${decision.args}`.trim(), chatKey, { messageIds, senderId })
+      return
+    }
+
+    const manager = this.ensureManagerPump()
+    if (manager !== undefined) {
+      await this.dispatchViaManager(manager, decision.sessionId, decision.create, chatKey, text, messageIds, senderId, images)
       return
     }
 
@@ -814,7 +896,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
       ...(this.config.model !== undefined ? { model: this.config.model } : {}),
     }
 
-    const setup = (agentCtx: Context, agent: Agent) => this.setupAgent(agentCtx, agent)
+    const setup = (agentCtx: Context, agent: Agent) => this.setupAgent(agentCtx, agent, { mountPreset: true })
 
     // 0.2 resume fails for real reasons (session owned elsewhere, unsupported
     // format, broken preset); a catch-all that falls through to create() hits
@@ -877,7 +959,12 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     }
   }
 
-  private async setupAgent(agentCtx: Context, agent: Agent): Promise<void> {
+  /**
+   * Per-agent composition. With a session manager the manager owns the preset
+   * mount (it runs after this hook inside the manager's composed setup), so
+   * `mountPreset` is false there and true on the standalone path.
+   */
+  private async setupAgent(agentCtx: Context, agent: Agent, opts: { mountPreset: boolean }): Promise<void> {
     try {
       const systemPrompt = agentCtx.get('systemPrompt')
       systemPrompt?.section({
@@ -898,7 +985,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     }
     this.registerUserQuestionsAnswerer(agentCtx)
     this.registerAssistantStreamRelay(agentCtx, agent)
-    await this.mountAgentPreset(agentCtx, agent)
+    if (opts.mountPreset) await this.mountAgentPreset(agentCtx, agent)
   }
 
   /** Agent-scoped answerer for the 0.2 user-questions waterfall (replaces the rc.6 registerProvider slot). */
@@ -930,6 +1017,713 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
       // A preset that fails to mount must not block the channel: the agent runs without it.
       this.warn(`agent preset ${id} could not be mounted: ${error instanceof Error ? error.message : String(error)}`)
     }
+  }
+
+  // ---- session-manager upstream (D4: manager when present, convention otherwise) ----
+
+  /** This bridge's subscriber namespace: `channel:<id>[:<account>]:` — the subscriberKey is sessionIdFor(chatKey). */
+  private get subscriberPrefix(): string {
+    return `channel:${this.channel.id}${this.accountSegment}:`
+  }
+
+  /** The chat's focus session: its binding, else the conventional id (D4 — no binding, no mode switch). */
+  private focusedSessionOf(chatKey: string): string {
+    return this.store.bindings()[chatKey] ?? this.sessionIdFor(chatKey)
+  }
+
+  /**
+   * Resolve `ctx.sessionManager` lazily and keep exactly one live notification
+   * pump registered for it. Lazy because plugin order is not a contract: the
+   * manager may mount after this bridge started, or unmount while it runs —
+   * both flip the bridge between the manager and conventional paths (D4).
+   */
+  private ensureManagerPump(): SessionManager | undefined {
+    const manager = this.ctx.get('sessionManager')
+    if (manager === undefined) {
+      this.disposeManagerPump()
+      return undefined
+    }
+    if (this.managerPump === undefined || this.managerPump.manager !== manager) {
+      this.disposeManagerPump()
+      const dispose = manager.onNotification(this.subscriberPrefix, (notification) => {
+        void this.onManagerNotification(notification).catch((error: unknown) => {
+          this.warn(`notification handling failed: ${error instanceof Error ? error.message : String(error)}`)
+        })
+      })
+      this.managerPump = { manager, dispose }
+    }
+    return manager
+  }
+
+  private disposeManagerPump(): void {
+    if (this.managerPump !== undefined) {
+      try {
+        this.managerPump.dispose()
+      } catch {
+        // A dead manager's disposer failing must not block teardown.
+      }
+      this.managerPump = undefined
+    }
+    this.notifyTimers.clearAll()
+    this.notifyDeliveries.clear()
+  }
+
+  /** Creation defaults handed to manager.adopt/create — the bridge's config wins over the manager's. */
+  private managerAgentDefaults(): { agentOptions: { provider: string; model?: string }; cwd?: string; agentPreset?: string } {
+    return {
+      agentOptions: {
+        provider: this.config.provider,
+        ...(this.config.model !== undefined ? { model: this.config.model } : {}),
+      },
+      ...(this.config.cwd !== undefined ? { cwd: this.config.cwd } : {}),
+      ...(this.config.agentPreset !== undefined ? { agentPreset: this.config.agentPreset } : {}),
+    }
+  }
+
+  /** The bridge's per-agent setup for manager-composed sessions (the manager owns the preset mount there). */
+  private managerSetup(): (agentCtx: Context, agent: Agent) => Promise<void> {
+    return (agentCtx, agent) => this.setupAgent(agentCtx, agent, { mountPreset: false })
+  }
+
+  /**
+   * Manager-backed `ensureAgent`: register (adopt) the session with the manager
+   * — including the conventional per-chat default, so it shows up in `/ls` —
+   * and resolve the live agent through the manager's resume/create ladder.
+   */
+  private async ensureAgentManaged(manager: SessionManager, sessionId: string, chatKey: string, create: boolean): Promise<Agent | undefined> {
+    this.sessionChatKeys.set(sessionId, chatKey)
+    this.registerSessionBinding(sessionId, chatKey)
+    const live = this.ctx.agents.get(SessionId(sessionId))
+    try {
+      await manager.ready()
+      await manager.adopt(sessionId, this.sessionIdFor(chatKey), {
+        createIfMissing: create,
+        ...this.managerAgentDefaults(),
+        setup: this.managerSetup(),
+      })
+    } catch (error) {
+      this.warn(`session manager adopt ${sessionId} failed: ${error instanceof Error ? error.message : String(error)}`)
+      return live
+    }
+    return live ?? this.ctx.agents.get(SessionId(sessionId))
+  }
+
+  /** The manager path of `dispatchText`: identical busy/queue semantics, dispatch folded into a tracked task. */
+  private async dispatchViaManager(
+    manager: SessionManager,
+    sessionId: string,
+    create: boolean,
+    chatKey: string,
+    text: string,
+    messageIds: string[],
+    senderId: string,
+    images: readonly ImageAttachmentRef[],
+  ): Promise<void> {
+    const agent = await this.ensureAgentManaged(manager, sessionId, chatKey, create)
+    if (!agent) {
+      this.sendLocal(chatKey, '⚠️ Unable to create or resume session.')
+      return
+    }
+
+    const message = this.buildUserMessage(chatKey, text, messageIds, senderId, images)
+    const action = this.resolveBusyActionFor(agent.status, images.length > 0 ? 'media' : 'text')
+
+    const queued: BusyQueuedMessage = { chatKey, text, messageIds, senderId, images }
+    if (action === 'queue') {
+      this.queueBehindRunningTurn(agent, queued)
+      return
+    }
+
+    await this.runSerializedSessionTurn(agent.id, chatKey, async () => {
+      try {
+        await manager.dispatch({
+          sessionId: agent.id,
+          message,
+          mode: action === 'steer' ? 'steer' : 'followup',
+          by: this.sessionIdFor(chatKey),
+          // A session this chat explicitly /unwatch'ed stays unwatched: free
+          // text must not silently undo that (it re-arms on /watch or focus).
+          watch: !(this.unwatchedSessions.get(chatKey)?.has(agent.id) ?? false),
+        })
+      } catch (error) {
+        // steer() itself never rejects a message; only a throw (agent released
+        // mid-dispatch) lands here — buffer it, never drop it (same guarantee
+        // as the conventional path).
+        if (action === 'steer') {
+          this.queueBehindRunningTurn(agent, queued)
+          return
+        }
+        throw error
+      }
+      this.sessionChatKeys.set(agent.id, chatKey)
+    })
+  }
+
+  /** Move a chat's focus: the binding is the focus pointer, the previous focus stops streaming here. */
+  private setFocus(chatKey: string, sessionId: string): void {
+    for (const [existingSession, existingChat] of [...this.sessionChatKeys]) {
+      if (existingChat === chatKey && existingSession !== sessionId) this.sessionChatKeys.delete(existingSession)
+    }
+    this.store.setBinding(chatKey, sessionId)
+    this.sessionChatKeys.set(sessionId, chatKey)
+    this.registerSessionBinding(sessionId, chatKey)
+    // Focusing implies watching (every focus path subscribes), so an explicit
+    // /unwatch of the focused session no longer suppresses dispatch watches.
+    this.unwatchedSessions.get(chatKey)?.delete(sessionId)
+  }
+
+  /**
+   * Which chats an agent's approval/question should reach: its focus chat plus
+   * every subscriber chat of its session on THIS bridge (§6.4). All of them get
+   * the prompt; the first answer wins (the broker resolves single-shot).
+   */
+  private chatKeysForAgent(agentId: string, kind: 'approval' | 'question'): string[] {
+    const keys: string[] = []
+    const bound = this.sessionChatKeys.get(agentId)
+    if (bound !== undefined) keys.push(bound)
+    const manager = this.ctx.get('sessionManager')
+    if (manager !== undefined) {
+      try {
+        for (const subscriberKey of manager.subscribersOf(agentId, kind)) {
+          const chatKey = this.chatKeyOfSubscriber(subscriberKey)
+          if (chatKey !== undefined && !keys.includes(chatKey)) keys.push(chatKey)
+        }
+      } catch {
+        // A broken manager must not mute the focus chat.
+      }
+    }
+    return keys
+  }
+
+  private chatKeyOfSubscriber(subscriberKey: string): string | undefined {
+    return subscriberKey.startsWith(this.subscriberPrefix) ? subscriberKey.slice(this.subscriberPrefix.length) : undefined
+  }
+
+  // ---- manager notifications (outbox → serial queue → ack) ----
+
+  private async onManagerNotification(notification: ManagerNotification): Promise<void> {
+    const manager = this.managerPump?.manager
+    if (manager === undefined) return
+    const chatKey = this.chatKeyOfSubscriber(notification.subscriberKey)
+    if (chatKey === undefined) return
+    const presentation = resolveFocusPresentation({
+      isFocused: this.focusedSessionOf(chatKey) === notification.sessionId,
+      kind: notification.kind,
+    })
+    if (presentation === 'silent') {
+      // Deliberately not shown (a focused session's turn-end streams natively);
+      // ack so the outbox row never re-delivers.
+      manager.ack(notification.id)
+      return
+    }
+    const badge = presentation === 'deliver-badged' ? await this.notificationBadge(chatKey, notification.sessionId) : ''
+    this.deliverNotification(notification, chatKey, `${badge}${notification.text}`)
+  }
+
+  /** Enqueue one outbox row on the chat's serial queue under the `notify:<id>` key (D3). */
+  private deliverNotification(notification: ManagerNotification, chatKey: string, markdown: string): void {
+    const key = `notify:${notification.id}`
+    if (this.notifyDeliveries.has(key)) return
+    this.notifyDeliveries.set(key, { id: notification.id, chatKey, markdown })
+    // ledger:true gates on `connected` and drives retries; NO ledger row is
+    // recorded — the manager's outbox is the durability for notifications, and
+    // a phantom ledger entry would confuse the session-keyed recovery sweep.
+    this.enqueueDelivery(chatKey, { key, value: { chatKey, markdown, ledger: true } })
+  }
+
+  /** §6.5: pull un-acked outbox rows after (re)connect and re-deliver them with the resumed-resend marker. */
+  private async redeliverPendingNotifications(): Promise<void> {
+    const manager = this.ensureManagerPump()
+    if (manager === undefined) return
+    try {
+      await manager.ready()
+    } catch {
+      return
+    }
+    for (const notification of manager.pending(this.subscriberPrefix)) {
+      const key = `notify:${notification.id}`
+      if (this.notifyDeliveries.has(key)) continue
+      const chatKey = this.chatKeyOfSubscriber(notification.subscriberKey)
+      if (chatKey === undefined) {
+        manager.ack(notification.id)
+        continue
+      }
+      const presentation = resolveFocusPresentation({
+        isFocused: this.focusedSessionOf(chatKey) === notification.sessionId,
+        kind: notification.kind,
+      })
+      if (presentation === 'silent') {
+        manager.ack(notification.id)
+        continue
+      }
+      const badge = presentation === 'deliver-badged' ? await this.notificationBadge(chatKey, notification.sessionId) : ''
+      this.deliverNotification(notification, chatKey, `${RESUMED_RESEND_MARKER}${badge}${notification.text}`)
+    }
+  }
+
+  private onNotifyDelivered(key: string): void {
+    const entry = this.notifyDeliveries.get(key)
+    if (entry === undefined) return
+    this.notifyDeliveries.delete(key)
+    this.notifyTimers.clear(key)
+    this.managerPump?.manager.ack(entry.id)
+  }
+
+  private onNotifyGiveUp(key: string, errorKind: SendErrorKind | undefined): void {
+    const entry = this.notifyDeliveries.get(key)
+    if (entry === undefined) return
+    const manager = this.managerPump?.manager
+    if (isFatalSendError(errorKind)) {
+      // A terminally rejected notification is acked (retrying cannot help); a
+      // forbidden/not_found chat additionally loses its subscriptions (§7 —
+      // the dead-target cleanup without a registry).
+      this.notifyDeliveries.delete(key)
+      this.notifyTimers.clear(key)
+      manager?.ack(entry.id)
+      if (errorKind === 'forbidden' || errorKind === 'not_found') {
+        manager?.unwatch(this.sessionIdFor(entry.chatKey))
+        // Every subscription of the chat is gone, so its explicit-/unwatch
+        // suppressions are stale too — a returning user starts clean.
+        this.unwatchedSessions.delete(entry.chatKey)
+        this.warn(`notification target for chat ${entry.chatKey} is unreachable (${errorKind}); unwatched`)
+      }
+      return
+    }
+    // Transient give-up: stay un-acked and retry later (at-least-once in-process).
+    this.notifyTimers.arm(key, Date.now() + NOTIFY_RETRY_MS, () => this.retryNotifyDelivery(key))
+  }
+
+  private onNotifyBackpressure(key: string): void {
+    if (!this.notifyDeliveries.has(key)) return
+    this.notifyTimers.arm(key, Date.now() + NOTIFY_BACKPRESSURE_RETRY_MS, () => this.retryNotifyDelivery(key))
+  }
+
+  private retryNotifyDelivery(key: string): void {
+    const entry = this.notifyDeliveries.get(key)
+    if (entry === undefined) return
+    this.enqueueDelivery(entry.chatKey, { key, value: { chatKey: entry.chatKey, markdown: entry.markdown, ledger: true } })
+  }
+
+  /** `[#2 docs sync] ` — the badge for a watched-but-not-focused session (§6.4). */
+  private async notificationBadge(chatKey: string, sessionId: string): Promise<string> {
+    const number = this.assignSessionNumber(chatKey, sessionId)
+    let title = this.titleCache.get(sessionId)
+    if (title === undefined) {
+      const manager = this.managerPump?.manager
+      if (manager !== undefined) {
+        try {
+          const detail = await manager.describe(sessionId)
+          title = detail.title ?? detail.label ?? (detail.cwd !== undefined ? pathLabel(detail.cwd) : undefined)
+        } catch {
+          // The badge degrades to the number alone.
+        }
+      }
+      if (title !== undefined) this.titleCache.set(sessionId, title)
+    }
+    return `${sessionBadge({ number, ...(title !== undefined ? { title } : {}), sessionId })} `
+  }
+
+  /** Per-chat list numbering: existing numbers are stable; new sessions append. */
+  private assignSessionNumber(chatKey: string, sessionId: string): number {
+    const numbers = { ...(this.sessionNumbers.get(chatKey) ?? {}) }
+    const existing = numbers[sessionId]
+    if (existing !== undefined) return existing
+    const next = Object.values(numbers).reduce((max, value) => Math.max(max, value), 0) + 1
+    numbers[sessionId] = next
+    this.sessionNumbers.set(chatKey, numbers)
+    return next
+  }
+
+  /**
+   * Resolve a `/ls` inline-keyboard tap (providers with supportsChoices call
+   * this from their callback handler). Adopt + focus; a foreign unmanaged
+   * session is refused with `foreign` (the provider replies with the same
+   * --take confirmation as /use — a button tap must not bypass it, §6.3), and
+   * a broken or vanished session reports `unavailable`.
+   */
+  protected async applyFocusChoice(sessionId: string, chatKey: string): Promise<'focused' | 'unavailable' | 'foreign'> {
+    const manager = this.ensureManagerPump()
+    if (manager === undefined) return 'unavailable'
+    try {
+      await manager.ready()
+      // §6.3: single-writer ownership blocks concurrent writes, but not the
+      // "should not adopt" intent problem — the keyboard is no shortcut around
+      // the foreign-session confirmation /use enforces.
+      const view = await this.findView(manager, sessionId)
+      if (view !== undefined && view.foreign && !view.managed) return 'foreign'
+      await manager.adopt(sessionId, this.sessionIdFor(chatKey), {
+        createIfMissing: false,
+        ...this.managerAgentDefaults(),
+        setup: this.managerSetup(),
+      })
+    } catch (error) {
+      this.warn(`focus choice ${sessionId} failed: ${error instanceof Error ? error.message : String(error)}`)
+      return 'unavailable'
+    }
+    this.setFocus(chatKey, sessionId)
+    manager.watch(this.sessionIdFor(chatKey), sessionId)
+    return 'focused'
+  }
+
+  // ---- manager commands (§6.2) ----
+
+  private async handleManagerCommand(manager: SessionManager, commandText: string, chatKey: string, context?: CommandContext): Promise<void> {
+    const parsed = parseManagerCommand(commandText)
+    try {
+      await manager.ready()
+      switch (parsed.kind) {
+        case 'help':
+          this.sendLocal(chatKey, MANAGER_HELP_TEXT)
+          return
+        case 'list-sessions':
+          await this.execListSessions(manager, chatKey, parsed.workspace)
+          return
+        case 'list-workspaces':
+          this.execListWorkspaces(manager, chatKey)
+          return
+        case 'use':
+          await this.execUse(manager, chatKey, parsed.target, parsed.take)
+          return
+        case 'new':
+          await this.execNew(manager, chatKey, parsed.target, parsed.text, context)
+          return
+        case 'to':
+          await this.execTo(manager, chatKey, parsed.target, parsed.text, parsed.take, context)
+          return
+        case 'status':
+          await this.execStatus(manager, chatKey, parsed.target)
+          return
+        case 'tail':
+          await this.execTail(manager, chatKey, parsed.target)
+          return
+        case 'stop':
+          await this.execStop(manager, chatKey, parsed.target)
+          return
+        case 'watch':
+          await this.execWatch(manager, chatKey, parsed.target)
+          return
+        case 'unwatch':
+          await this.execUnwatch(manager, chatKey, parsed.target)
+          return
+        case 'bind':
+          await this.execBind(manager, chatKey, parsed.sessionId, parsed.take)
+          return
+        case 'unknown':
+          this.sendLocal(chatKey, `Unknown command: ${parsed.command}. Use /help for help.`)
+          return
+      }
+    } catch (error) {
+      this.sendLocal(chatKey, `⚠️ ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  private resolveCommandTarget(chatKey: string, target?: string): { sessionId?: string; error?: string } {
+    if (target === undefined) return { sessionId: this.focusedSessionOf(chatKey) }
+    const resolution = resolveSessionTarget(target, this.sessionNumbers.get(chatKey) ?? {})
+    if (resolution.kind === 'unknown-number') return { error: renderUnknownNumber(target) }
+    return { sessionId: resolution.sessionId }
+  }
+
+  private async findView(manager: SessionManager, sessionId: string): Promise<SessionView | undefined> {
+    const views = await manager.list()
+    const view = views.find((candidate) => candidate.sessionId === sessionId)
+    if (view !== undefined) this.rememberViewTitles(view)
+    return view
+  }
+
+  private rememberViewTitles(view: SessionView): void {
+    const title = view.title ?? view.label ?? (view.cwd !== undefined ? pathLabel(view.cwd) : undefined)
+    if (title !== undefined) this.titleCache.set(view.sessionId, title)
+  }
+
+  private toListRow(view: SessionView, focusedSessionId: string): SessionListRow {
+    return {
+      sessionId: view.sessionId,
+      ...(view.title !== undefined ? { title: view.title } : {}),
+      ...(view.label !== undefined ? { label: view.label } : {}),
+      ...(view.cwd !== undefined ? { cwd: view.cwd } : {}),
+      ...(view.workspaceId !== undefined ? { workspaceId: view.workspaceId } : {}),
+      running: view.running,
+      blank: view.blank,
+      managed: view.managed,
+      foreign: view.foreign,
+      ...(view.pendingInteraction !== undefined ? { pendingInteraction: view.pendingInteraction } : {}),
+      watchers: view.watchers,
+      updatedAt: view.updatedAt,
+      ...(view.activeTask !== undefined ? { activeTaskState: view.activeTask.state } : {}),
+      ...(view.lastReason !== undefined ? { lastReason: view.lastReason } : {}),
+      focused: view.sessionId === focusedSessionId,
+    }
+  }
+
+  private async execListSessions(manager: SessionManager, chatKey: string, workspace?: string): Promise<void> {
+    const views = await manager.list()
+    for (const view of views) this.rememberViewTitles(view)
+    const workspaceTitles: Record<string, string> = {}
+    for (const row of manager.workspaces()) workspaceTitles[row.id] = row.title
+
+    let filtered = views
+    if (workspace !== undefined) {
+      const workspaceId = this.resolveWorkspaceIdArg(manager, chatKey, workspace)
+      if (workspaceId === undefined) {
+        this.sendLocal(chatKey, `Unknown workspace: ${workspace} — run /ws to see them.`)
+        return
+      }
+      filtered = views.filter((view) => view.workspaceId === workspaceId)
+    }
+
+    const render = renderSessionList(filtered.map((view) => this.toListRow(view, this.focusedSessionOf(chatKey))), {
+      now: Date.now(),
+      workspaceTitles,
+      supportsChoices: this.channel.supportsChoices,
+      maxValueBytes: this.channel.presentationLimits.maxValueBytes,
+    })
+    this.sessionNumbers.set(chatKey, render.numbers)
+    this.sendLocal(chatKey, render.text, render.choices.length > 0 ? { choices: [...render.choices] } : {})
+  }
+
+  private execListWorkspaces(manager: SessionManager, chatKey: string): void {
+    const render = renderWorkspaceList(manager.workspaces())
+    this.workspaceNumbers.set(chatKey, render.numbers)
+    this.sendLocal(chatKey, render.text)
+  }
+
+  /** `/ls <arg>` / `/new <arg>` workspace resolution: number from the last /ws, title, id, or path. */
+  private resolveWorkspaceIdArg(manager: SessionManager, chatKey: string, arg: string): string | undefined {
+    const workspaces = manager.workspaces()
+    if (/^\d+$/.test(arg)) {
+      const wanted = Number(arg)
+      const numbers = this.workspaceNumbers.get(chatKey) ?? {}
+      const id = Object.keys(numbers).find((key) => numbers[key] === wanted)
+      if (id !== undefined && workspaces.some((workspace) => workspace.id === id)) return id
+      return undefined
+    }
+    const match = workspaces.find(
+      (workspace) => workspace.title.toLowerCase() === arg.toLowerCase() || workspace.id === arg || workspace.path === arg,
+    )
+    return match?.id
+  }
+
+  private async execUse(manager: SessionManager, chatKey: string, target: string, take: boolean): Promise<void> {
+    const resolved = this.resolveCommandTarget(chatKey, target)
+    if (resolved.error !== undefined || resolved.sessionId === undefined) {
+      this.sendLocal(chatKey, resolved.error ?? renderUnknownSession(target))
+      return
+    }
+    const sessionId = resolved.sessionId
+    const view = await this.findView(manager, sessionId)
+    if (view === undefined) {
+      this.sendLocal(chatKey, renderUnknownSession(sessionId))
+      return
+    }
+    if (view.foreign && !view.managed && !take) {
+      // §6.3: single-writer ownership blocks concurrent writes, but not the
+      // "should not adopt" intent problem — confirm before taking a foreign session.
+      this.sendLocal(chatKey, renderForeignConfirm(target))
+      return
+    }
+    await manager.adopt(sessionId, this.sessionIdFor(chatKey), {
+      createIfMissing: false,
+      ...this.managerAgentDefaults(),
+      setup: this.managerSetup(),
+    })
+    this.setFocus(chatKey, sessionId)
+    manager.watch(this.sessionIdFor(chatKey), sessionId)
+    const number = this.assignSessionNumber(chatKey, sessionId)
+    const workspaceTitle = view.workspaceId !== undefined ? manager.workspaces().find((workspace) => workspace.id === view.workspaceId)?.title : undefined
+    this.sendLocal(
+      chatKey,
+      renderFocusReply({
+        number,
+        ...(view.title !== undefined ? { title: view.title } : {}),
+        sessionId,
+        ...(workspaceTitle !== undefined ? { workspaceTitle } : {}),
+      }),
+    )
+  }
+
+  private async execNew(manager: SessionManager, chatKey: string, target?: string, text?: string, context?: CommandContext): Promise<void> {
+    let cwd: string | undefined
+    let workspaceId: string | undefined
+    let firstText = text
+    if (target !== undefined) {
+      if (/^(?:\/|\.\/|\.\.\/|~)/.test(target)) {
+        cwd = expandHome(target)
+      } else {
+        const resolvedWorkspace = this.resolveWorkspaceIdArg(manager, chatKey, target)
+        const workspace = resolvedWorkspace !== undefined ? manager.workspaces().find((candidate) => candidate.id === resolvedWorkspace) : undefined
+        if (workspace !== undefined) {
+          workspaceId = workspace.id
+          cwd = workspace.path
+        } else {
+          // Not a workspace: the "target" was the first word of the message.
+          firstText = firstText === undefined ? target : `${target} ${firstText}`
+        }
+      }
+    }
+
+    const row = await manager.create({
+      ...(cwd !== undefined ? { cwd } : {}),
+      ...(workspaceId !== undefined ? { workspaceId } : {}),
+      by: this.sessionIdFor(chatKey),
+      agentOptions: this.managerAgentDefaults().agentOptions,
+      ...(this.config.agentPreset !== undefined ? { agentPreset: this.config.agentPreset } : {}),
+      setup: this.managerSetup(),
+    })
+    this.setFocus(chatKey, row.sessionId)
+    manager.watch(this.sessionIdFor(chatKey), row.sessionId)
+    const number = this.assignSessionNumber(chatKey, row.sessionId)
+    if (row.label !== undefined) this.titleCache.set(row.sessionId, row.label)
+    this.sendLocal(chatKey, renderNewReply({ number, ...(row.label !== undefined ? { title: row.label } : {}), sessionId: row.sessionId, ...(row.cwd !== undefined ? { cwd: row.cwd } : {}) }))
+
+    if (firstText !== undefined && firstText.trim() !== '') {
+      await manager.dispatch({
+        sessionId: row.sessionId,
+        message: this.buildUserMessage(chatKey, firstText, context?.messageIds ?? [], context?.senderId ?? '0', []),
+        by: this.sessionIdFor(chatKey),
+        watch: true,
+      })
+    }
+  }
+
+  private async execTo(manager: SessionManager, chatKey: string, target: string, text: string, take: boolean, context?: CommandContext): Promise<void> {
+    const resolved = this.resolveCommandTarget(chatKey, target)
+    if (resolved.error !== undefined || resolved.sessionId === undefined) {
+      this.sendLocal(chatKey, resolved.error ?? renderUnknownSession(target))
+      return
+    }
+    const sessionId = resolved.sessionId
+    const view = await this.findView(manager, sessionId)
+    if (view === undefined) {
+      this.sendLocal(chatKey, renderUnknownSession(sessionId))
+      return
+    }
+    if (view.foreign && !view.managed && !take) {
+      // §6.3: single-writer ownership blocks concurrent writes, but not the
+      // "should not adopt" intent problem — confirm before taking a foreign session.
+      this.sendLocal(chatKey, renderForeignConfirm(target))
+      return
+    }
+    await manager.adopt(sessionId, this.sessionIdFor(chatKey), {
+      createIfMissing: false,
+      ...this.managerAgentDefaults(),
+      setup: this.managerSetup(),
+    })
+    manager.watch(this.sessionIdFor(chatKey), sessionId)
+    const task = await manager.dispatch({
+      sessionId,
+      message: this.buildUserMessage(chatKey, text, context?.messageIds ?? [], context?.senderId ?? '0', []),
+      by: this.sessionIdFor(chatKey),
+      watch: true,
+    })
+    const number = this.assignSessionNumber(chatKey, sessionId)
+    this.sendLocal(chatKey, renderDispatchReply({ number, ...(view.title !== undefined ? { title: view.title } : {}), sessionId, mode: task.mode }))
+  }
+
+  private async execStatus(manager: SessionManager, chatKey: string, target?: string): Promise<void> {
+    const resolved = this.resolveCommandTarget(chatKey, target)
+    if (resolved.error !== undefined || resolved.sessionId === undefined) {
+      this.sendLocal(chatKey, resolved.error ?? renderUnknownSession(target ?? ''))
+      return
+    }
+    const sessionId = resolved.sessionId
+    if ((await this.findView(manager, sessionId)) === undefined) {
+      this.sendLocal(chatKey, renderUnknownSession(sessionId))
+      return
+    }
+    const detail = await manager.describe(sessionId)
+    this.sendLocal(
+      chatKey,
+      renderSessionStatus({
+        sessionId,
+        ...(this.sessionNumbers.get(chatKey)?.[sessionId] !== undefined ? { number: this.sessionNumbers.get(chatKey)![sessionId] } : {}),
+        ...(detail.title !== undefined ? { title: detail.title } : {}),
+        ...(detail.cwd !== undefined ? { cwd: detail.cwd } : {}),
+        running: detail.running,
+        blank: detail.blank,
+        ...(detail.pendingInteraction !== undefined ? { pendingInteraction: detail.pendingInteraction } : {}),
+        ...(detail.queued !== undefined ? { queued: detail.queued } : {}),
+        ...(detail.currentTool !== undefined ? { currentTool: detail.currentTool } : {}),
+        ...(detail.lastAssistantText !== undefined ? { lastAssistantText: detail.lastAssistantText } : {}),
+        ...(detail.lastError !== undefined ? { lastError: detail.lastError } : {}),
+        ...(detail.todos !== undefined ? { todos: detail.todos as ReadonlyArray<{ content?: string; status?: string }> } : {}),
+        watchers: detail.watchers,
+        ...(detail.lastReason !== undefined ? { lastReason: detail.lastReason } : {}),
+        updatedAt: detail.updatedAt,
+        now: Date.now(),
+      }),
+    )
+  }
+
+  private async execTail(manager: SessionManager, chatKey: string, target?: string): Promise<void> {
+    const resolved = this.resolveCommandTarget(chatKey, target)
+    if (resolved.error !== undefined || resolved.sessionId === undefined) {
+      this.sendLocal(chatKey, resolved.error ?? renderUnknownSession(target ?? ''))
+      return
+    }
+    const detail = await manager.describe(resolved.sessionId)
+    this.sendLocal(chatKey, renderTailReply(detail.lastAssistantText))
+  }
+
+  private async execStop(manager: SessionManager, chatKey: string, target?: string): Promise<void> {
+    const resolved = this.resolveCommandTarget(chatKey, target)
+    if (resolved.error !== undefined || resolved.sessionId === undefined) {
+      this.sendLocal(chatKey, resolved.error ?? renderUnknownSession(target ?? ''))
+      return
+    }
+    const sessionId = resolved.sessionId
+    const view = await this.findView(manager, sessionId)
+    await manager.cancel(sessionId, `stopped from a ${this.channel.id} chat`)
+    const number = this.assignSessionNumber(chatKey, sessionId)
+    this.sendLocal(
+      chatKey,
+      renderStopReply({ number, ...(view?.title !== undefined ? { title: view.title } : {}), sessionId, wasRunning: view?.running ?? false }),
+    )
+  }
+
+  private async execWatch(manager: SessionManager, chatKey: string, target: string): Promise<void> {
+    const resolved = this.resolveCommandTarget(chatKey, target)
+    if (resolved.error !== undefined || resolved.sessionId === undefined) {
+      this.sendLocal(chatKey, resolved.error ?? renderUnknownSession(target))
+      return
+    }
+    manager.watch(this.sessionIdFor(chatKey), resolved.sessionId)
+    // An explicit /watch also re-arms the dispatch-time subscription.
+    this.unwatchedSessions.get(chatKey)?.delete(resolved.sessionId)
+    const number = this.assignSessionNumber(chatKey, resolved.sessionId)
+    this.sendLocal(chatKey, renderWatchReply({ number, ...(this.titleCache.get(resolved.sessionId) !== undefined ? { title: this.titleCache.get(resolved.sessionId) } : {}), sessionId: resolved.sessionId }))
+  }
+
+  private async execUnwatch(manager: SessionManager, chatKey: string, target?: string): Promise<void> {
+    const resolved = this.resolveCommandTarget(chatKey, target)
+    if (resolved.error !== undefined || resolved.sessionId === undefined) {
+      this.sendLocal(chatKey, resolved.error ?? renderUnknownSession(target ?? ''))
+      return
+    }
+    manager.unwatch(this.sessionIdFor(chatKey), resolved.sessionId)
+    // Remember the explicit opt-out: the next free-text dispatch must not
+    // silently re-subscribe this session with its watch:true.
+    const unwatched = this.unwatchedSessions.get(chatKey) ?? new Set<string>()
+    unwatched.add(resolved.sessionId)
+    this.unwatchedSessions.set(chatKey, unwatched)
+    this.sendLocal(chatKey, renderUnwatchReply({ ...(this.sessionNumbers.get(chatKey)?.[resolved.sessionId] !== undefined ? { number: this.sessionNumbers.get(chatKey)![resolved.sessionId] } : {}), sessionId: resolved.sessionId }))
+  }
+
+  private async execBind(manager: SessionManager, chatKey: string, sessionId: string, take: boolean): Promise<void> {
+    const view = await this.findView(manager, sessionId)
+    if (view !== undefined && view.foreign && !view.managed && !take) {
+      this.sendLocal(chatKey, renderForeignConfirm(sessionId))
+      return
+    }
+    await manager.adopt(sessionId, this.sessionIdFor(chatKey), {
+      createIfMissing: false,
+      ...this.managerAgentDefaults(),
+      setup: this.managerSetup(),
+    })
+    this.setFocus(chatKey, sessionId)
+    manager.watch(this.sessionIdFor(chatKey), sessionId)
+    const number = this.assignSessionNumber(chatKey, sessionId)
+    this.sendLocal(chatKey, renderFocusReply({ number, ...(view?.title !== undefined ? { title: view.title } : {}), sessionId }))
   }
 
   // ---- outbound (session events → frames) ----
@@ -1223,10 +2017,12 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
           break
         case 'give-up':
           this.store.markFailed(effect.item.key, effect.error, effect.errorKind)
+          this.onNotifyGiveUp(effect.item.key, effect.errorKind)
           break
         case 'reject-backpressure':
           // Distinguishable in the ledger: backpressure is retryable, not terminal.
           this.store.markFailed(effect.item.key, 'delivery queue full (backpressure)', 'transient')
+          this.onNotifyBackpressure(effect.item.key)
           break
       }
     }
@@ -1249,6 +2045,7 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
         ...this.accountQualifier,
         chatKey: item.value.chatKey,
         markdown: item.value.markdown,
+        ...(item.value.choices !== undefined ? { choices: item.value.choices } : {}),
         deliveryKey: item.key,
         origin: item.value.origin,
         silent: item.value.silent ? true : undefined,
@@ -1277,6 +2074,9 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
     errorKind?: SendErrorKind,
     retryAfterMs?: number,
   ): void {
+    // A manager notification is acked the moment its delivery settles sent —
+    // a crash between here and the ack re-delivers once from the outbox (D3).
+    if (outcome === 'sent' || outcome === 'suppressed') this.onNotifyDelivered(key)
     this.feedDeliverQueue(chatKey, { kind: 'attempt-result', key, outcome, error, errorKind, retryAfterMs, now: Date.now() })
   }
 
@@ -1285,21 +2085,42 @@ export abstract class ChannelBridge<TCfg extends BridgeConfig> {
    * chatKey's serial worker with real answers, so a `⏹ Turn ended` line can no
    * longer slip between two chunks of the answer it follows. Not ledger-tracked:
    * these are local notices, not agent output, so the ledger marks are no-ops.
+   * Optional choices (the `/ls` inline keyboard) ride the LAST chunk.
    */
-  protected sendLocal(chatKey: string, markdown: string, opts: { silent?: boolean } = {}): void {
+  protected sendLocal(chatKey: string, markdown: string, opts: { silent?: boolean; choices?: readonly OutboundChoice[] } = {}): void {
     const chunks = this.renderChunks(markdown)
     const seq = ++this.localSeq
     for (let i = 0; i < chunks.length; i++) {
+      const isLast = i === chunks.length - 1
       this.enqueueDelivery(chatKey, {
         key: `local:${chatKey}:${seq}:${i}`,
-        value: { chatKey, markdown: chunks[i]!, silent: opts.silent },
+        value: {
+          chatKey,
+          markdown: chunks[i]!,
+          silent: opts.silent,
+          ...(isLast && opts.choices !== undefined && opts.choices.length > 0 ? { choices: opts.choices } : {}),
+        },
       })
     }
   }
 
   // ---- commands ----
 
-  protected async handleCommand(commandText: string, chatKey: string): Promise<void> {
+  /**
+   * Slash-command entry. With `ctx.sessionManager` present this is the full
+   * manager table (§6.2); without one the behavior is byte-for-byte the
+   * historical command set (D4 — the manager's presence is the only switch;
+   * the legacy path ignores `context`). `context` attributes the user message
+   * a dispatching command (/to, /new <text>) injects to its inbound platform
+   * message (R7).
+   */
+  protected async handleCommand(commandText: string, chatKey: string, context?: CommandContext): Promise<void> {
+    const manager = this.ensureManagerPump()
+    if (manager !== undefined) {
+      await this.handleManagerCommand(manager, commandText, chatKey, context)
+      return
+    }
+
     const match = /^\/([^\s@]+)\s*(.*)$/.exec(commandText)
     const command = (match?.[1] ?? '').toLowerCase()
     const args = (match?.[2] ?? '').trim()
@@ -1378,4 +2199,18 @@ function withDeadline<T>(promise: Promise<T>, ms: number, what: string): Promise
       },
     )
   })
+}
+
+/** The RecoveryPolicy's honest-duplicate marker, reused for outbox re-delivery after a restart (§6.5). */
+const RESUMED_RESEND_MARKER = '(resumed resend, may duplicate)\n'
+/** Re-enqueue delay for a notification whose transient retries were exhausted in-process. */
+const NOTIFY_RETRY_MS = 60_000
+/** Re-enqueue delay for a notification rejected by deliver-queue backpressure. */
+const NOTIFY_BACKPRESSURE_RETRY_MS = 5_000
+
+/** Expand a leading `~` (path.resolve would treat it as a literal directory name). */
+function expandHome(path: string): string {
+  if (path === '~') return homedir()
+  if (path.startsWith('~/')) return join(homedir(), path.slice(2))
+  return path
 }

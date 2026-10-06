@@ -32,7 +32,7 @@ WORKSPACE="$REPO/agent-workspace"
 command -v pnpm >/dev/null || { echo "[dev-bot] pnpm is required (profiles are pnpm-managed)"; exit 1; }
 
 # Build once if any package has no lib/ yet (rebuilds after edits stay yours).
-for p in channel channel-kit channel-telegram; do
+for p in channel session-manager channel-kit channel-telegram; do
   if [ ! -d "$REPO/packages/$p/lib" ]; then
     (cd "$REPO" && npm run build)
     break
@@ -47,6 +47,7 @@ cat > "$PROFILE_DIR/package.json" <<EOF
   "private": true,
   "dependencies": {
     "dsh-channel": "file:$REPO/packages/channel",
+    "dsh-session-manager": "file:$REPO/packages/session-manager",
     "dsh-channel-kit": "file:$REPO/packages/channel-kit",
     "dsh-channel-telegram": "file:$REPO/packages/channel-telegram"
   },

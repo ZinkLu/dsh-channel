@@ -490,7 +490,9 @@ export class ChannelRegistry extends Service {
   }
 }
 
-export default ChannelRegistry
+// No `export default`: the 0.2 loader unwraps `exports.default` first, which
+// would turn this module into a class plugin and silently drop the named
+// `apply` above.
 
 function registryKey(id: string, accountId: string): string {
   return `${id}:${accountId}`

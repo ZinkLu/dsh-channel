@@ -4,15 +4,15 @@ This file provides guidance to coding agents when working with code in this repo
 
 ## What this repo is
 
-The message-channel layer for DeepSeek Harness (dsh, a Cordis 4.x plugin framework): a contract package, a shared handler/pure-function kit, and one provider package per platform (Telegram, WeChat, Feishu). npm workspaces monorepo, ESM, TypeScript `NodeNext`, tests on `node:test` via `tsx`. Pinned dsh baseline: `@deepseek-ai/dsh-*@0.2.0-rc.2`. **This repo never patches dsh core** — it only consumes these dsh touchpoints: `session/event`, `agent/assistant-stream`, `ctx.agents.create/resume`, the `approval/request` and `user-questions/request` waterfalls, and `ctx.credentials`.
+The message-channel layer for DeepSeek Harness (dsh, a Cordis 4.x plugin framework): a contract package, a channel-agnostic session manager, a shared handler/pure-function kit, and one provider package per platform (Telegram, WeChat, Feishu). npm workspaces monorepo, ESM, TypeScript `NodeNext`, tests on `node:test` via `tsx`. Pinned dsh baseline: `@deepseek-ai/dsh-*@0.2.0-rc.2`. **This repo never patches dsh core** — it only consumes these dsh touchpoints: `session/event`, `agent/status`, `agent/assistant-stream`, `ctx.agents.create/resume`, the `approval/request` and `user-questions/request` waterfalls, and `ctx.credentials` (plus, all optional and duck-typed through `ctx.get`, `sessionQuery`/`workspaceRegistry`/`agentPresets`/`sessionProjections`/`sessionPersistence`/`storageDomain`/`tools`).
 
-`dsh-channel-design.md` is the single design source (R1–R10 hard constraints in §6, off-track signals in Appendix B). Read the relevant section before changing a contract or mechanism.
+`dsh-channel-design.md` is the single design source (R1–R10 hard constraints in §6, the session-manager layer in §14, off-track signals in Appendix B). Read the relevant section before changing a contract or mechanism.
 
 ## Commands
 
 ```bash
 npm install
-npm run build                      # all five packages → packages/*/lib, in dependency order
+npm run build                      # all six packages → packages/*/lib, in dependency order
 npm run test                       # build, then test every workspace
 npm run typecheck                  # build, then tsc --noEmit every workspace
 
@@ -26,8 +26,8 @@ cd packages/channel-kit && npx tsx --test --test-name-pattern='iron rules' test/
 
 Build/test ordering matters because cross-package imports resolve through `node_modules` symlinks to each package's **built `lib/`**, not `src/`:
 
-- `dsh-channel-kit` and `dsh-channel` tests import `../src/*.ts` directly — no build needed.
-- Provider tests (`telegram`/`wechat`/`feishu`) have a `pretest` that rebuilds only *that* provider. After editing `channel` or `channel-kit`, rebuild those first (or run root `npm run build`) or the provider tests run against stale `lib/`.
+- `dsh-channel-kit` and `dsh-channel` tests import `../src/*.ts` directly — no build needed. `dsh-session-manager` tests import `../src/index.ts` directly too, and the kit's `bridge-manager.test.ts` imports the built `dsh-session-manager` `lib/` (its `pretest` rebuilds that package).
+- Provider tests (`telegram`/`wechat`/`feishu`) have a `pretest` that rebuilds only *that* provider. After editing `channel`, `session-manager`, or `channel-kit`, rebuild those first (or run root `npm run build`) or the provider tests run against stale `lib/`.
 - Root `build` lists packages explicitly because `--workspaces` walks alphabetically and would build `channel-feishu` before `channel-kit`.
 
 Local debugging (see README for details):
@@ -49,6 +49,10 @@ dsh-channel (contract, zero implementation)
 dsh-channel-kit (config/ + format/ → policy/ → bridge/ ; plus testing/)
    ▲
 dsh-channel-telegram / -wechat / -feishu (transport only)
+
+dsh-session-manager (ctx.sessionManager; depends on NO channel package)
+   ▲ (optional peer, type-only)
+dsh-channel-kit bridge (ctx.get('sessionManager') upstream)
 ```
 
 Cross-package deps among dsh packages are `peerDependencies` (+ `devDependencies` for tests); `dependencies` is reserved for third parties.
@@ -57,17 +61,27 @@ Cross-package deps among dsh packages are `peerDependencies` (+ `devDependencies
 
 `declare module` for `ctx.channels` + `channel/message` (emit) / `channel/deliver` (waterfall) / `channel/status` (emit); `ChannelRegistry` (a Service, mirrors `LlmRuntime`); `abstract class Channel` (a *plain* abstract class mirroring `LlmAdapter` — deliberately **not** a Service, since many platforms coexist under one ctx key). Platform differences are expressed only as `get` capability facts with conservative defaults (`formatTier`, `streamingMode`, `supportsChoices/Edit/Typing/Media/Reply/Threads/Silent/Reconciliation`, …) plus the small required surface. A method only one platform can implement must never land on `Channel`. Registry keys are `(id, accountId)`; `bindChatKey`/`chatKeyOf` expose sessionId → chat binding for proactive push.
 
+### `packages/session-manager` — `ctx.sessionManager` (channel-agnostic)
+
+The layer that turns "one chat ↔ one session" into "any subscriber ↔ every session of this process" (design §14). `SessionManager extends Service` (R5, core-style singleton like `ChannelRegistry`), provided under `sessionManager`; it imports **no** channel package (D1/R3). `inject = ['agents','sessions']`; everything else (`sessionQuery`/`workspaceRegistry`/`agentPresets`/`sessionProjections`/`sessionPersistence`/`storageDomain`/`tools`) is optional and duck-typed through `ctx.get`, so it degrades instead of failing.
+
+- **Registry/dispatch:** `list`/`describe`/`workspaces` fold `ctx.agents` live state ⊕ cold `sessionQuery` records ⊕ the four store tables ⊕ projection titles. `create`/`adopt`/`dispatch`/`cancel` own the resume-before-create + preset-mount flow the bridge used to. `dispatch(mode:'auto')` = idle→`followup`, running→`steer`.
+- **Tasks fold from the log (R7):** a dispatch records `{taskId, sessionId, watermark = session.seq}`; the first `turn/start` with `seq ≥ watermark` owns the task, `turn/end(turn)` closes it (`crashed` = reason `interrupted`). The `tasks` table stores associations, not truth; a restart re-folds open tasks (crashed unless the live log shows the turn ended).
+- **Notifications:** the edge is `agent/status → 'idle'`, NOT `turn/end` (a followup chain pushes once). `watch`/`unwatch`/`subscribersOf`, a durable ack'd `outbox`, `notify(when:'now'|'done')`, `onNotification(prefix)`/`pending(prefix)`/`ack(id)`. The global `notify_user` tool (`execute → notify(agent.id, …)`) registers on the plugin ctx and re-registers per agent in `setup()` (preset-restriction fallback).
+- **Store:** `ManagerStore` interface + `createMemoryManagerStore` (tests) + `createJsonFileManagerStore` (tmp+rename atomic, the default) + `openDomainManagerStore` (`ctx.storageDomain`, the shared `$DSH_HOME/storages` composition). The store is a handoff cache; only outbox `pending` rows carry real at-least-once semantics.
+- **Two emit-only events** (`manager/notification`, `manager/task`) for observers/policy plugins (R4). Approval/question observation is a pure pass-through that always `next()`s (R8).
+
 ### `packages/channel-kit` — the shared handler
 
 - `config/` — the schemastery fragments (`agentRoutingSchema`/`channelBehaviorSchema`/`allowedUserIdsSchema` + `AgentRoutingConfig`/`ChannelBehaviorConfig`) every provider composes its `Config` from; `BridgeConfig` is derived from these types so handler and schema can't drift.
 - `format/` — leaf text/transport shaping, no decisions, no state (`chunkText`, `renderForTier`, `promptHint`, `assertMediaWithinLimit`, `proxiedFetch`).
-- `policy/` — decision logic as **pure reducers** `(state, input) → { state, effects }` (`mergeReduce`, `route`, `deliverQueueReduce`, `streamReduce`, `draftThrottleReduce`, `outboundEchoReduce`, recovery/finalization/busy/approval-render/prompt-render/tool-display) and the two policy *seams* with defaults: `PresentationPolicy` and `RecoveryPolicy`. Policies hold no state; state lives in the bridge.
+- `policy/` — decision logic as **pure reducers** `(state, input) → { state, effects }` (`mergeReduce`, `route`, `deliverQueueReduce`, `streamReduce`, `draftThrottleReduce`, `outboundEchoReduce`, recovery/finalization/busy/approval-render/prompt-render/tool-display) and the two policy *seams* with defaults: `PresentationPolicy` and `RecoveryPolicy`. The manager surface joins these as pure functions: `router.ts` grew the tri-state resolver chain (`focusResolver`/`conventionResolver`, `null`=reject/`undefined`=pass, `provenance` on hits), `manager-commands.ts` parses/renders the `/ls /use /new /to /status /tail /stop /watch /unwatch /ws /bind` table, `focus-presentation.ts` decides stream-vs-badge-vs-silent per `{isFocused, kind}`. Policies hold no state; state lives in the bridge.
 - `bridge/` — `ChannelBridge<TCfg>` (`bridge.ts`) owns all orchestration; `InteractionBroker` handles approvals + user-question prompts (shared `#n` numbering, timeouts, fail-closed); `KeyedTimers`/`sleepWithAbort` in `timing.ts` host every per-key timer; `ChannelStore` interface + `createMemoryStore` (tests) + `createJsonFileStore` (the only file that touches the filesystem).
 - `testing/` — `installChannelContractSuite` conformance battery every provider installs in `test/conformance.test.ts`; every `true` capability fact must come with a proof callback or the suite fails.
 
 Kit design rulings that are settled (backlog §3.2): the kit is **not** split into packages; there are no `MergePolicy`/`RoutePolicy`/`DeliveryPolicy`/… seams beyond presentation + recovery — abstract on the second real implementation, not before. New reducer-style mechanisms should reuse `KeyedTimers`.
 
-**The protected surface providers depend on must not change shape:** `handleInbound`, `mergeMessage`, `sendOutbound`, `sendLocal`, `resolveApproval`, `resolvePrompt`, `handleInboundChoice`, `draftMessageIds`, `chunkCountBy`, `showDraft`, `deleteDraft`, plus the abstract hooks `connect`/`disconnect`/`isAllowed`/`config`.
+**The protected surface providers depend on must not change shape:** `handleInbound`, `mergeMessage`, `sendOutbound`, `sendLocal`, `resolveApproval`, `resolvePrompt`, `handleInboundChoice`, `applyFocusChoice`, `draftMessageIds`, `chunkCountBy`, `showDraft`, `deleteDraft`, plus the abstract hooks `connect`/`disconnect`/`isAllowed`/`config`. Growth is additive only (the manager added `applyFocusChoice` and `sendLocal`'s optional `choices` field; nothing was re-shaped).
 
 ### Providers — what one actually implements
 
@@ -84,9 +98,10 @@ Bridge config comes from the plugin entry in the profile's `cordis.patch.yml` (t
 - **Startup recovery** (`restore()`) resumes every session a swept delivery key parses to (resume-only, never create), each under `resumeTimeoutMs`, and re-runs on every reconnect, skipping keys a live queue still owns.
 - **Session id grammar:** `channel:<id>:<chatKey>`, with `:<accountId>` inserted only for non-default accounts — single-account ids must stay byte-for-byte unchanged.
 - **Approval answerer** on `approval/request`: only answers for its own agents, always calls `next()` for non-owned agents and on timeout, never defaults to allow.
+- **Manager upstream (optional, D4):** with `ctx.sessionManager` present the bridge routes free text through `manager.adopt`/`dispatch` (focus = the chat's `bindings` entry), executes the `/ls…` command table, and pumps the manager outbox through the same serial deliver queue under ledger key `notify:<id>` (acked after a `sent` receipt; a crash between deliver and ack re-delivers once with the "(resumed resend)" marker; `forbidden`/`not_found` acks + `unwatch`). Approval/question prompts fan out to every `subscribersOf(sessionId, kind)` chat plus the focus chat — first answer wins. Only the focus session streams; watched sessions get badged result notifications. **Without the manager every path is byte-for-byte the classic behavior** (same command replies, same conventional session ids).
 
 ## Documentation conventions
 
-Exactly four living documents: `README.md` (bilingual EN/中文 — keep both halves in sync, including the test-count table), `dsh-channel-design.md`, `docs/dsh-core-reference.md` (0.2 core alignment), `docs/dsh-channel-backlog.md` (open questions / deferred work with triggers / rejected designs). Finished process documents live in git history, not the tree. Docs and code comments speak only about this repo's own design, implementation, and roadmap — do not name or cite external reference projects. When shipping a capability, update design §12/§13 and the README; when deferring or rejecting one, write it to the backlog with its trigger.
+Exactly four living documents: `README.md` (bilingual EN/中文 — keep both halves in sync, including the test-count table), `dsh-channel-design.md`, `docs/dsh-core-reference.md` (0.2 core alignment), `docs/dsh-channel-backlog.md` (open questions / deferred work with triggers / rejected designs). Finished process documents live in git history, not the tree. Docs and code comments speak only about this repo's own design, implementation, and roadmap — do not name or cite external reference projects. When shipping a capability, update design §12/§13/§14 and the README; when deferring or rejecting one, write it to the backlog with its trigger.
 
-Commit messages follow `type(scope): imperative summary` with scopes like `kit`, `channel`, `telegram`, `wechat`, `feishu`, `config`, `scripts`, `docs` (multi-scope as `fix(telegram,wechat): …`).
+Commit messages follow `type(scope): imperative summary` with scopes like `kit`, `channel`, `manager`, `telegram`, `wechat`, `feishu`, `config`, `scripts`, `docs` (multi-scope as `fix(telegram,wechat): …`).

@@ -644,6 +644,8 @@ Per T7's advice, **T7's interface-call checklist is listed in the first week of 
 | M7 ✅ | Capability hardening (§12): inbound media size cap, generic outbound retry/backpressure queue, `mentionsBot` fix, reaction-based ack; plus the configuration/settings seam (§11) | P0 hardening green; full suite (channel+kit+config+3 providers) passes |
 | M8–M10 ✅ | Capability reach: multi-account, reconciliation seam, reply/thread/silent delivery, pairing-login interface, outbound proxy | Contract additive only; A5 re-checked |
 | M11–M14 ✅ | Mechanism hardening + the `ChannelBridge` handler layer (§13); M14 audits M11–M13 against the tree | Conformance suite + capability proofs per provider; providers hold transport only |
+| M15–M17 ✅ | The session-manager layer (§14): `dsh-session-manager` (registry, task fold, outbox, `notify_user`), the bridge's manager upstream (focus pointer, command table, resolver provenance), and the notification pipeline | Manager suite green; conformance suite unchanged; without a manager the bridge is byte-identical |
+| M18 | Composition spikes V1–V5 (§14.8) on the dev bot; a `dsh-channel-host` session-only profile if V1 needs it | Browser-opened session → `notify_user` → Telegram delivery observed live |
 
 ---
 
@@ -864,6 +866,276 @@ path as the original send) and compares it against the `textHash` the ledger rec
 resends as before; a mismatch marks the entry `abandoned` with the reason in the ledger instead
 of delivering the wrong message. `markAbandoned` (store) is the terminal outlet — `markFailed`
 would be re-swept forever without ever burning an attempt.
+
+---
+
+## 14. The `dsh-session-manager` Layer (M15–M18)
+
+> Status: shipped (M15–M17); composition spikes V1–V5 (M18) run on the dev bot.
+> Origin: `docs/dsh-session-manager.md` proposal (folded into this chapter on adoption; §9/§10
+> of that proposal live in `docs/dsh-channel-backlog.md`).
+
+§1–§13 wire one IM chat to one agent session. That is enough to talk to a bot, but it cannot
+answer "which of my tasks are where?" (N1), "start/steer work on session X from here" (N2), or
+"call me back when the agent finishes" (N3) — because no object knows *which sessions this
+process has, what each is doing, and who is waiting on whom*. The missing layer is a
+channel-agnostic dsh service, not a channel feature.
+
+### 14.1 The one-line design
+
+**Replace the "IM ↔ one session" glue with "IM ↔ `ctx.sessionManager` ↔ every session in this
+process."** The manager registers each session this process creates or adopts (with its
+workspace/cwd), models one dispatch as a **log-foldable Task**, models "tell the user" as a
+**durable ack'd outbox**, and exposes a global `notify_user` tool to every agent. The channel
+bridge stops calling `ensureAgent` itself: it treats a chat's `bindings` entry as a **focus
+pointer**, sends free text to the focused session, routes slash commands to the manager, and
+lands outbox notifications through its **existing serial queue + delivery ledger**. With no
+manager present, bridge behavior is byte-for-byte the §13 behavior.
+
+Four rulings (D1–D4) are load-bearing and settled:
+
+- **D1 — the manager is a dsh service, not part of a channel.** It peer-depends on
+  `agents`/`sessions` (required) and duck-types `sessionQuery`/`workspaceRegistry`/`agentPresets`/
+  `sessionProjections`/`sessionPersistence`/`storageDomain`/`tools` through `ctx.get` (all
+  optional, graceful absence). It imports **no** channel package. Web UI, CLI, or any channel can
+  consume it; the channel bridge is just its first consumer (R3 holds: the manager's deps name no
+  provider).
+- **D2 — the control plane is deterministic commands + reducers, not an LLM.** List/switch/
+  dispatch/stop are testable, zero-latency, token-free: slash commands + stable numbering
+  (Telegram adds an inline keyboard). A natural-language "concierge" agent is v2 (backlog), and
+  its tools would sit on this same `ctx.sessionManager` API — the layers do not conflict.
+- **D3 — notifications ride the bridge's queue and ledger, never `ctx.channels.deliver()`
+  directly.** The manager holds the outbox (durable, ack'd) and **does not know what a chat is**;
+  the bridge subscribes as `subscriberKey = channel:<id>[:<account>]:<chatKey>`, delivers through
+  its serial queue under the ledger key `notify:<id>`, then `ack`s. A crash between deliver and
+  ack re-delivers once on restart with the "(resumed resend)" marker — the same honest
+  at-least-once principle as the delivery ledger.
+- **D4 — a chat's `bindings` entry IS its focus pointer; no binding falls back to the
+  conventional id.** No "mode switch" config: `ctx.get('sessionManager')` decides the upstream.
+  Zero-config start behaves exactly as §13 (single-session id bytes unchanged).
+
+Package layout (one new package; contract untouched, so A5 still holds):
+
+```
+dsh-channel            contract (unchanged)
+dsh-session-manager    NEW: ctx.sessionManager (Service) + notify_user tool + storage domain
+                       ← depends on no channel package
+dsh-channel-kit        bridge gains an optional manager upstream (ctx.get('sessionManager'));
+                       policy/ gains focus-presentation + manager-commands reducers;
+                       the router grows the tri-state resolver chain + provenance
+dsh-channel-*          providers: transport only (Telegram adds the focus: callback branch)
+```
+
+### 14.2 `dsh-session-manager` concepts and API
+
+| Concept | Definition | Persisted |
+|---|---|---|
+| **ManagedSession** | A session this process's manager created or explicitly adopted: `{sessionId, cwd, workspaceId?, label?, createdBy, createdAt, adoptedAt?}` | `sessions` table |
+| **Task** | One dispatch: `{taskId, sessionId, by, mode, summary, dispatchedAt, turn?, state, endedAt?, reason?}`; `state ∈ queued → running → done(reason) \| failed \| crashed`, **folded from that session's `turn/start`/`turn/end`** (`crashed` = reason `interrupted`). The table stores the taskId → (sessionId, turn) association, not the truth | `tasks` table |
+| **Subscription** | `{subscriberKey, sessionId, kinds: Set<'turn-end'\|'approval'\|'question'\|'notify'\|'error'>}` | `subscriptions` table |
+| **Notification** | Outbox row: `{id, subscriberKey, sessionId, kind, text, createdAt, state: 'pending'\|'acked'}`; `id` monotonic from a store-wide counter | `outbox` table |
+| **subscriberKey** | Opaque to the manager; the channel convention is `channel:<id>[:<account>]:<chatKey>`, a web UI could use `web:<clientId>` | — |
+
+```ts
+declare module '@deepseek-ai/cordis' {
+  interface Context { sessionManager: SessionManager }
+  interface Events {
+    'manager/notification'(n: ManagerNotification): void   // emit — observers/audit
+    'manager/task'(t: ManagerTask): void                     // emit — state transitions
+  }
+}
+
+class SessionManager extends Service {
+  list(opts?): Promise<SessionView[]>; describe(id): Promise<SessionDetail>; workspaces(): WorkspaceView[]
+  create(opts): Promise<ManagedSession>; adopt(id, by, opts?): Promise<ManagedSession>
+  dispatch(opts): Promise<ManagerTask>; cancel(id, cause?): Promise<void>
+  watch(subscriberKey, id, kinds?): () => void; unwatch(subscriberKey, id?): void
+  subscribersOf(id, kind?): string[]
+  notify(id, text, opts?): Promise<number>; onNotification(prefix, handler): () => void
+  pending(prefix): ManagerNotification[]; ack(id): void
+  ready(): Promise<void>   // resolves once start() opened the store + installed listeners
+}
+```
+
+Implementation invariants:
+
+- **`list()`** = `ctx.agents.list()` (live `status`) ⊕ `ctx.sessionQuery.listSessions()` (cold
+  records, header-level cwd/createdAt) ⊕ the local `sessions/tasks/subscriptions` tables ⊕
+  `sessionProjections.snapshot()` (title/todo, optional). Without `sessionQuery` it lists managed +
+  live only; a broken `sessionQuery` degrades rather than throwing.
+- **`create()`** owns the resume-before-create + `agentPresets.resolve` + in-`setup` `mount` flow
+  that used to live in the bridge's `ensureAgent` — moved wholesale. Manager-created sessions get
+  a **random id** (web-UI convention); the `channel:<id>:<chatKey>` grammar stays reserved for each
+  chat's default session (D4). Workspace grouping is by `header.cwd` (0.2 dropped `attachSession`).
+- **`adopt()`/`create()`** resolve existence through `sessionQuery.listSessions()` first
+  (`live` → `agents.get`; `persisted` → `resume`; neither → create only with `createIfMissing`),
+  falling back to `sessionPersistence.stat`, then to the legacy try-resume-then-create. A `resume`
+  that throws is a **real failure** (owned elsewhere, broken log) and propagates verbatim — never a
+  silent re-create. `withSessionLock` serializes ensure per session so two subscribers cannot
+  double-resume.
+- **`dispatch(mode:'auto')`** = the busy policy's day-one rule: idle → `followup` (an own turn),
+  running → `steer` (joins the open turn, closes with it). Before dispatch the manager records
+  `{taskId, sessionId, watermark = session.seq}`; the first `turn/start` with `seq ≥ watermark`
+  owns the task, and `turn/end(turn)` closes it. **A restart re-folds task state from the log
+  (R7)**; the table's terminal fields are a presentation cache. An open task across a restart
+  folds to `crashed` unless the live log shows its turn actually ended.
+- **The notification edge is `agent/status → 'idle'`, not `turn/end`.** Task closure uses
+  `turn/end` (it carries the reason), but the `turn-end` notification fires once per idle edge with
+  the last reason attached — so a followup-after-followup session pushes once, not per turn.
+  `notify(when:'done')` writes a deferred entry the idle edge flushes; `when:'now'` writes the
+  outbox rows immediately. A `turn/end` with reason `error` fans out an `error` notification
+  immediately (it should not wait for idle).
+- **Storage**: `ctx.storageDomain` → `defineDomain('session-manager', …)` sharing
+  `$DSH_HOME/storages`; else the JSON file fallback (`$DSH_HOME/session-manager/state.json`,
+  tmp+rename atomic writes mirroring the kit's ledger); else in-memory (tests). All four tables are
+  small — a whole-file rewrite per debounced flush. The store is a handoff cache, never the source
+  of truth (R7); the outbox's `pending` rows are the one exception with real at-least-once
+  semantics.
+
+### 14.3 The global `notify_user` tool
+
+```ts
+defineTool({
+  name: 'notify_user',
+  description: 'Send a short message to the user on their messaging app. when="done" delivers it once this session goes idle, with the outcome attached.',
+  parameters: { text: string, when?: 'now' | 'done' },
+  output: { schema: { delivered: number }, render: … },
+  execute: ({ text, when }, exec) => manager.notify(exec.agent.id, text, { when }),
+})
+```
+
+- Registered by the plugin on the **ordinary plugin ctx** → the global tool layer, visible to
+  every agent (including web-UI sessions) — the "main agent calls the user back" landing spot. As
+  the V2 fallback, the manager also re-registers it **per agent** inside its own `setup()`, so a
+  preset that restricts the global layer still leaves manager-composed sessions able to notify.
+- Target resolution: the session's watchers; **with no watcher it falls to `defaultSubscribers`**
+  (config, e.g. the user's own DM), so a browser-opened session can still reach IM. Junk input or a
+  missing agent fails closed to `{delivered: 0}` — never a phantom notification.
+- Trust level equals assistant output (it rides the same allowlisted chat); it adds no new
+  security surface.
+
+### 14.4 The bridge's manager upstream
+
+**Resolver chain (the backlog's "second resolver").** §4.3's convention branch becomes the tail of
+a tri-state chain (`policy/router.ts`): each resolver returns a hit (with `provenance`), `null`
+(explicit rejection — stops the chain, `route()` drops), or `undefined` (no opinion — next
+resolver). The default chain `[focusResolver, conventionResolver]` is byte-compatible with §13:
+`focus` = the chat's stored binding (`/use`, `/bind`, `/new` write it), `convention` = the
+historical per-chat id. A `SessionManager` consumer adds no resolver here — its session ids arrive
+through `/use`-written bindings; the chain is the seam where a stricter per-chat veto would plug in.
+
+**Bridge internals.** `ensureAgent` → `manager.create`/`adopt` + `dispatch`; no
+`ctx.get('sessionManager')` → the §13 path. The protected surface's shape holds
+(`handleInbound`/`mergeMessage`/`sendOutbound`/`sendLocal`/`resolveApproval`/`resolvePrompt`/
+`handleInboundChoice`/`draftMessageIds`/`chunkCountBy`/`showDraft`/`deleteDraft`, plus
+`connect`/`disconnect`/`isAllowed`/`config`), so providers stay transport-only; the manager added
+two entries, both additive rather than shape changes. `sendLocal` grew an optional `choices` field
+(the `/ls` inline keyboard rides the last chunk). And `applyFocusChoice(sessionId, chatKey)` —
+called by providers with `supportsChoices` from their callback handler — resolves a
+`focus:<sessionId>` tap: adopt + focus + watch, returning `'focused' | 'unavailable' | 'foreign'`.
+A `'foreign'` outcome means the session was not started by this host; the provider then replies
+with the takeover-confirmation warning (reply `/use <id> --take` to adopt) instead of a success
+message. The manager pump is registered lazily (`ensureManagerPump`) so plugin order is not a
+contract: the manager may mount after the bridge started, and both flip between the manager and
+conventional paths on `ctx.get`.
+
+**Command table** (`policy/manager-commands.ts`, pure parse + render):
+
+| Command | Effect |
+|---|---|
+| `/ls [ws]` | Sessions grouped by workspace, numbered `1..n` (stable per chat until the next `/ls`); glyphs `▶` running · `✓` done · `✗` crashed · `·` blank; `⏳approval`/`⏳question` suffix; `◀` marks focus |
+| `/use <n\|id> [--take]` | Set focus (writes the binding); free text then goes there. A `foreign && !managed` session confirms first (`--take` adopts) |
+| `/new [ws\|path] [text]` | `manager.create()` + focus + optional immediate dispatch |
+| `/to <n> <text>` | One-shot dispatch to `n`, focus unchanged, auto-watch |
+| `/status [n]` · `/tail [n]` · `/stop [n]` | `describe()` · last assistant text · `cancel()` |
+| `/watch <n>` · `/unwatch [n]` | Subscribe/unsubscribe the result notifications |
+| `/ws` | List workspaces (numbers feed `/new <ws>`) |
+| `/bind <id> [--take]` | `adopt` + focus (foreign confirms) |
+| `/start` · `/help` | Manager help when a manager is present; else the historical text |
+
+Telegram's `supportsChoices` adds an inline keyboard to `/ls` (`focus:<sessionId>` callbacks,
+beside the existing `appr:`/`prompt:`). The session `#n` and approval `#n` namespaces are distinct
+(approvals reply `#n`; sessions use `/use n`), so they never collide. **Without a manager the
+manager-only commands answer with the historical `Unknown command: …` reply** — the byte-identical
+guarantee.
+
+### 14.5 Outbound presentation: focus streams, watchers get results
+
+One chat watching several sessions cannot stream all of them without interleaving. The rule
+(`policy/focus-presentation.ts`, pure, input `{isFocused, kind}`):
+
+- **The focus session** behaves exactly as §13 (assistant text, tool status lines, drafts, typing).
+- **A watched-but-not-focused session** never streams; only manager notifications reach the chat
+  (turn-end summary = truncated last assistant text + reason, `notify_user`, errors), each badged
+  `[#2 docs sync]`.
+- **Neither focused nor watched** is silent.
+
+Approvals/questions are **broker** traffic, not outbox traffic: the broker's per-agent chat
+resolution became `chatKeysForAgent(agentId, kind)` = every `manager.subscribersOf(sessionId, kind)`
+chat on this bridge **plus** the focus chat. All of them get the prompt; the first answer wins (the
+broker resolves single-shot). While pending, the manager records `pendingInteraction`, so `/status`
+shows the one thing a remote user most needs to know.
+
+### 14.6 The notification pipeline
+
+```
+agent notify_user(text, when:'done')  →  manager deferred[session] += text
+session log turn/end {reason}          →  manager folds task → done(reason)
+agent/status → 'idle'                  →  outbox += {id, subscriberKey, text + last reason, pending}
+manager onNotification(n)              →  bridge enqueue(chatKey, ledger key notify:<id>)
+bridge deliver queue → chat            →  "[#1 fix merge window] ✅ completed · <text>"
+chat ok → bridge ack(id)
+   (crash between deliver and ack → restart pending() re-delivers once, "(resumed resend)" marker)
+```
+
+- **Kinds and defaults**: a `watch:true` dispatch (and `/watch`) subscribes all five kinds;
+  `defaultSubscribers` receive only `notify` and `error` (so every browser session's turn-end does
+  not buzz the phone).
+- **A focused session's turn-end notification is silently acked** (`resolveFocusPresentation` →
+  `silent`): the native stream already delivered the answer, so a summary would be a duplicate. The
+  ack keeps the outbox from re-delivering it forever.
+- **Recovery (§6.5 of the proposal)**: `recover()` first pulls `manager.pending(subscriberPrefix)`
+  and re-enqueues the un-acked rows under `notify:<id>` with the resumed-resend marker. These live
+  in the manager's outbox, not the channel ledger, so the session-keyed sweep never double-handles
+  them.
+- **Error feedback**: a delivery returning `forbidden`/chat-level `not_found` acks the row and
+  calls `unwatch(subscriberKey)` — the dead-target cleanup the backlog wanted, without a registry.
+  A transient give-up stays un-acked and retries on a timer (at-least-once in-process); backpressure
+  retries sooner.
+
+### 14.7 R1–R10 reconciliation
+
+| Rule | Landing |
+|---|---|
+| R1 reversible | The manager's listeners, tool registration, and pump all live in `ctx.effect`/disposers; `stop()` disposes owned handles and closes the store. The bridge's pump disposes on `stop()` |
+| R2 inject | Manager `inject = ['agents','sessions']`, the rest `ctx.get` degradation; the bridge's inject is unchanged, `sessionManager` optional |
+| R3 dependency direction | The manager depends on no channel package; the kit peer-depends on `dsh-session-manager` (optional); no provider appears in anyone's deps |
+| R4 contract | New events `manager/notification`/`manager/task` are emit-only; policy plugins purely observe |
+| R5 shape | `SessionManager extends Service` (core-style singleton, like `ChannelRegistry`) |
+| R6 capability facts | The `Channel` abstract class is unchanged — A5 still holds |
+| R7 log discipline | Task state folds from `turn/start`/`turn/end`; the tables store associations; notifications use a durable outbox, not memory |
+| R8 waterfall | The approval answerer still `next()`s for non-owned agents and on timeout; only "mine" changed from `sessionChatKeys` to `subscribersOf`. The manager's own approval/question observation is a pure pass-through that always `next()`s |
+| R9 YAML | The profile gains a `dsh-session-manager` row before the channel rows (see `cordis.patch.yml`) |
+| R10 scope | `notify_user` registers on the plugin ctx (global layer); the per-agent fallback registers in `setup(agentCtx)` |
+
+Backlog deltas: Q1 stays closed (0.2's `user-questions/request` is an agent-scoped waterfall, not
+a global slot); the "route()/resolver tri-state + provenance" item is **done** (the second resolver
+arrived); the "dead-target registry" stays rejected, now covered by `forbidden → unwatch`; the
+multi-process claim rejection stands (single-writer ownership in 0.2 blocks concurrent writes but
+not the "should not adopt" intent, which the foreign-confirm flow answers).
+
+### 14.8 Verification spikes (M18, run on the dev bot)
+
+The unit + integration suites are green with in-memory fakes; these five need a live composition
+and are the M18 exit:
+
+| # | Question | How to verify | Fallback if it fails |
+|---|---|---|---|
+| V1 | A channel agent's `ask_user_question` lands in Telegram, not the browser (agent-scope answerer vs root/web claim order) | Run the dev-bot composition: a channel-created session calls `ask_user_question`; watch whether it lands in Telegram or the browser | Ship a `dsh-channel-host` session-only profile (no web host), channel becomes the sole answerer |
+| V2 | The global `notify_user` is visible under the `standard` preset (`request/header.tools`) | Create a `standard`-preset session and inspect `request/header.tools` for `notify_user` | The per-agent `setup()` re-registration already covers manager-created sessions |
+| V3 | A root `session/event`/`agent/status` listener sees every session, incl. web-UI ones | Covered by the "a web-UI-created session appears in `/ls`" e2e (dsh-scope documents events flowing upward, so the risk is low) | Listen `agent/created` then per-agent on `agent.ctx` |
+| V4 | A manager-created random id + cwd lands in the right workspace; cwd normalization is lossy | Unit test plus one real `/new /other/path` on the dev bot | Group as "Ungrouped", record cwd only |
+| V5 | Two processes resuming one id: the second gets `SessionAlreadyOwnedError`, not a corrupt log | Two processes resume the same id; expect `SessionAlreadyOwnedError` on the second | The §14.4 foreign-confirm flow remains the honest answer |
 
 ---
 

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createJsonFileStore, createMemoryStore } from '../src/index.ts'
@@ -89,6 +89,36 @@ test('json file store persists and reloads', async () => {
     assert.equal(recoverable.length, 1)
     assert.equal(recoverable[0]!.state, 'failed')
     assert.equal(recoverable[0]!.errorKind, 'rate_limited')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('json file store recovers a failed write on the next flush instead of stalling', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-channel-kit-'))
+  const path = join(dir, 'state.json')
+  const store = createJsonFileStore(path)
+  try {
+    // Block the atomic rename: a non-empty directory sits where the state file
+    // belongs (created after open so load does not rename it aside as corrupt).
+    await mkdir(path)
+    await writeFile(join(path, 'blocker'), 'x', 'utf8')
+
+    store.markInbound('m1')
+    await assert.rejects(() => store.flush())
+
+    // Clearing the blockage alone must be enough: the failed snapshot was
+    // re-dirtied, so this flush retries it with no new mutation.
+    await rm(path, { recursive: true })
+    await store.flush()
+    const reloaded = createJsonFileStore(path)
+    assert.equal(reloaded.seenInbound('m1'), true)
+
+    // And later flushes keep working off the healed write chain.
+    store.setBinding('chat1', 's1')
+    await store.flush()
+    const reloaded2 = createJsonFileStore(path)
+    assert.deepEqual(reloaded2.bindings(), { chat1: 's1' })
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
