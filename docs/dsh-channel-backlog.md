@@ -77,7 +77,8 @@ None of these is a functional gap today; all seven wait on a concrete consumer.
 | **Scheduled / timed dispatch** | The manager holding its own timers to dispatch at a wall-clock time or after a delay (`dsh-schedule` is session-local, ≥300s, and does not adopt an existing agent) | A user asking for cron-style "run this every morning" |
 | **Per-workspace concierges** | Design §15 ships one concierge per process with a single cwd; per-workspace instances need an id grammar (`manager:concierge:<ws>`) plus a reachability story per workspace | One process genuinely serving multiple workspaces' users through the concierge |
 | **A dedicated `/agent` command** | Focus-switch shorthand for `manager:concierge` (today: `/bind manager:concierge`). One additive row in the kit's command table; zero pressure until then | User feedback that `/bind manager:concierge` is clunky |
-| **`ctx.jobs.onJobDone` → notification** | Wire the one dsh "completion callback" primitive into the outbox so a background job finishing pings the subscriber | Background jobs becoming a normal part of channel-driven work |
+| **Compose the official subagent stack for the concierge** | 0.2.1 ships `dsh-subagent` (`ctx.subagents`: named providers — `dsh-subagent-spawn-in-process`/`-fork`/`-acp` — plus `sendMessage` steering, interrupt authority, depth caps) and `dsh-tool-subagent` (the model-facing `subagent` tool: a delegated child returns its result INTO the parent's turn — a structural callback, no glue). Composing it under the concierge gives parent-child delegation alongside our sibling dispatch; `subagent/start`/`subagent/end` (scope-filtered) are the observation seam if badge notifications beyond the streamed parent turn are ever wanted. Survey 2026-10: no official tool manages EXISTING sessions (list/dispatch/cancel across the fleet) — that stays this repo's manager niche | Delegation-with-callback demand on a real channel deployment; first as a dev-bot spike (V8) |
+| **`ctx.jobs` settlement → notification** | dsh-jobs (`ctx.jobs` + `dsh-jobs-local`) is the official background-job registry: owner-fenced jobs, bounded output rings, `kill`/`wait`, and a `settled` event carrying whether a waiting caller already collected (`awaited` — a completion reporter can skip those). Wiring `settled && !awaited` into the manager outbox would ping the subscriber when a channel-started job finishes | Background jobs becoming a normal part of channel-driven work |
 
 ### 2.3 Session-manager layer debts
 
@@ -157,6 +158,12 @@ stated reason, not rediscovering the option.
 - **No LLM in the v1 control plane.** List/switch/dispatch/stop must be testable, instant, and
   token-free (D2). The concierge agent (design §15) is an additional layer on the same API, never a
   replacement for the deterministic one.
+- **No homegrown parent-child delegation machinery.** 0.2.1 ships an official subagent
+  capability seam (`dsh-subagent` + providers + `dsh-tool-subagent`) with activation
+  ownership, steering, interrupt authority, and depth control. This repo's manager stays
+  the **fleet** layer — sibling sessions, focus pointers, outbox notifications — and composes
+  the official stack for parent-child needs instead of reimplementing it (the same ruling
+  shape as "the contract never grows a one-platform method").
 - **No `answer_approval` / `answer_question` tool on the concierge.** Letting the model resolve a
   human checkpoint turns approval into a suggestion; the numbered-reply path already answers from
   any subscribed chat, and design §15's C4 subscriber copy keeps that path reachable for
