@@ -37,6 +37,20 @@ export type { SessionManagerConfig } from './config.js'
 export { notifyUserTool, NOTIFY_USER_DESCRIPTION } from './notify-tool.js'
 export type { NotifyToolHost, NotifyToolExec, NotifyUserToolDefinition } from './notify-tool.js'
 export {
+  CONCIERGE_SESSION_ID,
+  CONCIERGE_SECTION_NAME,
+  CONCIERGE_SECTION_ORDER,
+  DEFAULT_CONCIERGE_INSTRUCTIONS,
+  DEFAULT_CONCIERGE_LABEL,
+  conciergeSection,
+  reawakenText,
+  resolveConciergeConfig,
+} from './concierge.js'
+export type { ResolvedConciergeConfig } from './concierge.js'
+export { conciergeTools, CONCIERGE_TOOL_NAMES, resolveSessionRef } from './concierge-tools.js'
+export type { ConciergeToolDefinition, ConciergeToolExec, ConciergeToolHost } from './concierge-tools.js'
+export type { ConciergeConfig } from './config.js'
+export {
   createMemoryManagerStore,
   createTableState,
   bindTableOps,

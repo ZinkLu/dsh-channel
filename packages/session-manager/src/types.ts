@@ -42,6 +42,21 @@ declare module '@deepseek-ai/cordis' {
   }
 }
 
+// The manager's own message vocabulary (design §15): a dispatch authored by
+// this layer — the concierge toolset forwarding a model-written instruction,
+// or the wake glue's synthetic followup. `user` would misattribute
+// model-written text to a human; carrying no platform messageIds keeps it
+// invisible to the channel idempotency fold by construction.
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    manager: {
+      kind: 'manager'
+      /** Which manager path authored it: 'concierge-tool' | 'concierge-wake'. */
+      origin: 'concierge-tool' | 'concierge-wake'
+    }
+  }
+}
+
 /** Notification kinds a subscription can filter on. */
 export type NotificationKind = 'turn-end' | 'approval' | 'question' | 'notify' | 'error'
 
@@ -83,6 +98,13 @@ export interface ManagerTask {
   readonly endedAt?: number
   /** `turn/end.reason.kind` for a closed task; `'steered'` tasks close with their host turn. */
   readonly reason?: string
+  /**
+   * When the concierge glue delivered this task's re-awaken followup (design
+   * §15.4). A presentation-cache flag, never folded from the log — its only
+   * reader is the wake path (exactly-once in-process, at-least-once across
+   * restarts via the startup scan).
+   */
+  readonly wokeAt?: number
 }
 
 /** One subscriber's interest in one session. */

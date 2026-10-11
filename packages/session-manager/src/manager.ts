@@ -28,6 +28,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle, AgentOptions, AgentSetup } from '@deepseek-ai/dsh-agent'
 import { SessionId, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { SessionManagerConfig } from './config.js'
 import { createMemoryManagerStore, type ManagerStore } from './store.js'
 import { openDomainManagerStore, type DomainFacilityLike } from './store/domain.js'
@@ -46,6 +47,8 @@ import {
   type WorkspaceView,
 } from './types.js'
 import { notifyUserTool, type NotifyToolHost } from './notify-tool.js'
+import { CONCIERGE_SESSION_ID, conciergeSection, reawakenText, resolveConciergeConfig } from './concierge.js'
+import { conciergeTools } from './concierge-tools.js'
 
 // ---- duck types for the optional dsh services (never imported) ----
 
@@ -167,6 +170,12 @@ export class SessionManager extends Service implements NotifyToolHost {
       if (row.deferred === true) this.trackingFor(row.sessionId)
     }
 
+    // Concierge (design §15): the pre-written row is data only; wake recovery
+    // runs BEFORE the live listener registers so restart-folded tasks are
+    // handled exactly once, by this scan rather than by an emit replay.
+    await this.prewriteConciergeRow()
+    await this.recoverConciergeWakes()
+
     // Root listeners see every agent of the process, including ones the web UI
     // opened (dsh-scope: events flow upward) — that is exactly the point (V3).
     this.disposers.push(this.ctx.on('session/event', (session: Session, event: SessionEvent) => {
@@ -177,6 +186,9 @@ export class SessionManager extends Service implements NotifyToolHost {
     }))
     this.disposers.push(this.observeInteraction('approval/request', 'approval'))
     this.disposers.push(this.observeInteraction('user-questions/request', 'question'))
+    this.disposers.push(this.ctx.on('manager/task', (task: ManagerTask) => {
+      this.onConciergeTaskEvent(task)
+    }))
 
     const tools = this.ctx.get('tools') as ToolRuntimeLike | undefined
     if (tools !== undefined && typeof tools.register === 'function') {
@@ -765,14 +777,15 @@ export class SessionManager extends Service implements NotifyToolHost {
   private async ensureLiveAgent(id: string, opts: AdoptSessionOptions): Promise<Agent | undefined> {
     const live = this.ctx.agents.get(SessionId(id))
     if (live !== undefined) return live
-    const agentOptions = this.agentOptionsFor(opts.agentOptions)
+    const effective = this.conciergeAdoptOpts(id, opts)
+    const agentOptions = this.agentOptionsFor(effective.agentOptions)
     const persisted = await this.probePersisted(id)
     if (persisted !== false) {
       try {
         const handle = await this.ctx.agents.resume({
           resumeSessionId: SessionId(id),
           agentOptions,
-          setup: this.composeSetup(opts.setup),
+          setup: this.composeSetup(effective.setup),
         })
         this.handles.set(id, handle)
         return handle.agent
@@ -780,22 +793,41 @@ export class SessionManager extends Service implements NotifyToolHost {
         // 0.2 resume fails for real reasons (owned elsewhere, broken log,
         // bad preset): report verbatim unless the caller allowed creation
         // and the persistence layer reported the session definitely absent.
-        if (persisted === true || !opts.createIfMissing) throw error
+        if (persisted === true || !effective.createIfMissing) throw error
       }
     }
-    if (!opts.createIfMissing) {
+    if (!effective.createIfMissing) {
       throw new Error(`session ${id} was not found (neither live nor persisted)`)
     }
-    const cwd = this.resolveCwd(opts.cwd ?? this.config.cwd)
-    const agentPreset = await this.resolvePresetId(opts.agentPreset)
+    const cwd = this.resolveCwd(effective.cwd ?? this.config.cwd)
+    const agentPreset = await this.resolvePresetId(effective.agentPreset)
     const handle = await this.ctx.agents.create({
       sessionId: SessionId(id),
       meta: { cwd, ...(agentPreset !== undefined ? { agentPreset } : {}) },
       agentOptions,
-      setup: this.composeSetup(opts.setup),
+      setup: this.composeSetup(effective.setup),
     })
     this.handles.set(id, handle)
     return handle.agent
+  }
+
+  /**
+   * The concierge special case (design §15.3): the manager — not the caller —
+   * owns that id's existence, so the ladder always may create it, the
+   * concierge config wins on cwd/preset, and the setup forces the concierge
+   * composition (toolset + instructions) before the preset mount. Caller
+   * `agentOptions` (provider/model) pass through untouched.
+   */
+  private conciergeAdoptOpts(id: string, opts: AdoptSessionOptions): AdoptSessionOptions {
+    const cfg = this.conciergeCfg()
+    if (cfg === undefined || id !== CONCIERGE_SESSION_ID) return opts
+    return {
+      ...opts,
+      createIfMissing: true,
+      cwd: cfg.cwd ?? opts.cwd,
+      agentPreset: cfg.agentPreset,
+      setup: this.composeConciergeSetup(opts.setup),
+    }
   }
 
   /**
@@ -843,6 +875,146 @@ export class SessionManager extends Service implements NotifyToolHost {
       tools.register(notifyUserTool(this))
     } catch {
       // A duplicate/shadowed registration must not fail agent composition.
+    }
+  }
+
+  // ---- concierge glue (design §15) ----
+
+  private conciergeCfg() {
+    return resolveConciergeConfig(this.config)
+  }
+
+  /**
+   * §15.3 birth: with `concierge.enable`, `start()` pre-writes exactly one
+   * `sessions`-table row — data, not behavior. No agent, no model resources;
+   * the row makes the well-known id `/bind`-able, `/ls`-visible, and stable
+   * across restarts. An existing row (a later restart) always wins.
+   */
+  private async prewriteConciergeRow(): Promise<void> {
+    const cfg = this.conciergeCfg()
+    if (cfg === undefined) return
+    if (this.store.getSession(CONCIERGE_SESSION_ID) !== undefined) return
+    const cwd = this.resolveCwd(cfg.cwd ?? this.config.cwd)
+    const workspaceId = await this.resolveWorkspaceId(cwd)
+    this.store.putSession({
+      sessionId: CONCIERGE_SESSION_ID,
+      cwd,
+      ...(workspaceId !== undefined ? { workspaceId } : {}),
+      label: cfg.label,
+      createdBy: 'manager',
+      createdAt: Date.now(),
+    })
+  }
+
+  /**
+   * §15.4 crash recovery: terminal tasks the concierge dispatched but that
+   * were never woken (a crash between the fold and the followup). The manager
+   * owns the concierge's existence, so STARTUP recovery may spawn it — the one
+   * place a wake path creates the agent. Failures degrade to a warning; they
+   * must not keep the rest of `start()` from running.
+   */
+  private async recoverConciergeWakes(): Promise<void> {
+    const cfg = this.conciergeCfg()
+    if (cfg === undefined) return
+    const candidates = this.store
+      .listTasks()
+      .filter((task) =>
+        task.by === CONCIERGE_SESSION_ID &&
+        task.sessionId !== CONCIERGE_SESSION_ID &&
+        task.wokeAt === undefined &&
+        (task.state === 'done' || task.state === 'failed' || task.state === 'crashed'))
+      .sort((a, b) => (a.endedAt ?? a.dispatchedAt) - (b.endedAt ?? b.dispatchedAt))
+    if (candidates.length === 0) return
+    try {
+      await this.adopt(CONCIERGE_SESSION_ID, 'manager')
+    } catch (error) {
+      this.warn(`concierge wake recovery could not adopt the concierge: ${errorMessage(error)}`)
+      return
+    }
+    for (const task of candidates) {
+      try {
+        await this.wakeConcierge(task)
+      } catch (error) {
+        this.warn(`concierge wake recovery failed for task ${task.taskId}: ${errorMessage(error)}`)
+      }
+    }
+  }
+
+  /**
+   * §15.4 the live loop: edge-triggered off the `manager/task` emit (C3).
+   * Guards — disabled ⇒ out; not dispatched by the concierge ⇒ out; the
+   * task's own session IS the concierge ⇒ out (the loop guard: a re-awaken
+   * task closes on the concierge session and must not re-trigger); non-
+   * terminal state ⇒ out; already woken ⇒ out; concierge not live ⇒ skip — a
+   * live-process wake never spawns the agent (startup recovery may).
+   */
+  private onConciergeTaskEvent(task: ManagerTask): void {
+    if (this.conciergeCfg() === undefined) return
+    if (task.by !== CONCIERGE_SESSION_ID) return
+    if (task.sessionId === CONCIERGE_SESSION_ID) return
+    if (task.state !== 'done' && task.state !== 'failed' && task.state !== 'crashed') return
+    if (task.wokeAt !== undefined) return
+    if (this.ctx.agents.get(SessionId(CONCIERGE_SESSION_ID)) === undefined) {
+      this.warn('concierge wake skipped: the concierge agent is not live')
+      return
+    }
+    void this.wakeConcierge(task).catch((error) => {
+      this.warn(`concierge wake failed for task ${task.taskId}: ${errorMessage(error)}`)
+    })
+  }
+
+  /** Dispatch the synthetic followup, then stamp `wokeAt` (§15.4: at-least-once prefers a rare duplicate to a lost report). */
+  private async wakeConcierge(task: ManagerTask): Promise<void> {
+    const agent = this.ctx.agents.get(SessionId(CONCIERGE_SESSION_ID))
+    if (agent === undefined) return
+    const label = this.store.getSession(task.sessionId)?.label
+    await this.dispatch({
+      sessionId: CONCIERGE_SESSION_ID,
+      message: createUserMessage({
+        content: [{ type: 'text', text: reawakenText(task, label) }],
+        source: { kind: 'manager', origin: 'concierge-wake' },
+      }),
+      by: CONCIERGE_SESSION_ID,
+    })
+    // Bookkeeping only — deliberately NOT an emitTask transition.
+    this.store.putTask({ ...task, wokeAt: Date.now() })
+  }
+
+  /**
+   * The concierge composition (C1), as a caller setup INSIDE `composeSetup`:
+   * the outer wrapper already registers notify_user and performs the single
+   * preset mount, so this layer only adds the concierge-specific bits — the
+   * toolset and the instructions section — BEFORE the caller's own setup and
+   * the mount (a preset restricting the tool layer cannot strip them; the V2
+   * reasoning).
+   */
+  private composeConciergeSetup(callerSetup?: AgentSetup): AgentSetup {
+    return async (agentCtx: Context, agent: Agent) => {
+      this.registerConciergeTools(agentCtx)
+      return callerSetup !== undefined ? await callerSetup(agentCtx, agent) : undefined
+    }
+  }
+
+  private registerConciergeTools(scopeCtx: Context): void {
+    const cfg = this.conciergeCfg()
+    if (cfg === undefined) return
+    const tools = scopeCtx.get('tools') as ToolRuntimeLike | undefined
+    if (tools !== undefined && typeof tools.register === 'function') {
+      for (const definition of conciergeTools(this)) {
+        try {
+          tools.register(definition)
+        } catch {
+          // A duplicate/shadowed registration must not fail agent composition.
+        }
+      }
+    }
+    const prompts = scopeCtx.get('systemPrompt') as { section?(section: { name: string; order: number; text: string }): unknown } | undefined
+    if (prompts !== undefined && typeof prompts.section === 'function') {
+      try {
+        prompts.section(conciergeSection(cfg.instructions))
+      } catch {
+        // A duplicate section must not fail agent composition.
+      }
     }
   }
 

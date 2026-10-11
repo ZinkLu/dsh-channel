@@ -18,3 +18,17 @@
         # provider / model / cwd / agentPreset: creation defaults for sessions
         # this manager creates; a channel bridge passes its own config through
         # create()/dispatch() and wins over these.
+        #
+        # Concierge (design §15): a natural-language session-control agent on
+        # the well-known `manager:concierge` session — reach it with
+        # `/bind manager:concierge`, then talk to it in free text. It drives
+        # this same manager through 8 tools; dispatched tasks re-awaken it to
+        # verify and report. enable writes one store row at start; the agent
+        # spawns lazily on first touch.
+        # concierge:
+        #   enable: true
+        #   label: concierge      # /ls label (default "concierge")
+        #   # agentPreset: standard
+        #   # cwd: /home/me/projects   # its own workspace (default: manager cwd)
+        #   # instructions: |         # system-prompt section (default: built-in text)
+        #   #   You are my session concierge...
