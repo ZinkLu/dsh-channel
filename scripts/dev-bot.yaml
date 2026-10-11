@@ -32,31 +32,6 @@
         defaultSubscribers:
           - channel:telegram:5002186681
         statePath: !!js dshHomePath('dev-bot', 'session-manager', 'state.json')
-        # Concierge (design §15): /bind manager:concierge, then free text.
-        # The row is pre-written at start; the agent spawns on first touch.
-        concierge:
-          enable: true
-# Official parent-child delegation for the concierge (V8 spike): the
-# `subagent` tool starts a managed child whose result returns INTO the
-# caller's turn — the structural callback our dispatch_message (sibling
-# sessions) deliberately does not replicate. Children answer approvals
-# through whoever watches them; whether a concierge-delegated child's
-# approval reaches this chat is exactly what the spike must answer (the
-# candidate glue: copy the concierge's subscribers onto the child).
-- insert:
-    - id: subagents
-      name: dsh-subagent
-- insert:
-    - id: subagent-spawn
-      name: dsh-subagent-spawn-in-process
-- insert:
-    - id: tool-subagent
-      name: dsh-tool-subagent
-      config:
-        provider: spawn
-        # toolName: subagent          # default
-        # maxDepth: 1                 # omission reads the host setting (default 1)
-        # toolFilter: { allow: [...] } # per-child tool restriction
 - insert:
     - id: channel-telegram
       name: dsh-channel-telegram
