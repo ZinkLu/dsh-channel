@@ -1335,6 +1335,12 @@ alone. Default text (v1):
 - **Integration (in-memory fakes):** the full loop — chat focuses the concierge, concierge
   dispatches to a worker, worker's turn ends, concierge re-awakened exactly once; crash-restart
   mid-loop re-folds and re-awakens without doubling.
+- **Headless real-stack self-test** (`scripts/concierge-selftest.mjs`, manual, needs
+  `DEEPSEEK_API_KEY`; validated 2026-10 on 0.2.1-alpha.2, 14/14): the REAL AgentLoop + LlmRuntime
+  + ToolRuntime + SystemPrompt composition — the model genuinely calls the tools (tool
+  visibility under a preset-less composition, the V6 question for the default ladder), the
+  worker answers through the real LLM, and the wake loop fires on real `turn/end`/idle events
+  with `manager`/`concierge-wake` provenance in the log.
 - **Dev-bot spikes (extend §14.8):** **V6** — under the real `standard` preset,
   `request/header.tools` shows the toolset on the concierge and *only* there; **V7** — a
   re-awaken turn streams to the focus chat on real Telegram, and a worker approval lands in the

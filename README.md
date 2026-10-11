@@ -148,6 +148,13 @@ profile can take the same file plus that one patch row.
 Note: two processes long-polling the same bot token fight over `getUpdates` (Telegram 409) — stop any
 other instance using the token first.
 
+For a **no-Telegram, real-model** check there is [`scripts/concierge-selftest.mjs`](./scripts/concierge-selftest.mjs):
+it composes the real dsh stack headless (AgentLoop + LlmRuntime + ToolRuntime + SystemPrompt) plus this
+repo's session manager with `concierge.enable`, then drives the concierge against the real model — the
+model genuinely calls `list_sessions`/`create_session`/`dispatch_message`, the worker really answers,
+and the wake loop fires on real turn events. It is not part of `npm test` (it spends a few
+deepseek-flash calls and needs `DEEPSEEK_API_KEY`); the header documents the scratch-install one-liner.
+
 ---
 
 ### Test coverage
@@ -349,6 +356,12 @@ profile 拿同一个文件加同一行 patch 即可。
 
 注意：两个进程用同一个 bot token 长轮询会互抢 `getUpdates`（Telegram 409）——先停掉占用
 该 token 的其他实例。
+
+不需要 Telegram、但要**真模型**的验证用 [`scripts/concierge-selftest.mjs`](./scripts/concierge-selftest.mjs)：
+无头组合真实 dsh 栈（AgentLoop + LlmRuntime + ToolRuntime + SystemPrompt）+ 本仓库的 session manager
+（`concierge.enable`），然后对着真模型驱动 concierge——模型真实调用 `list_sessions`/`create_session`/
+`dispatch_message`，worker 真实应答，wake 闭环在真实 turn 事件上触发。它不在 `npm test` 里（要花几次
+deepseek-flash 调用、需要 `DEEPSEEK_API_KEY`）；文件头有 scratch 安装的一行命令。
 
 ---
 
