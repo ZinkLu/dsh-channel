@@ -73,8 +73,10 @@ None of these is a functional gap today; all seven wait on a concrete consumer.
 | **Chunker: single-backtick balancing, mid-stream truncation closure** | `chunk.ts` treats fenced blocks as atomic and re-fences on hard split; inline code spans and mid-stream cuts are not balanced | Block streaming (v2) — only reachable when partial text is rendered mid-turn |
 | **`always` / `session` approval memory** | dsh's `approval/request` has no `always`/`session` outcome. "Remember always for this tool this session" requires the channel to record it in its own store and short-circuit in the answerer, never calling back into `approval/request` | A user asking for it. Interface space is reserved; nothing is built |
 | **0.2 session-projection cache rejects channel session ids** | e2e-observed on 0.2.0-rc.2: its per-record key must match `/^[a-zA-Z0-9_-]+$/`, so our colon-bearing `channel:<id>:<chatKey>` ids never warm the projection cache ("cache stays stale" warnings; titles/projections for channel sessions stay cold). The id grammar is byte-stable by design (§4.5), so the fix belongs upstream or in an id-mapping layer. The manager's random-id `create()` sessions are cache-friendly; only the conventional default ids are not | The projection cache powering something a channel user actually sees (e.g. session titles in web lists) — then raise it upstream |
-| **Concierge agent (natural-language session control)** | A v2 agent that drives `ctx.sessionManager` through tools ("what's running?", "start a blog session and fix the header") instead of slash commands. It builds on the same API — D2's deterministic plane and this are complementary layers, not alternatives | The command table passing ~10 entries, or users persistently asking session state in free text |
+| ~~**Concierge agent (natural-language session control)**~~ ✅ shipped with M19 (design §15): well-known `manager:concierge` session, agent-relative toolset scoped to its own setup, edge-triggered re-awaken loop on `manager/task` with `wokeAt` + a startup scan, subscriber copy keeping approvals in human chats | The remaining open questions live in design §15.7 (spikes V6–V7 run on the dev bot); `/agent` shorthand and per-workspace concierges stay below | — |
 | **Scheduled / timed dispatch** | The manager holding its own timers to dispatch at a wall-clock time or after a delay (`dsh-schedule` is session-local, ≥300s, and does not adopt an existing agent) | A user asking for cron-style "run this every morning" |
+| **Per-workspace concierges** | Design §15 ships one concierge per process with a single cwd; per-workspace instances need an id grammar (`manager:concierge:<ws>`) plus a reachability story per workspace | One process genuinely serving multiple workspaces' users through the concierge |
+| **A dedicated `/agent` command** | Focus-switch shorthand for `manager:concierge` (today: `/bind manager:concierge`). One additive row in the kit's command table; zero pressure until then | User feedback that `/bind manager:concierge` is clunky |
 | **`ctx.jobs.onJobDone` → notification** | Wire the one dsh "completion callback" primitive into the outbox so a background job finishing pings the subscriber | Background jobs becoming a normal part of channel-driven work |
 
 ### 2.3 Session-manager layer debts
@@ -153,8 +155,12 @@ stated reason, not rediscovering the option.
   decides the upstream (D4); a config flag would create two paths to maintain and two ways to be
   wrong.
 - **No LLM in the v1 control plane.** List/switch/dispatch/stop must be testable, instant, and
-  token-free (D2). The concierge agent (§2.2) is an additional layer on the same API, never a
+  token-free (D2). The concierge agent (design §15) is an additional layer on the same API, never a
   replacement for the deterministic one.
+- **No `answer_approval` / `answer_question` tool on the concierge.** Letting the model resolve a
+  human checkpoint turns approval into a suggestion; the numbered-reply path already answers from
+  any subscribed chat, and design §15's C4 subscriber copy keeps that path reachable for
+  concierge-dispatched workers. Re-proposing this means arguing against R8, not against taste.
 - **No per-chat "manager conversation log".** Command round-trips enter no session log (the same
   reasoning as `ctx.commands`' non-turn `command/run`); audit consumers listen to
   `manager/task` / `manager/notification`.

@@ -1139,6 +1139,182 @@ and are the M18 exit:
 
 ---
 
+## 15. The Concierge Agent (M19) — natural-language session control
+
+> Status: shipped (M19; unit + integration suites green; composition spikes V6–V7 run on the
+> dev bot like §14.8's). Origin: the backlog's "concierge agent" item (§2.2) — its trigger (the
+> command table passing ~10 entries) was met: the table held 11 commands.
+
+§14's control plane is deterministic by ruling (D2): slash commands, stable numbers, zero tokens.
+This chapter is the v2 layer D2 explicitly reserved: a **concierge** — one managed session whose
+model drives the *same* `ctx.sessionManager` API through tools, so "看看哪个卡住了，停掉，再让
+docs 会话把 README 修了" becomes one utterance instead of `/ls` → `/stop 3` → `/to 2 …`. The
+command plane stays exactly as shipped (deterministic, token-free, always available); the
+concierge is an additional consumer of the same API, never a replacement (§3.2's negative ruling
+holds). Nothing in §13/§14 changes shape, and no channel package, kit file, or contract line is
+touched.
+
+### 15.1 The one-line design
+
+**The concierge is a managed session, not a service feature**: a well-known session id
+pre-registered by the manager, an agent spawned lazily on first touch, a session-management
+toolset mounted only on that agent's scope, and a closed loop that re-awakens the concierge when
+a task it dispatched closes. All of it lives in `dsh-session-manager`.
+
+Rulings C1–C6 are load-bearing and settled:
+
+- **C1 — agent-relative tools, scoped mounting.** The toolset is defined agent-relative
+  (`by = exec.agent.id`, the notify_user pattern) but is registered **only inside the concierge
+  session's setup composition** — never on the plugin ctx, never global. Work sessions never see
+  it, so recursive session-spawning is impossible by construction, not by prompt discipline.
+- **C2 — same API, no bypass.** Every tool is a thin shell over the public `SessionManager`
+  surface (`list`/`describe`/`workspaces`/`create`/`dispatch`/`cancel`/`watch`/`unwatch`). No
+  tool touches private manager state; no command-table behavior is reimplemented.
+- **C3 — the closed loop is edge-triggered on the existing `manager/task` emit event.** When a
+  task with `by === <concierge id>` and `sessionId !== <concierge id>` reaches a terminal state,
+  the concierge glue dispatches exactly one synthetic followup into the concierge and stamps the
+  task row's `wokeAt` (a presentation-cache flag, never folded). The `sessionId` guard makes it
+  loop-safe (the re-awaken's own task closes on the concierge session and cannot re-trigger).
+  Crash recovery is a STARTUP scan, not an emit replay: `start()` re-wakes terminal tasks with
+  `by === concierge` and no `wokeAt` (the two crash windows — fold-without-wake, and
+  wake-dispatch-without-stamp, which re-wakes once: at-least-once prefers a rare duplicate to a
+  lost report). Startup recovery is the one wake path allowed to spawn the concierge; a
+  live-process wake never does (skip + warn).
+- **C4 — humans stay in the loop for approvals.** A concierge dispatch copies the concierge's own
+  subscribers (opaque keys, all five kinds) onto the target session. Worker approvals/questions
+  then fan out to real chats natively (§14.5's `chatKeysForAgent` picks up the copied keys), and
+  turn-end badges reach them too. The concierge itself is **not** subscribed — it learns through
+  the re-awaken, never through outbox rows nothing would ack.
+- **C5 — rejected: `answer_approval` / `answer_question` tools.** Letting the model resolve a
+  human checkpoint turns approval into a suggestion. The numbered-reply path already answers from
+  any subscribed chat (first answer wins, R8 unchanged); C4's copy is what makes that path
+  reachable for concierge-dispatched workers.
+- **C6 — trust equals the command table.** The concierge can do what an allowlisted user could do
+  with `/ls`/`/to`/`/stop`/`/new` — nothing more. No log deletion, no credentials, no
+  cross-process adoption beyond the existing `foreign`/`--take` rules; the chat allowlist already
+  gates every human who can reach it.
+
+### 15.2 The toolset
+
+Eight tools, all structural `ToolDefinition`s duck-typed the notify_user way (no dsh-tools
+import). Outputs are compact JSON rows for the model; `output.render` produces the one-line
+status text the focus chat sees in the stream.
+
+| Tool | Wraps | Parameters | Notes |
+|---|---|---|---|
+| `list_sessions` | `list()` | `workspaceId?`, `includeForeign?` | Running/blank/pendingInteraction glyphs fold to booleans |
+| `describe_session` | `describe()` | `sessionId` — **id or label** | Label resolution so "the docs session" works without `/ls` first |
+| `list_workspaces` | `workspaces()` | — | |
+| `create_session` | `create()` (+ optional first dispatch) | `cwd?`/`workspaceId?`, `label?`, `text?` | Standard preset by construction — no toolset on workers (C1) |
+| `dispatch_message` | `dispatch()` + C4 subscriber copy | `sessionId`, `text`, `mode?` | Rejects `sessionId === self` ("answer the user directly"); a target with no live agent returns a structured error naming the two legal paths (create it, or tell the user it is another process's) |
+| `cancel_session` | `cancel()` | `sessionId`, `cause?` | Idempotent like `/stop` |
+| `watch_session` · `unwatch_session` | `watch`/`unwatch` | `sessionId` | Subscribe the *calling chat's* keys — rare; C4 already copies on dispatch |
+
+### 15.3 Identity, birth, reachability
+
+- **Id: `manager:concierge`** — well-known, stable across restarts, colon-safe for the §13.3
+  delivery-key grammar, never colliding with `channel:*` or random UUIDs. `managed` by
+  construction, so `/bind`'s foreign-confirm never fires for it.
+- **Birth: one row, no agent.** With `concierge.enable` the manager's `start()` pre-writes a
+  single `sessions`-table row (`label: 'concierge'`, `createdBy: 'manager'`). That is a table
+  row — no agent, no model resources, nothing to dispose.
+- **Lazy spawn on first touch.** The manager's ensure ladder special-cases the well-known id as
+  always-adoptable (`createIfMissing` forced, because the manager — not the caller — owns its
+  existence) and forces the concierge composition regardless of caller opts: the concierge
+  `agentPreset`/`instructions` config plus the toolset setup, while keeping caller-supplied
+  `agentOptions` (the bridge's provider/model). The agent spawns the first time anything adopts
+  or dispatches to the id — `/bind`, focus free text, or `/to`.
+- **Reachability today, zero kit changes:** `/bind manager:concierge` → focus → free text. It
+  appears in `/ls` like any managed session; multiple chats may focus it concurrently (it is a
+  shared assistant; dispatches interleave in one log). A dedicated `/agent` command is a later
+  additive nicety (backlog), not a requirement.
+- **One concierge per process.** Per-workspace concierges wait on a backlog trigger.
+
+### 15.4 The closed loop
+
+```
+concierge: dispatch_message(X, text)  →  task {by: manager:concierge, sessionId: X}
+                                        + copy subscribersOf(concierge) → X (C4)
+X: turn/end                           →  task folds done/failed/crashed
+manager/task (emit)                   →  glue: by === concierge && sessionId !== concierge
+                                      →  manager.dispatch(concierge,
+                                          "[#12 on X] done — verify and report if useful")
+concierge turn                        →  describe_session(X) as needed → streamed answer /
+                                          notify_user (watchers = the originating chats)
+```
+
+- The synthetic followup is an ordinary user message (task summary as text, source
+  `{kind:'manager', origin:'concierge-wake'}`); it starts a turn that streams to the concierge's
+  focus chat like any turn. The concierge's own turn-end then follows §14.6 verbatim: silently
+  acked for the focus chat, badged for other watchers. Dispatches the concierge itself authors
+  (tool forwards) carry `origin:'concierge-tool'` — manager provenance, never `user` and never
+  `channel`, and carrying no platform messageIds the inbound idempotency fold could trip over.
+- **Exactly-once in a live process:** one emit per terminal transition, one wake, one `wokeAt`
+  stamp read back by the guard.
+- **Crash windows:** (a) worker ended, crash before the wake — the task is terminal in the table
+  with no `wokeAt`; the startup scan finds it, adopts the concierge (the manager owns its
+  existence — the one place a wake path spawns it), and wakes it. (b) crash between the wake
+  dispatch and the stamp — the followup is already in the concierge's log (the log is the truth,
+  R7) AND the scan re-wakes once: a rare, benign duplicate rather than a lost report. The scan
+  runs BEFORE the live listener registers, so restart-folded tasks are handled by the scan
+  alone — no double path.
+- If the concierge agent is not live when a live-process wake fires, the glue skips with one
+  warn — a wake must never spawn the agent outside startup recovery.
+- Re-awaken applies to terminal states only; a `queued`/`running` emit (e.g. a steer join) is
+  not a wake signal.
+
+### 15.5 Configuration
+
+```ts
+concierge: object({
+  enable: boolean().default(false),
+  label: string().default('concierge'),
+  agentPreset: string(),        // default: the host's default preset (resolvePresetId ladder)
+  cwd: string(),                // default: the manager cwd
+  instructions: string(),       // default: the built-in text below
+})
+```
+
+`instructions` registers as a system-prompt fragment on the concierge's agent scope when
+`ctx.systemPrompt` is composed; absent that seam, the tool descriptions carry the semantics
+alone. Default text (v1):
+
+> You are the session concierge. The user chats with you; the actual work happens in other agent
+> sessions you operate through your session tools. List before acting, dispatch with clear
+> self-contained instructions, and verify outcomes — you will be woken when a dispatched task
+> ends; then check the result and report briefly. Never claim work you delegated.
+
+### 15.6 R1–R10 reconciliation
+
+| Rule | Landing |
+|---|---|
+| R1 reversible | Glue listeners and tool registrations live in disposers; `stop()` removes them. The pre-written row is durable *data*, not behavior — it persists, inert, until the plugin runs again |
+| R2 inject | No new injects; `tools`/`systemPrompt`/`agentPresets` stay optional `ctx.get` seams |
+| R3 / D1 | All new code in `dsh-session-manager`; the dependency graph names no channel package |
+| R4 contract | No new events — the loop reuses the emit-only `manager/task` |
+| R7 log discipline | The loop is edge-triggered on the log fold; the synthetic followup is a log message like any other |
+| R8 waterfall | Approvals unchanged: copied subscribers make the broker fan out to chats, still first-answer-wins, and the concierge holds no answering tool (C5) |
+| R9 YAML | Rides the existing `dsh-session-manager` plugin entry's config (0.2 settings model) |
+| R10 scope | The toolset registers in the concierge's `setup(agentCtx)` only — never the plugin ctx, never global |
+
+### 15.7 Tests and verification (M19 exit)
+
+- **Unit (session-manager):** tool definitions execute against a fake host (mirrors the
+  notify-tool tests); `dispatch_message` self-rejection and no-live-agent error shape; loop guard
+  (a task on the concierge itself never re-awakens); the C4 subscriber copy (and that the
+  concierge is never itself subscribed); the ensure-ladder special-case forcing concierge
+  composition while keeping caller `agentOptions`; pre-written row + lazy spawn; `enable: false`
+  → no row, no tools, byte-identical §14 behavior.
+- **Integration (in-memory fakes):** the full loop — chat focuses the concierge, concierge
+  dispatches to a worker, worker's turn ends, concierge re-awakened exactly once; crash-restart
+  mid-loop re-folds and re-awakens without doubling.
+- **Dev-bot spikes (extend §14.8):** **V6** — under the real `standard` preset,
+  `request/header.tools` shows the toolset on the concierge and *only* there; **V7** — a
+  re-awaken turn streams to the focus chat on real Telegram, and a worker approval lands in the
+  chat as an answerable numbered prompt.
+
+---
+
 ## Appendix A: Reference Index
 
 - dsh: `packages/fs/fs` (definition-package paradigm) · `packages/llm/llm` (registry paradigm) · `packages/interaction/user-approval` (waterfall answerer and audit pair) · `packages/core/agent` (`AgentRegistry`/`Agent`) · `packages/core/session` (`SessionEventMap`/fork) · `packages/credentials/credentials` · `docs/cordis-tutorial/01–07` · `docs/architecture.md`
