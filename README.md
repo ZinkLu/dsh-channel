@@ -155,6 +155,11 @@ model genuinely calls `list_sessions`/`create_session`/`dispatch_message`, the w
 and the wake loop fires on real turn events. It is not part of `npm test` (it spends a few
 deepseek-flash calls and needs `DEEPSEEK_API_KEY`); the header documents the scratch-install one-liner.
 
+Upgrading from a pre-0.2.1 dsh baseline? dsh 0.2.1's v0 log migration rejects custom message-source
+kinds, so old channel sessions fail to resume with `cannot safely transform unclassified message
+source`. [`scripts/repair-v0-channel-sources.mjs`](./scripts/repair-v0-channel-sources.mjs) fixes
+such artifacts in place (dry-run by default, backs up before rewriting); new v4 logs are unaffected.
+
 ---
 
 ### Test coverage
@@ -362,6 +367,11 @@ profile 拿同一个文件加同一行 patch 即可。
 （`concierge.enable`），然后对着真模型驱动 concierge——模型真实调用 `list_sessions`/`create_session`/
 `dispatch_message`，worker 真实应答，wake 闭环在真实 turn 事件上触发。它不在 `npm test` 里（要花几次
 deepseek-flash 调用、需要 `DEEPSEEK_API_KEY`）；文件头有 scratch 安装的一行命令。
+
+从 pre-0.2.1 的 dsh 基线升级过来？dsh 0.2.1 的 v0 日志迁移不认自定义 message-source kind，旧渠道会话会以
+`cannot safely transform unclassified message source` 拒绝 resume。
+[`scripts/repair-v0-channel-sources.mjs`](./scripts/repair-v0-channel-sources.mjs) 可原位修复这类
+artifact（默认 dry-run、写前备份）；新的 v4 日志不受影响。
 
 ---
 
