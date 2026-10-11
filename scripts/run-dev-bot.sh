@@ -22,7 +22,7 @@
 # (Telegram 409) — stop any other instance using this token first.
 set -euo pipefail
 
-DSH_VERSION="${DSH_VERSION:-0.2.0-rc.2}"
+DSH_VERSION="${DSH_VERSION:-0.2.1-alpha.2}"
 PROFILE="${DEV_BOT_PROFILE:-dev-bot}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export DSH_HOME="${DSH_HOME:-$HOME/.dsh}"

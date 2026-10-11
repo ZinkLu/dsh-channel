@@ -13,7 +13,7 @@ Split into six packages per [dsh-channel-design.md](./dsh-channel-design.md).
 
 For the alignment baseline against dsh's own core/seam, see [docs/dsh-core-reference.md](./docs/dsh-core-reference.md)
 (full ctx seam/core table + core packages + lifecycle + tool pipeline + session log, checked line-by-line
-against the 0.2.0-rc.2 source). What is deliberately *not* built — open questions, deferred work with its
+against the 0.2.0-rc.2 source; the baseline moved to 0.2.1-alpha.2 in 2026-10 with the full suite green and zero source changes — the 0.2.1 seam re-survey is pending). What is deliberately *not* built — open questions, deferred work with its
 trigger, and designs considered and rejected — is in
 [docs/dsh-channel-backlog.md](./docs/dsh-channel-backlog.md).
 
@@ -215,7 +215,7 @@ DeepSeek Harness (dsh) 的消息渠道公共层、一个与渠道无关的会话
 按照 [dsh-channel-design.md](./dsh-channel-design.md) 拆为六个包。
 
 对 dsh 本身核心/seam 的对齐基线，见 [docs/dsh-core-reference.md](./docs/dsh-core-reference.md)
-（ctx seam/core 全表 + 核心包 + 生命周期 + 工具流水线 + 会话日志，逐条对照 0.2.0-rc.2 源码）。
+（ctx seam/core 全表 + 核心包 + 生命周期 + 工具流水线 + 会话日志，逐条对照 0.2.0-rc.2 源码；基线已于 2026-10 升至 0.2.1-alpha.2——全套测试绿、零源码改动，0.2.1 seam 复查待做）。
 刻意**没有**做的部分——待验证的开放问题、带触发条件的延后项、以及已论证并否决的设计——见
 [docs/dsh-channel-backlog.md](./docs/dsh-channel-backlog.md)。
 

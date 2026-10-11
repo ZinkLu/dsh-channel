@@ -8,9 +8,13 @@
 > 0.2.0-rc.2 sources it is called out in place — do not write code directly from symbols that
 > only exist in the master docs.
 
-- This project's `package.json` devDependencies are pinned to `^0.2.0-rc.2`; the runtime
-  harness also runs on 0.2.0-rc.2. **Code takes 0.2.0-rc.2 as authoritative**; the docs serve
-  only as semantic reference.
+- This project's `package.json` devDependencies are pinned to `^0.2.1-alpha.2` (cordis
+  `~4.0.5-alpha.1`, schemastery `~3.18.5-alpha.1`); the runtime harness also runs on
+  0.2.1-alpha.2. **Code takes the installed tarballs as authoritative**; the docs serve
+  only as semantic reference. Baseline history: this document was verified line-by-line
+  against 0.2.0-rc.2; the 2026-10 bump to 0.2.1-alpha.2 passed the full suite with zero
+  source changes (every consumed seam stable), but the tables below still quote 0.2.0-rc.2
+  type positions until the next full pass.
 - Verification sources, in descending order of preference: the installed
   `node_modules/@deepseek-ai/*/lib/types/*.d.ts` (plus `lib/*.js` for behavior) for the
   packages this repo dev-depends on (cordis 4.0.4, dsh-agent, dsh-llm, dsh-session,
