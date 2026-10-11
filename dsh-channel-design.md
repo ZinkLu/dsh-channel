@@ -1139,11 +1139,12 @@ and are the M18 exit:
 
 ---
 
-## 15. The Concierge Agent (M19) — natural-language session control
+## 15. The Concierge Agent (M19–M20) — natural-language resource management
 
-> Status: shipped (M19; unit + integration suites green; composition spikes V6–V7 run on the
-> dev bot like §14.8's). Origin: the backlog's "concierge agent" item (§2.2) — its trigger (the
-> command table passing ~10 entries) was met: the table held 11 commands.
+> Status: shipped (M19 session control + M20 the full resource plane; unit + integration suites
+> green; composition spikes V6–V7 run on the dev bot like §14.8's). Origin: the backlog's
+> "concierge agent" item (§2.2) — its trigger (the command table passing ~10 entries) was met:
+> the table held 11 commands.
 
 §14's control plane is deterministic by ruling (D2): slash commands, stable numbers, zero tokens.
 This chapter is the v2 layer D2 explicitly reserved: a **concierge** — one managed session whose
@@ -1196,19 +1197,45 @@ Rulings C1–C6 are load-bearing and settled:
 
 ### 15.2 The toolset
 
-Eight tools, all structural `ToolDefinition`s duck-typed the notify_user way (no dsh-tools
-import). Outputs are compact JSON rows for the model; `output.render` produces the one-line
-status text the focus chat sees in the stream.
+M19 shipped session control; **M20 widened it to the full resource plane** — agents/sessions,
+tasks, logs, and projects (workspaces), each a thin shell over the manager surface or a
+duck-typed official seam. All are structural `ToolDefinition`s duck-typed the notify_user way
+(no dsh-tools import). Outputs are compact JSON rows for the model; `output.render` produces
+the one-line status text the focus chat sees in the stream.
+
+**Sessions (M19):**
 
 | Tool | Wraps | Parameters | Notes |
 |---|---|---|---|
 | `list_sessions` | `list()` | `workspaceId?`, `includeForeign?` | Running/blank/pendingInteraction glyphs fold to booleans |
 | `describe_session` | `describe()` | `sessionId` — **id or label** | Label resolution so "the docs session" works without `/ls` first |
-| `list_workspaces` | `workspaces()` | — | |
 | `create_session` | `create()` (+ optional first dispatch) | `cwd?`/`workspaceId?`, `label?`, `text?` | Standard preset by construction — no toolset on workers (C1) |
 | `dispatch_message` | `dispatch()` + C4 subscriber copy | `sessionId`, `text`, `mode?` | Rejects `sessionId === self` ("answer the user directly"); a target with no live agent returns a structured error naming the two legal paths (create it, or tell the user it is another process's) |
 | `cancel_session` | `cancel()` | `sessionId`, `cause?` | Idempotent like `/stop` |
 | `watch_session` · `unwatch_session` | `watch`/`unwatch` | `sessionId` | Subscribe the *calling chat's* keys — rare; C4 already copies on dispatch |
+
+**Tasks / logs / session bookkeeping (M20):**
+
+| Tool | Wraps | Parameters | Notes |
+|---|---|---|---|
+| `list_tasks` | `tasks()` | `state?[]`, `session?` | The cross-fleet "what is running / what died" view, newest first, capped at 50 |
+| `tail_session` | `tail()` | `session`, `limit?` (1–100, default 20) | Live log tail — the log is the truth (R7); cold sessions are told to resume first |
+| `set_session_label` | `setSessionLabel()` | `session`, `label` (empty clears) | Managed rows only; a foreign session is not ours to retitle |
+| `dispose_session` | `disposeSession()` | `session` | Releases the owned agent; row + log persist, a later dispatch resumes; an open turn folds `crashed` — `cancel_session` is the graceful path. Returns false when no handle is held |
+
+**Projects / workspaces (M20, duck-typed `ctx.workspaceRegistry` writes; every op throws cleanly when the host composed no registry or a read-only one):**
+
+| Tool | Wraps | Parameters | Notes |
+|---|---|---|---|
+| `list_workspaces` | `workspaces()` | — | (M19) |
+| `create_workspace` | `createWorkspace()` → `registry.create(path, title?)` | `path` (absolute, existing), `title?` | Register a directory as a project |
+| `rename_workspace` | `renameWorkspace()` → `entity.setTitle()` | `workspace` (id), `title` | |
+| `archive_session` | `archiveSession()` → `registry.archiveSession`/`unarchiveSession` | `session`, `archived?` (default true) | Hidden from every grouping, logs kept; the registry refuses live sessions (cancel/dispose first) — its error propagates verbatim |
+
+The M20 manager surface (`tasks`/`tail`/`setSessionLabel`/`disposeSession`/`createWorkspace`/
+`renameWorkspace`/`archiveSession`) is public API like the rest: a CLI or the web host can call
+it without the concierge. Workspace writes reuse the SAME `WorkspaceRegistryLike` duck type the
+reads always used, grown additively with optional methods.
 
 ### 15.3 Identity, birth, reachability
 

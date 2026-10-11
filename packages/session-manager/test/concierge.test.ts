@@ -100,7 +100,7 @@ test('adopt(createIfMissing:false) spawns the concierge lazily with the forced c
   // C1: notify_user + the 8 concierge tools on the AGENT scope, then the
   // caller setup, then exactly one preset mount. Never the global layer.
   assert.deepEqual(h.agentToolDefinitions.map((definition) => definition.name), ['notify_user', ...CONCIERGE_TOOL_NAMES])
-  assert.deepEqual(h.setupOrder, [...Array.from({ length: 9 }, () => 'agent-tool'), 'caller', 'mount'])
+  assert.deepEqual(h.setupOrder, [...Array.from({ length: 16 }, () => 'agent-tool'), 'caller', 'mount'])
   assert.deepEqual(h.toolDefinitions.map((definition) => definition.name), ['notify_user'])
 })
 
@@ -133,7 +133,7 @@ test('the instructions register as an agent-scoped prompt section when systemPro
 test('without the systemPrompt seam, composition still succeeds', async () => {
   const h = await harness({ config: ENABLED, presets: {} })
   await h.manager.adopt(CONCIERGE_SESSION_ID, 'x')
-  assert.equal(h.agentToolDefinitions.length, 9)
+  assert.equal(h.agentToolDefinitions.length, 16)
 })
 
 // ---- §15.2 the toolset against a fake host ----
@@ -493,6 +493,163 @@ test('the real manager serves as the tool host: dispatch + subscriber copy end t
   assert.deepEqual(h.manager.subscribersOf(worker.sessionId), ['channel:telegram:1'])
   // And the concierge itself was not subscribed to its worker (C4).
   assert.ok(!h.manager.subscribersOf(worker.sessionId).includes(CONCIERGE_SESSION_ID))
+})
+
+// ---- M20: the full resource-management plane ----
+
+test('tasks(): the cross-fleet task view, newest first, filtered by state and session', async () => {
+  const h = await harness({ presets: {} })
+  const a = await h.manager.create({ cwd: '/tmp/a', by: 'x', label: 'a' })
+  const b = await h.manager.create({ cwd: '/tmp/b', by: 'x', label: 'b' })
+  const agentA = h.agents.agents.get(a.sessionId)!
+  const agentB = h.agents.agents.get(b.sessionId)!
+
+  await h.manager.dispatch({ sessionId: a.sessionId, message: userMsg('one'), by: 'x' })
+  runTurn(h.root, agentA, 1)
+  await h.manager.dispatch({ sessionId: b.sessionId, message: userMsg('two'), by: 'x' })
+
+  const running = h.manager.tasks({ state: ['queued'] })
+  assert.equal(running.length, 1)
+  assert.equal(running[0]!.sessionId, b.sessionId)
+
+  const all = h.manager.tasks()
+  assert.equal(all.length, 2)
+  assert.ok(all[0]!.dispatchedAt >= all[1]!.dispatchedAt, 'newest first')
+  assert.equal(h.manager.tasks({ sessionId: a.sessionId })[0]!.state, 'done')
+})
+
+test('tail(): live log tail bounded 1..100, cold sessions throw', async () => {
+  const h = await harness({ presets: {} })
+  const row = await h.manager.create({ cwd: '/tmp/a', by: 'x' })
+  const agent = h.agents.agents.get(row.sessionId)!
+  runTurn(h.root, agent, 1, { assistantText: 'hi' })
+
+  const tail = h.manager.tail(row.sessionId, 3)
+  assert.equal(tail.length, 3)
+  assert.deepEqual(tail.map((event) => event.type), ['turn/start', 'assistant/message', 'turn/end'])
+  assert.equal(h.manager.tail(row.sessionId, 500).length <= 100, true)
+
+  await h.manager.disposeSession(row.sessionId)
+  assert.throws(() => h.manager.tail(row.sessionId), /no live agent/)
+})
+
+test('setSessionLabel(): relabel and clear managed rows; foreign ids throw', async () => {
+  const h = await harness({ presets: {} })
+  const row = await h.manager.create({ cwd: '/tmp/a', by: 'x', label: 'old' })
+
+  assert.equal(h.manager.setSessionLabel(row.sessionId, 'new').label, 'new')
+  assert.equal(h.manager.setSessionLabel(row.sessionId, '').label, undefined)
+  assert.throws(() => h.manager.setSessionLabel('nope', 'x'), /not managed here/)
+})
+
+test('disposeSession(): releases the owned agent, keeps the row, later adopt resumes', async () => {
+  const h = await harness({ presets: {} })
+  const row = await h.manager.create({ cwd: '/tmp/a', by: 'x', label: 'keep' })
+
+  assert.equal(await h.manager.disposeSession(row.sessionId), true)
+  assert.equal(h.agents.agents.get(row.sessionId), undefined, 'agent released')
+  assert.notEqual(h.manager['store'].getSession(row.sessionId), undefined, 'row kept')
+  assert.equal(await h.manager.disposeSession(row.sessionId), false, 'second dispose is a no-op')
+
+  await h.manager.adopt(row.sessionId, 'x', { createIfMissing: true })
+  assert.notEqual(h.agents.agents.get(row.sessionId), undefined, 'resumed on next touch')
+})
+
+test('workspace writes: create/rename/archive through the registry seam, errors without one', async () => {
+  const h = await harness({ presets: {} }) // no workspaceRegistry option
+  const calls: Array<{ op: string; args: unknown[] }> = []
+  h.root.provide('workspaceRegistry', {
+    list: () => [],
+    create: async (path: string, title?: string) => {
+      calls.push({ op: 'create', args: [path, title] })
+      return { id: 'ws-1', title: title ?? 'proj', path }
+    },
+    get: (id: string) => ({
+      id, title: 'old', path: '/tmp/p', setTitle: async (title: string) => {
+        calls.push({ op: 'setTitle', args: [id, title] })
+      },
+    }),
+    archiveSession: async (id: unknown) => {
+      calls.push({ op: 'archive', args: [String(id)] })
+    },
+    unarchiveSession: async (id: unknown) => {
+      calls.push({ op: 'unarchive', args: [String(id)] })
+    },
+  } as never)
+
+  const created = await h.manager.createWorkspace('/tmp/proj', 'proj')
+  assert.equal(created.id, 'ws-1')
+  const renamed = await h.manager.renameWorkspace('ws-1', 'renamed')
+  assert.equal(renamed.title, 'renamed')
+  await h.manager.archiveSession('some-session', true)
+  await h.manager.archiveSession('some-session', false)
+  assert.deepEqual(calls.map((call) => call.op), ['create', 'setTitle', 'archive', 'unarchive'])
+
+  const bare = await harness({ presets: {} }) // no registry at all
+  await assert.rejects(() => bare.manager.createWorkspace('/tmp/x'), /no workspace registry/)
+  await assert.rejects(() => bare.manager.renameWorkspace('ws-1', 't'), /no workspace/)
+  await assert.rejects(() => bare.manager.archiveSession('s', true), /no workspace registry/)
+})
+
+test('the M20 tools against a fake host: filters, caps, and error shapes', async () => {
+  const { host, calls } = fakeHost([view({ sessionId: 's1', label: 'docs' })])
+  const tools = conciergeTools({
+    ...host,
+    tasks: (opts) => [
+      { taskId: '1', sessionId: 's1', by: 'x', mode: 'followup', summary: 'a', dispatchedAt: 2, state: 'done', reason: 'completed', endedAt: 3 },
+      { taskId: '2', sessionId: 's2', by: 'y', mode: 'followup', summary: 'b', dispatchedAt: 1, state: 'running' },
+    ].filter((task) => opts?.state === undefined || opts.state.includes(task.state)),
+    tail: () => [{ seq: 5, type: 'turn/end', time: 0 }],
+    setSessionLabel: (sessionId, label) => {
+      calls.created.push({ op: 'label', sessionId, label })
+    },
+    disposeSession: async () => true,
+    createWorkspace: async () => ({ id: 'ws', title: 'p', sessionCount: 0 }),
+    renameWorkspace: async (_workspaceId, title) => ({ id: 'ws', title, sessionCount: 0 }),
+    archiveSession: async (sessionId, archived) => {
+      calls.created.push({ op: 'archive', sessionId, archived })
+    },
+  })
+
+  const tasks = await toolOf(tools, 'list_tasks').execute({ state: ['running'] }, EXEC) as { tasks?: Array<{ taskId: string }> }
+  assert.deepEqual(tasks.tasks?.map((task) => task.taskId), ['2'])
+
+  const tail = await toolOf(tools, 'tail_session').execute({ session: 's1', limit: 5 }, EXEC) as { events?: Array<{ type: string }> }
+  assert.deepEqual(tail.events, [{ seq: 5, type: 'turn/end', at: new Date(0).toISOString() }])
+
+  const labeled = await toolOf(tools, 'set_session_label').execute({ session: 's1', label: 'docs' }, EXEC)
+  assert.deepEqual(labeled, { relabeled: true })
+  assert.deepEqual(calls.created.at(-1), { op: 'label', sessionId: 's1', label: 'docs' })
+
+  assert.deepEqual(await toolOf(tools, 'dispose_session').execute({ session: 's1' }, EXEC), { disposed: true })
+  assert.deepEqual((await toolOf(tools, 'create_workspace').execute({ path: '/tmp/p', title: 'P' }, EXEC) as { workspace?: { id: string } }).workspace, { id: 'ws', title: 'p', sessionCount: 0 })
+  assert.deepEqual((await toolOf(tools, 'rename_workspace').execute({ workspace: 'ws', title: 'T' }, EXEC) as { workspace?: { title: string } }).workspace?.title, 'T')
+  assert.deepEqual(await toolOf(tools, 'archive_session').execute({ session: 's1' }, EXEC), { archived: true })
+  assert.deepEqual(await toolOf(tools, 'archive_session').execute({ session: 's1', archived: false }, EXEC), { archived: false })
+})
+
+test('the real manager serves the M20 tools: tasks + tail + dispose end to end', async () => {
+  const h = await harness({ config: ENABLED, presets: {} })
+  await h.manager.adopt(CONCIERGE_SESSION_ID, 'channel:telegram:1')
+  const worker = await h.manager.create({ cwd: '/tmp/w', by: 'channel:telegram:1', label: 'docs' })
+
+  await h.manager.dispatch({ sessionId: worker.sessionId, message: userMsg('go'), by: CONCIERGE_SESSION_ID })
+  runTurn(h.root, h.agents.agents.get(worker.sessionId)!, 1, { assistantText: 'done' })
+  await new Promise<void>((resolve) => setImmediate(resolve))
+
+  const tools = conciergeTools(h.manager as unknown as ConciergeToolHost)
+  const done = await toolOf(tools, 'list_tasks').execute({ state: ['done'] }, EXEC) as { tasks?: Array<{ sessionId: string }> }
+  assert.deepEqual(done.tasks?.map((task) => task.sessionId), [worker.sessionId], 'the worker task folded done')
+
+  const queued = await toolOf(tools, 'list_tasks').execute({ state: ['queued'] }, EXEC) as { tasks?: Array<{ sessionId: string }> }
+  assert.deepEqual(queued.tasks?.map((task) => task.sessionId), [CONCIERGE_SESSION_ID], 'the wake task sits queued on the concierge')
+
+  const tail = await toolOf(tools, 'tail_session').execute({ session: 'docs' }, EXEC) as { events?: unknown[] }
+  assert.ok((tail.events?.length ?? 0) > 0, 'label resolution reaches the live log')
+
+  const disposed = await toolOf(tools, 'dispose_session').execute({ session: 'docs' }, EXEC) as { disposed?: boolean }
+  assert.equal(disposed.disposed, true)
+  assert.equal(h.agents.agents.get(worker.sessionId), undefined)
 })
 
 // ---- pure helpers ----

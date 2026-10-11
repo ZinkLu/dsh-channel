@@ -44,6 +44,7 @@ import {
   type NotificationKind,
   type SessionDetail,
   type SessionView,
+  type TaskState,
   type WorkspaceView,
 } from './types.js'
 import { notifyUserTool, type NotifyToolHost } from './notify-tool.js'
@@ -66,9 +67,14 @@ interface WorkspaceLike {
   title: string
   sessionIds?: readonly string[]
 }
+/** The registry seam as the manager uses it: reads always, writes (M20) when the host composed them. */
 interface WorkspaceRegistryLike {
   list(): WorkspaceLike[]
   resolveByPath?(path: string): Promise<WorkspaceLike | undefined>
+  create?(path: string, title?: string): Promise<WorkspaceLike>
+  get?(id: string): (WorkspaceLike & { setTitle?(title: string): Promise<void> }) | undefined
+  archiveSession?(sessionId: unknown): Promise<void>
+  unarchiveSession?(sessionId: unknown): Promise<void>
 }
 interface SessionProjectionsLike {
   snapshot(session: Session, keys?: readonly string[]): { values: Record<string, unknown> }
@@ -315,6 +321,112 @@ export class SessionManager extends Service implements NotifyToolHost {
   workspaces(): WorkspaceView[] {
     const rows = this.workspaceRows()
     return rows.map((row) => ({ id: row.id, title: row.title, ...(row.path !== undefined ? { path: row.path } : {}), sessionCount: row.sessionCount }))
+  }
+
+  // ---- M20: the full resource-management plane (design §15.2) ----
+
+  /**
+   * Task-centric view across the fleet (M20): every task this manager
+   * tracked, newest first, optionally filtered by session or state. The
+   * "what is running / what died" question, without walking sessions one
+   * by one.
+   */
+  tasks(opts: { sessionId?: SessionId | string; state?: readonly TaskState[] } = {}): ManagerTask[] {
+    const id = opts.sessionId !== undefined ? String(opts.sessionId) : undefined
+    return this.store
+      .listTasks(id)
+      .filter((task) => opts.state === undefined || opts.state.includes(task.state))
+      .sort((a, b) => b.dispatchedAt - a.dispatchedAt || Number(b.taskId) - Number(a.taskId))
+  }
+
+  /**
+   * Live log tail (M20): the last `limit` events of a live agent's session —
+   * the log is the truth (R7), so this reads it directly. Cold sessions
+   * throw (resume them first); the caller decides how much to show.
+   */
+  tail(sessionId: SessionId | string, limit = 20): Array<{ seq: number; type: string; time?: number }> {
+    const id = String(sessionId)
+    const agent = this.ctx.agents.get(SessionId(id))
+    if (agent === undefined) throw new Error(`session ${id} has no live agent; resume it first`)
+    const events = agent.session.snapshotEvents()
+    return events.slice(-Math.max(1, Math.min(limit, 100))).map((event) => ({
+      seq: Number(event.seq),
+      type: String(event.type),
+      ...(event.time !== undefined ? { time: Number(event.time) } : {}),
+    }))
+  }
+
+  /**
+   * Rename (or clear) a managed session's label (M20). Foreign/unmanaged ids
+   * throw — a session this manager never tracked is not ours to retitle.
+   */
+  setSessionLabel(sessionId: SessionId | string, label: string): ManagedSession {
+    const id = String(sessionId)
+    const row = this.store.getSession(id)
+    if (row === undefined) throw new Error(`session ${id} is not managed here`)
+    const next: ManagedSession = label !== ''
+      ? { ...row, label }
+      : (({ label: _cleared, ...rest }) => rest)(row)
+    this.store.putSession(next)
+    return next
+  }
+
+  /**
+   * Release a live agent this manager owns (M20): the handle is disposed and
+   * the in-memory fold dropped; the managed row and the durable log persist,
+   * so a later dispatch resumes it (the same lifecycle as a process restart).
+   * An open turn does not close cleanly — it folds `crashed` on the next
+   * start; `cancel()` is the graceful path. Returns false when the manager
+   * holds no handle for the id (never created here, already released, or
+   * another process's).
+   */
+  async disposeSession(sessionId: SessionId | string): Promise<boolean> {
+    const id = String(sessionId)
+    const handle = this.handles.get(id)
+    if (handle === undefined) return false
+    this.handles.delete(id)
+    this.tracking.delete(id)
+    await handle.dispose()
+    return true
+  }
+
+  /**
+   * Register an existing directory as a workspace (M20, project creation).
+   * Duck-typed: without a registry — or one without writes — this throws and
+   * the tool reports it; the manager's own grouping never depends on writes.
+   */
+  async createWorkspace(path: string, title?: string): Promise<WorkspaceView> {
+    const registry = this.ctx.get('workspaceRegistry') as WorkspaceRegistryLike | undefined
+    if (registry === undefined || typeof registry.create !== 'function') {
+      throw new Error('no workspace registry composed (or it is read-only)')
+    }
+    const workspace = await registry.create(path, title)
+    return { id: String(workspace.id), title: workspace.title, ...(workspace.path !== undefined ? { path: workspace.path } : {}), sessionCount: workspace.sessionIds?.length ?? 0 }
+  }
+
+  /** Retitle a workspace (M20). Unknown ids and read-only registries throw. */
+  async renameWorkspace(workspaceId: string, title: string): Promise<WorkspaceView> {
+    const registry = this.ctx.get('workspaceRegistry') as WorkspaceRegistryLike | undefined
+    const entity = registry?.get?.(workspaceId)
+    if (registry === undefined || entity === undefined) throw new Error(`no workspace ${workspaceId}`)
+    if (typeof entity.setTitle !== 'function') throw new Error('the workspace registry does not support renames')
+    await entity.setTitle(title)
+    return { id: String(entity.id), title, ...(entity.path !== undefined ? { path: entity.path } : {}), sessionCount: entity.sessionIds?.length ?? 0 }
+  }
+
+  /**
+   * Move a session into / out of the workspace archive set (M20): archived
+   * sessions are hidden from every grouping. The registry refuses live
+   * sessions (its `WorkspaceActiveSessionError` propagates verbatim — cancel
+   * or dispose first) and unknown ones.
+   */
+  async archiveSession(sessionId: SessionId | string, archived: boolean): Promise<void> {
+    const registry = this.ctx.get('workspaceRegistry') as WorkspaceRegistryLike | undefined
+    const method = archived ? registry?.archiveSession : registry?.unarchiveSession
+    if (registry === undefined || typeof method !== 'function') {
+      throw new Error('no workspace registry composed (or it does not support archiving)')
+    }
+    await method(SessionId(String(sessionId)))
   }
 
   // ---- N2: session lifecycle and dispatch ----

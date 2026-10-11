@@ -18,6 +18,13 @@ export interface ConciergeToolHost {
   list(opts?: { workspaceId?: string; includeForeign?: boolean }): Promise<SessionView[]>
   describe(sessionId: string): Promise<SessionDetail>
   workspaces(): WorkspaceView[]
+  tasks(opts?: { sessionId?: string; state?: readonly string[] }): ManagerTask[]
+  tail(sessionId: string, limit?: number): Array<{ seq: number; type: string; time?: number }>
+  setSessionLabel(sessionId: string, label: string): unknown
+  disposeSession(sessionId: string): Promise<boolean>
+  createWorkspace(path: string, title?: string): Promise<WorkspaceView>
+  renameWorkspace(workspaceId: string, title: string): Promise<WorkspaceView>
+  archiveSession(sessionId: string, archived: boolean): Promise<void>
   create(opts: { cwd?: string; workspaceId?: string; label?: string; by: string }): Promise<ManagedSession>
   dispatch(opts: { sessionId: string; message: UserMessage; mode?: 'auto' | 'followup' | 'steer'; by: string; watch?: boolean }): Promise<ManagerTask>
   cancel(sessionId: string, cause?: string): Promise<void>
@@ -341,6 +348,204 @@ export function conciergeTools(host: ConciergeToolHost): ConciergeToolDefinition
         return { removed }
       },
     },
+    {
+      name: 'list_tasks',
+      description: 'Every dispatch task this process tracked, newest first — the "what is running / queued / failed / crashed" view across all sessions at once.',
+      parameters: {
+        type: 'object',
+        properties: {
+          state: { type: 'array', items: { type: 'string', enum: ['queued', 'running', 'done', 'failed', 'crashed'] }, description: 'Only these states (e.g. ["running","queued"] for live work, ["failed","crashed"] for what died).' },
+          session: refParam,
+        },
+        additionalProperties: false,
+      },
+      output: {
+        schema: { type: 'object', properties: { tasks: { type: 'array' } }, required: ['tasks'], additionalProperties: false },
+        render: (_args, value) => oneLine(`${Array.isArray((value as { tasks?: unknown[] })?.tasks) ? (value as { tasks: unknown[] }).tasks.length : 0} task(s)`),
+      },
+      async execute(args) {
+        const states = Array.isArray(args?.state) ? args.state.map((state) => String(state)) : undefined
+        let sessionId: string | undefined
+        if (args?.session !== undefined && textOf(args.session) !== '') {
+          const resolved = await resolveSessionRef(host, textOf(args.session))
+          if ('error' in resolved) return { tasks: [], error: resolved.error }
+          sessionId = resolved.sessionId
+        }
+        const tasks = host.tasks({ ...(sessionId !== undefined ? { sessionId } : {}), ...(states !== undefined ? { state: states } : {}) })
+        return {
+          tasks: tasks.slice(0, 50).map((task) => ({
+            taskId: task.taskId,
+            sessionId: task.sessionId,
+            state: task.state,
+            summary: task.summary,
+            by: task.by,
+            dispatchedAt: new Date(task.dispatchedAt).toISOString(),
+            ...(task.endedAt !== undefined ? { endedAt: new Date(task.endedAt).toISOString() } : {}),
+            ...(task.reason !== undefined ? { reason: task.reason } : {}),
+          })),
+        }
+      },
+    },
+    {
+      name: 'tail_session',
+      description: 'The last events of a LIVE session\'s log (turns, messages, tool calls) — see what a running agent is actually doing. Cold sessions must be resumed first.',
+      parameters: {
+        type: 'object',
+        properties: {
+          session: refParam,
+          limit: { type: 'number', description: 'How many events (1–100, default 20).' },
+        },
+        required: ['session'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: { type: 'object', properties: { events: { type: 'array' }, error: { type: 'string' } }, required: ['events'], additionalProperties: false },
+        render: (_args, value) => oneLine((value as { error?: string } | undefined)?.error !== undefined ? `tail failed: ${(value as { error?: string }).error}` : `${(value as { events?: unknown[] }).events?.length ?? 0} event(s)`),
+      },
+      async execute(args) {
+        const ref = textOf(args?.session)
+        if (ref === '') return { events: [], error: 'session is required' }
+        const resolved = await resolveSessionRef(host, ref)
+        if ('error' in resolved) return { events: [], error: resolved.error }
+        const limit = typeof args?.limit === 'number' && Number.isFinite(args.limit) ? Math.trunc(args.limit) : undefined
+        try {
+          const events = await host.tail(resolved.sessionId, limit)
+          return { events: events.map((event) => ({ seq: event.seq, type: event.type, ...(event.time !== undefined ? { at: new Date(event.time).toISOString() } : {}) })) }
+        } catch (error) {
+          return { events: [], error: error instanceof Error ? error.message : String(error) }
+        }
+      },
+    },
+    {
+      name: 'set_session_label',
+      description: 'Set (or clear, with an empty string) a managed session\'s label — organize the fleet so you and the user can address sessions by name.',
+      parameters: {
+        type: 'object',
+        properties: { session: refParam, label: { type: 'string', description: 'New label; empty string clears it.' } },
+        required: ['session', 'label'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: { type: 'object', properties: { relabeled: { type: 'boolean' }, error: { type: 'string' } }, required: ['relabeled'], additionalProperties: false },
+        render: (_args, value) => oneLine((value as { relabeled?: boolean } | undefined)?.relabeled === true ? 'label updated' : `relabel failed: ${(value as { error?: string } | undefined)?.error ?? 'unknown'}`),
+      },
+      async execute(args) {
+        const ref = textOf(args?.session)
+        if (ref === '') return { relabeled: false, error: 'session is required' }
+        const resolved = await resolveSessionRef(host, ref)
+        if ('error' in resolved) return { relabeled: false, error: resolved.error }
+        try {
+          await host.setSessionLabel(resolved.sessionId, textOf(args?.label))
+          return { relabeled: true }
+        } catch (error) {
+          return { relabeled: false, error: error instanceof Error ? error.message : String(error) }
+        }
+      },
+    },
+    {
+      name: 'dispose_session',
+      description: 'Release a live session\'s agent: its resources are freed, the log and managed row persist, and a later dispatch resumes it. An open turn is LOST (folds crashed) — prefer cancel_session for a graceful stop.',
+      parameters: { type: 'object', properties: { session: refParam }, required: ['session'], additionalProperties: false },
+      output: {
+        schema: { type: 'object', properties: { disposed: { type: 'boolean' }, error: { type: 'string' } }, required: ['disposed'], additionalProperties: false },
+        render: (_args, value) => oneLine((value as { disposed?: boolean } | undefined)?.disposed === true ? 'agent released' : 'no owned live agent for that id'),
+      },
+      async execute(args) {
+        const ref = textOf(args?.session)
+        if (ref === '') return { disposed: false, error: 'session is required' }
+        const resolved = await resolveSessionRef(host, ref)
+        if ('error' in resolved) return { disposed: false, error: resolved.error }
+        try {
+          return { disposed: await host.disposeSession(resolved.sessionId) }
+        } catch (error) {
+          return { disposed: false, error: error instanceof Error ? error.message : String(error) }
+        }
+      },
+    },
+    {
+      name: 'create_workspace',
+      description: 'Register an existing directory as a workspace (a project), so sessions can be created and grouped under it. The path must be absolute and already exist.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Absolute path of an existing directory.' },
+          title: { type: 'string', description: 'Display title (defaults to the directory name).' },
+        },
+        required: ['path'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: { type: 'object', properties: { workspace: { type: 'object' }, error: { type: 'string' } }, additionalProperties: false },
+        render: (_args, value) => {
+          const result = value as { workspace?: { id?: string; title?: string }; error?: string } | undefined
+          return oneLine(result?.error !== undefined ? `create failed: ${result.error}` : `workspace ${result?.workspace?.title ?? result?.workspace?.id ?? '?'} ready`)
+        },
+      },
+      async execute(args) {
+        const path = textOf(args?.path)
+        if (path === '') return { error: 'path is required' }
+        try {
+          const workspace = await host.createWorkspace(path, args?.title !== undefined ? textOf(args.title) : undefined)
+          return { workspace }
+        } catch (error) {
+          return { error: error instanceof Error ? error.message : String(error) }
+        }
+      },
+    },
+    {
+      name: 'rename_workspace',
+      description: 'Retitle a workspace (project). Use list_workspaces for the id.',
+      parameters: {
+        type: 'object',
+        properties: { workspace: { type: 'string', description: 'Workspace id.' }, title: { type: 'string' } },
+        required: ['workspace', 'title'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: { type: 'object', properties: { workspace: { type: 'object' }, error: { type: 'string' } }, additionalProperties: false },
+        render: (_args, value) => oneLine((value as { error?: string } | undefined)?.error !== undefined ? `rename failed: ${(value as { error?: string }).error}` : 'workspace retitled'),
+      },
+      async execute(args) {
+        const id = textOf(args?.workspace)
+        const title = textOf(args?.title)
+        if (id === '' || title === '') return { error: 'workspace and title are required' }
+        try {
+          return { workspace: await host.renameWorkspace(id, title) }
+        } catch (error) {
+          return { error: error instanceof Error ? error.message : String(error) }
+        }
+      },
+    },
+    {
+      name: 'archive_session',
+      description: 'Move a session into (or out of) the workspace archive: archived sessions are hidden from every grouping but keep their logs. The registry refuses live sessions — cancel or dispose first.',
+      parameters: {
+        type: 'object',
+        properties: {
+          session: refParam,
+          archived: { type: 'boolean', description: 'true (default) archives; false restores.' },
+        },
+        required: ['session'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: { type: 'object', properties: { archived: { type: 'boolean' }, error: { type: 'string' } }, required: ['archived'], additionalProperties: false },
+        render: (_args, value) => oneLine((value as { error?: string } | undefined)?.error !== undefined ? `archive failed: ${(value as { error?: string }).error}` : (value as { archived?: boolean })?.archived === true ? 'archived' : 'restored'),
+      },
+      async execute(args) {
+        const ref = textOf(args?.session)
+        if (ref === '') return { archived: false, error: 'session is required' }
+        const resolved = await resolveSessionRef(host, ref)
+        if ('error' in resolved) return { archived: false, error: resolved.error }
+        const archived = args?.archived !== false
+        try {
+          await host.archiveSession(resolved.sessionId, archived)
+          return { archived }
+        } catch (error) {
+          return { archived: false, error: error instanceof Error ? error.message : String(error) }
+        }
+      },
+    },
   ]
 }
 
@@ -353,4 +558,11 @@ export const CONCIERGE_TOOL_NAMES = [
   'cancel_session',
   'watch_session',
   'unwatch_session',
+  'list_tasks',
+  'tail_session',
+  'set_session_label',
+  'dispose_session',
+  'create_workspace',
+  'rename_workspace',
+  'archive_session',
 ] as const
