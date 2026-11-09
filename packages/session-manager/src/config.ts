@@ -1,4 +1,5 @@
 import Schema from '@deepseek-ai/schemastery'
+import { DEFAULT_WAKE_LIMIT } from './concierge.js'
 
 /**
  * Plugin-entry config for `dsh-session-manager` (0.2 settings model: the config
@@ -21,6 +22,12 @@ export interface ConciergeConfig {
   cwd?: string
   /** System-prompt instructions for the concierge; default = the built-in text (design §15.5). */
   instructions?: string
+  /**
+   * Consecutive unsuccessful tasks on ONE session before the re-awaken loop
+   * stops waking for it and tells the watchers instead (design §15.4). The
+   * loop's own brake against a crash ping-pong; `0` disables it. Default 3.
+   */
+  wakeLimit?: number
 }
 
 export interface SessionManagerConfig {
@@ -59,6 +66,7 @@ export function sessionManagerConfigSchema() {
       agentPreset: Schema.string(),
       cwd: Schema.string(),
       instructions: Schema.string(),
+      wakeLimit: Schema.number().default(DEFAULT_WAKE_LIMIT),
     }),
   })
 }

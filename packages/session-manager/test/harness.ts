@@ -84,7 +84,7 @@ export function createFakeAgent(id: string, opts: { cwd?: string; agentPreset?: 
 /** The agent-scope ctx factory mirrors dsh's hierarchy: the agent layer shadows root services. */
 export type MakeAgentCtx = () => { get: (name: string) => unknown; on: (event: string, listener: unknown) => () => void }
 
-export function createFakeAgents(makeAgentCtx: MakeAgentCtx): FakeAgentsControl {
+export function createFakeAgents(makeAgentCtx: MakeAgentCtx, driveTurns?: (agent: FakeAgent) => void): FakeAgentsControl {
   const control: FakeAgentsControl = {
     agents: new Map(),
     created: [],
@@ -93,13 +93,31 @@ export function createFakeAgents(makeAgentCtx: MakeAgentCtx): FakeAgentsControl 
     resumable: new Set(),
     service: {},
   }
+  // The real driver opens a turn the moment it takes a message. Tests that
+  // care about fold timing opt into it (`autoTurn`); the rest keep followup
+  // inert so turn boundaries stay under the test's explicit control.
+  const driving = (agent: FakeAgent): FakeAgent => {
+    if (driveTurns === undefined) return agent
+    const followup = agent.followup.bind(agent)
+    const steer = agent.steer.bind(agent)
+    agent.followup = (message) => {
+      followup(message)
+      driveTurns(agent)
+    }
+    agent.steer = (message) => {
+      steer(message)
+      driveTurns(agent)
+    }
+    return agent
+  }
+
   control.service = {
     list: () => [...control.agents.values()],
     get: (id: unknown) => control.agents.get(String(id)),
     create: async (opts: { sessionId: string; meta?: { cwd?: string; agentPreset?: string }; agentOptions?: unknown; setup?: (agentCtx: unknown, agent: unknown) => unknown }) => {
       const id = String(opts.sessionId)
       if (control.agents.has(id)) throw new Error(`session already exists: ${id}`)
-      const agent = createFakeAgent(id, { cwd: opts.meta?.cwd, agentPreset: opts.meta?.agentPreset })
+      const agent = driving(createFakeAgent(id, { cwd: opts.meta?.cwd, agentPreset: opts.meta?.agentPreset }))
       control.agents.set(id, agent)
       control.created.push({ sessionId: id, meta: opts.meta, agentOptions: opts.agentOptions })
       if (opts.setup) await opts.setup(makeAgentCtx(), agent)
@@ -117,7 +135,7 @@ export function createFakeAgents(makeAgentCtx: MakeAgentCtx): FakeAgentsControl 
       if (!control.resumable.has(id)) throw new Error(`no persistence for ${id}`)
       control.resumed.push(id)
       const existing = control.agents.get(id)
-      const agent = existing ?? createFakeAgent(id, { cwd: '/persisted/cwd' })
+      const agent = driving(existing ?? createFakeAgent(id, { cwd: '/persisted/cwd' }))
       if (!existing) control.agents.set(id, agent)
       if (opts.setup) await opts.setup(makeAgentCtx(), agent)
       return {
@@ -153,6 +171,13 @@ export interface HarnessOptions {
   storageDomain?: { fails?: boolean; tables: Record<string, Map<string, unknown>>; globals: Array<unknown> }
   /** Live agents pre-registered before start(). */
   liveAgents?: FakeAgent[]
+  /**
+   * Mirror the real driver: a `followup`/`steer` opens a turn and flips the
+   * agent to `running` at once, instead of leaving turn boundaries to the
+   * test. Use it to exercise the fold's timing (which listener is up when
+   * the driver emits `turn/start`).
+   */
+  autoTurn?: boolean
 }
 
 export interface Harness {
@@ -170,6 +195,11 @@ export interface Harness {
 
 export function createHarness(opts: HarnessOptions = {}): Harness {
   const root = new Context()
+  const openTurn = (agent: FakeAgent): void => {
+    const turn = agent.session.events.filter((event) => event.type === 'turn/start').length + 1
+    agent.status = 'running'
+    emitEvent(root, agent, 'turn/start', { turn })
+  }
   const toolDefinitions = opts.tools?.definitions ?? []
   const agentToolDefinitions: Array<{ name: string }> = []
   const presetCalls = { resolves: [] as Array<string | undefined>, mounts: [] as Array<string | undefined> }
@@ -192,7 +222,7 @@ export function createHarness(opts: HarnessOptions = {}): Harness {
     on: () => () => {},
   })
 
-  const agents = createFakeAgents(makeAgentCtx)
+  const agents = createFakeAgents(makeAgentCtx, opts.autoTurn === true ? openTurn : undefined)
   for (const agent of opts.liveAgents ?? []) agents.agents.set(agent.id, agent)
   for (const id of opts.persistedStats ?? []) agents.resumable.add(id)
   for (const record of opts.sessionQueryRecords ?? []) {

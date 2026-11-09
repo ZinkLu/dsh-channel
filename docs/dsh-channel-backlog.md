@@ -94,6 +94,7 @@ its trigger.
 | **Pre-`/ls` badge numbers can drift from the next `/ls` render order** | Ad-hoc `assignSessionNumber` counting from 1 vs `/ls` replacing the map in render order. Cosmetic | Any user complaint, or notifications start carrying `/use`-actionable references |
 | **`flushBusyQueue` bypasses the manager** | Direct `followup`, no task record — reachable only via the steer-throw fallback, since `queue` mode is unreachable with `supportsSteer: true`. Very narrow surface | A platform without steer, or `/ls` needing to reflect such messages |
 | **Small cleanups bundle** | `shorten` (manager-commands) vs `shortenSessionId` (focus-presentation) duplication; focus-presentation's "dependency-free" claim vs its type-only `NotificationKind` import; `manager.ts`'s dead `task.state !== 'queued'` clause in `onTurnEnd`; watermark entries for steer tasks never reclaimed; the "Root listeners" comment vs plugin-scope ctx; provisional-store copy-forward inconsistency for subscriptions/outbox; `create({workspaceId})` without a matching `cwd` storing a decorative grouping | The next time any of these files is touched for a real change |
+| **The idle edge's `queued → failed/canceled` sweep is a heuristic** | It mislabels a just-dispatched task whose `followup` is still sitting in the agent's inbox. dsh's idle means quiescence (a non-empty inbox is not idle), so the window should be closed in practice — but the one task it would always hit is the concierge's own wake task, and only a real-stack run can prove it never fires. Worth watching in the headless self-test rather than guessing at | A dev-bot or self-test run showing a wake task in `failed/canceled`, or dsh documenting a followup that admits an idle edge before the turn opens |
 
 ---
 
@@ -172,6 +173,15 @@ stated reason, not rediscovering the option.
 - **No per-chat "manager conversation log".** Command round-trips enter no session log (the same
   reasoning as `ctx.commands`' non-turn `command/run`); audit consumers listen to
   `manager/task` / `manager/notification`.
+- **A periodic reaper for lost concierge wakes.** §15.4's at-least-once leg is a **sweep on the
+  concierge's idle edge**, not a timer. Rejected: a low-frequency `setInterval` re-running the
+  unwoken-task scan — it retries when the concierge has been idle for hours (a burst of stale
+  re-awakens as one turn) and it adds the only timer in a package that has none, with its own R1
+  teardown to get right. Adopted instead: the idle edge *is* the event "the loop is live and free
+  right now", and it only fires while there is something to retry into. **Trigger to revisit:** an
+  observable case the idle edge misses — a wake lost while the concierge sits idle and never runs
+  again costs one deferred report until it is next adopted, which is arguably the right trade; if
+  it ever is not, the timer is the fix.
 
 ---
 

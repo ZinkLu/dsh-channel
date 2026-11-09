@@ -48,7 +48,7 @@ import {
   type WorkspaceView,
 } from './types.js'
 import { notifyUserTool, type NotifyToolHost } from './notify-tool.js'
-import { CONCIERGE_SESSION_ID, conciergeSection, reawakenText, resolveConciergeConfig } from './concierge.js'
+import { CONCIERGE_SESSION_ID, DEFAULT_WAKE_LIMIT, INITIAL_WAKE_BUDGET, conciergeSection, reawakenText, resolveConciergeConfig, wakeBudgetReduce, type WakeBudget } from './concierge.js'
 import { conciergeTools } from './concierge-tools.js'
 
 // ---- duck types for the optional dsh services (never imported) ----
@@ -125,6 +125,8 @@ export class SessionManager extends Service implements NotifyToolHost {
   private readonly watermarks: Watermarks = new Map()
   private readonly notificationHandlers = new Map<string, Set<(notification: ManagerNotification) => void>>()
   private readonly ensureChains = new Map<string, Promise<void>>()
+  /** The re-awaken loop's own brake, per target session (§15.4); in-memory on purpose. */
+  private readonly wakeBudgets = new Map<string, WakeBudget>()
   private readonly disposers: Array<() => void> = []
   private started = false
   private stopped = false
@@ -176,22 +178,19 @@ export class SessionManager extends Service implements NotifyToolHost {
       if (row.deferred === true) this.trackingFor(row.sessionId)
     }
 
-    // Concierge (design §15): the pre-written row is data only; wake recovery
-    // runs BEFORE the live listener registers so restart-folded tasks are
-    // handled exactly once, by this scan rather than by an emit replay.
+    // Concierge (design §15): the pre-written row is data only.
     await this.prewriteConciergeRow()
+
+    // The FOLD listeners go up BEFORE the concierge scan, not after it: a
+    // recovery wake starts a real turn on the concierge, and that turn has to
+    // fold like any other — its wake task binds to a turn and closes instead
+    // of lying in the table as `queued` forever. Only `manager/task`, the wake
+    // edge itself, waits for the scan below, so a restart-folded task is still
+    // handled by the scan alone and never by both paths.
+    this.installFoldListeners()
+
     await this.recoverConciergeWakes()
 
-    // Root listeners see every agent of the process, including ones the web UI
-    // opened (dsh-scope: events flow upward) — that is exactly the point (V3).
-    this.disposers.push(this.ctx.on('session/event', (session: Session, event: SessionEvent) => {
-      this.onSessionEvent(session, event)
-    }))
-    this.disposers.push(this.ctx.on('agent/status', ({ agent, status }: { agent: Agent; status: string }) => {
-      if (status === 'idle') this.onAgentIdle(String(agent.id))
-    }))
-    this.disposers.push(this.observeInteraction('approval/request', 'approval'))
-    this.disposers.push(this.observeInteraction('user-questions/request', 'question'))
     this.disposers.push(this.ctx.on('manager/task', (task: ManagerTask) => {
       this.onConciergeTaskEvent(task)
     }))
@@ -206,6 +205,23 @@ export class SessionManager extends Service implements NotifyToolHost {
     }
   }
 
+  /**
+   * Everything the log fold needs: turn boundaries (tasks), the idle edge
+   * (notifications), and the two interaction waterfalls. Root listeners see
+   * every agent of the process, including ones the web UI opened (dsh-scope:
+   * events flow upward) — that is exactly the point (V3).
+   */
+  private installFoldListeners(): void {
+    this.disposers.push(this.ctx.on('session/event', (session: Session, event: SessionEvent) => {
+      this.onSessionEvent(session, event)
+    }))
+    this.disposers.push(this.ctx.on('agent/status', ({ agent, status }: { agent: Agent; status: string }) => {
+      if (status === 'idle') this.onAgentIdle(String(agent.id))
+    }))
+    this.disposers.push(this.observeInteraction('approval/request', 'approval'))
+    this.disposers.push(this.observeInteraction('user-questions/request', 'question'))
+  }
+
   async stop(): Promise<void> {
     if (!this.started || this.stopped) return
     this.stopped = true
@@ -217,6 +233,7 @@ export class SessionManager extends Service implements NotifyToolHost {
       }
     }
     this.notificationHandlers.clear()
+    this.wakeBudgets.clear()
     for (const [sessionId, handle] of [...this.handles]) {
       try {
         await handle.dispose()
@@ -753,6 +770,15 @@ export class SessionManager extends Service implements NotifyToolHost {
     }
     this.releaseDeferred(sessionId, ended)
     if (tracking.pendingInteraction !== undefined) tracking.pendingInteraction = undefined
+
+    // The re-awaken loop's live at-least-once leg: a wake that failed to land
+    // left its task unstamped, and this is the next moment we know the
+    // concierge is live and free. Deferred one microtask — never drive an
+    // agent from inside its own status emit.
+    if (sessionId === CONCIERGE_SESSION_ID && this.unwokenConciergeTasks().length > 0) {
+      queueMicrotask(() => void this.sweepUnwokenConciergeWakes())
+    }
+
     this.pruneTracking(sessionId, tracking)
   }
 
@@ -1019,6 +1045,22 @@ export class SessionManager extends Service implements NotifyToolHost {
   }
 
   /**
+   * Terminal tasks the concierge dispatched that no wake has claimed yet. Two
+   * readers: the startup scan below, and the live sweep at the concierge's next
+   * idle edge — the at-least-once legs of §15.4.
+   */
+  private unwokenConciergeTasks(): ManagerTask[] {
+    return this.store
+      .listTasks()
+      .filter((task) =>
+        task.by === CONCIERGE_SESSION_ID &&
+        task.sessionId !== CONCIERGE_SESSION_ID &&
+        task.wokeAt === undefined &&
+        (task.state === 'done' || task.state === 'failed' || task.state === 'crashed'))
+      .sort((a, b) => (a.endedAt ?? a.dispatchedAt) - (b.endedAt ?? b.dispatchedAt))
+  }
+
+  /**
    * §15.4 crash recovery: terminal tasks the concierge dispatched but that
    * were never woken (a crash between the fold and the followup). The manager
    * owns the concierge's existence, so STARTUP recovery may spawn it — the one
@@ -1028,14 +1070,7 @@ export class SessionManager extends Service implements NotifyToolHost {
   private async recoverConciergeWakes(): Promise<void> {
     const cfg = this.conciergeCfg()
     if (cfg === undefined) return
-    const candidates = this.store
-      .listTasks()
-      .filter((task) =>
-        task.by === CONCIERGE_SESSION_ID &&
-        task.sessionId !== CONCIERGE_SESSION_ID &&
-        task.wokeAt === undefined &&
-        (task.state === 'done' || task.state === 'failed' || task.state === 'crashed'))
-      .sort((a, b) => (a.endedAt ?? a.dispatchedAt) - (b.endedAt ?? b.dispatchedAt))
+    const candidates = this.unwokenConciergeTasks()
     if (candidates.length === 0) return
     try {
       await this.adopt(CONCIERGE_SESSION_ID, 'manager')
@@ -1043,11 +1078,32 @@ export class SessionManager extends Service implements NotifyToolHost {
       this.warn(`concierge wake recovery could not adopt the concierge: ${errorMessage(error)}`)
       return
     }
+    await this.deliverConciergeWakes(candidates)
+  }
+
+  /**
+   * The live half of the same guarantee: a wake that threw left its task
+   * unstamped, and the concierge's own idle edge is the next moment we know
+   * for certain that it is live and free. Never spawns — by construction the
+   * agent just went idle.
+   */
+  private async sweepUnwokenConciergeWakes(): Promise<void> {
+    if (this.stopped || this.conciergeCfg() === undefined) return
+    try {
+      await this.deliverConciergeWakes(this.unwokenConciergeTasks())
+    } catch (error) {
+      this.warn(`concierge wake sweep failed: ${errorMessage(error)}`)
+    }
+  }
+
+  private async deliverConciergeWakes(candidates: ManagerTask[]): Promise<void> {
     for (const task of candidates) {
       try {
         await this.wakeConcierge(task)
       } catch (error) {
-        this.warn(`concierge wake recovery failed for task ${task.taskId}: ${errorMessage(error)}`)
+        // No stamp: the next sweep (this session's idle, or the next start)
+        // retries it. at-least-once, per §15.4.
+        this.warn(`concierge wake failed for task ${task.taskId}: ${errorMessage(error)}`)
       }
     }
   }
@@ -1071,23 +1127,42 @@ export class SessionManager extends Service implements NotifyToolHost {
       return
     }
     void this.wakeConcierge(task).catch((error) => {
+      // Deliberately unstamped, so the idle-edge sweep retries it.
       this.warn(`concierge wake failed for task ${task.taskId}: ${errorMessage(error)}`)
     })
   }
 
-  /** Dispatch the synthetic followup, then stamp `wokeAt` (§15.4: at-least-once prefers a rare duplicate to a lost report). */
+  /**
+   * Dispatch the synthetic followup, then stamp `wokeAt` (§15.4: at-least-once
+   * prefers a rare duplicate to a lost report). The wake path's brake
+   * (`wakeBudgetReduce`) may replace the dispatch with a notice to the humans;
+   * either way the task is stamped, because the loop has now DECIDED about it
+   * and a restart must not decide again.
+   */
   private async wakeConcierge(task: ManagerTask): Promise<void> {
     const agent = this.ctx.agents.get(SessionId(CONCIERGE_SESSION_ID))
     if (agent === undefined) return
     const label = this.store.getSession(task.sessionId)?.label
-    await this.dispatch({
-      sessionId: CONCIERGE_SESSION_ID,
-      message: createUserMessage({
-        content: [{ type: 'text', text: reawakenText(task, label) }],
-        source: { kind: 'manager', origin: 'concierge-wake' },
-      }),
-      by: CONCIERGE_SESSION_ID,
+    const decision = wakeBudgetReduce(this.wakeBudgets.get(task.sessionId) ?? INITIAL_WAKE_BUDGET, {
+      state: task.state,
+      limit: this.config.concierge?.wakeLimit ?? DEFAULT_WAKE_LIMIT,
+      sessionId: task.sessionId,
+      ...(label !== undefined ? { label } : {}),
     })
+    this.wakeBudgets.set(task.sessionId, decision.next)
+    if (decision.action === 'wake') {
+      await this.dispatch({
+        sessionId: CONCIERGE_SESSION_ID,
+        message: createUserMessage({
+          content: [{ type: 'text', text: reawakenText(task, label) }],
+          source: { kind: 'manager', origin: 'concierge-wake' },
+        }),
+        by: CONCIERGE_SESSION_ID,
+      })
+    } else if (decision.notice !== undefined) {
+      // The concierge will not hear this one, so the humans who watch IT do.
+      this.fanout(CONCIERGE_SESSION_ID, 'notify', decision.notice)
+    }
     // Bookkeeping only — deliberately NOT an emitTask transition.
     this.store.putTask({ ...task, wokeAt: Date.now() })
   }

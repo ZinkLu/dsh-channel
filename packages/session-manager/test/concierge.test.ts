@@ -10,9 +10,12 @@ import {
   CONCIERGE_SECTION_NAME,
   CONCIERGE_SECTION_ORDER,
   CONCIERGE_TOOL_NAMES,
+  DEFAULT_WAKE_LIMIT,
+  INITIAL_WAKE_BUDGET,
   conciergeTools,
   reawakenText,
   resolveSessionRef,
+  wakeBudgetReduce,
   type ConciergeToolDefinition,
   type ConciergeToolHost,
 } from '../src/index.ts'
@@ -474,6 +477,139 @@ test('restart recovery leaves chat-dispatched tasks alone', async () => {
   await second.manager.start()
   managers.push(second.manager)
   assert.equal(second.agents.created.length, 0, 'no concierge spawn for a chat-dispatched task')
+})
+
+test('startup recovery folds its own turn: the wake task binds to a turn and closes', async () => {
+  const store = createMemoryManagerStore()
+  const first = createHarness({ config: ENABLED, presets: {}, store })
+  await first.manager.start()
+  const worker = await first.manager.create({ cwd: '/tmp/w', by: 'channel:telegram:1', label: 'docs' })
+  store.putTask({
+    taskId: '9', sessionId: worker.sessionId, by: CONCIERGE_SESSION_ID, mode: 'followup',
+    summary: 'fix the README', dispatchedAt: 1, state: 'done', reason: 'completed', endedAt: 2,
+  })
+  await first.manager.stop()
+
+  // autoTurn: the recovery followup opens a real turn the moment it lands,
+  // like dsh's driver. This only holds if the fold listeners were already up
+  // when the scan ran — otherwise the wake task never leaves `queued`.
+  const second = createHarness({ config: ENABLED, presets: {}, store, autoTurn: true })
+  await second.manager.start()
+  managers.push(second.manager)
+
+  const concierge = second.agents.agents.get(CONCIERGE_SESSION_ID)!
+  const wakeTask = second.manager['store'].listTasks(CONCIERGE_SESSION_ID)[0]!
+  assert.equal(wakeTask.state, 'running', 'the recovery wake bound to a turn instead of lingering queued')
+  assert.equal(wakeTask.turn, 1)
+
+  runTurn(second.root, concierge, 1, { assistantText: 'reported' })
+  const closed = second.manager['store'].listTasks(CONCIERGE_SESSION_ID)[0]!
+  assert.equal(closed.state, 'done')
+  assert.equal(closed.reason, 'completed')
+})
+
+test('a wake lost while the process is live is retried at the concierge\'s next idle edge', async () => {
+  const h = await harness({ config: ENABLED, presets: {} })
+  await conciergeWithWorker(h)
+  const concierge = h.agents.agents.get(CONCIERGE_SESSION_ID)!
+  const worker = (await h.manager.list()).find((entry) => entry.label === 'docs')!
+
+  // The live twin of the crash window: terminal, concierge-dispatched,
+  // unstamped — but nothing emitted, so only the sweep can find it.
+  h.manager['store'].putTask({
+    taskId: '42', sessionId: worker.sessionId, by: CONCIERGE_SESSION_ID, mode: 'followup',
+    summary: 'fix the README', dispatchedAt: 1, state: 'done', reason: 'completed', endedAt: 2,
+  })
+
+  runTurn(h.root, concierge, 1, { assistantText: 'ok' })
+  await flush()
+
+  assert.equal(concierge.followed.length, 1)
+  assert.match((concierge.followed[0]!.content[0] as { text: string }).text, /Task #42/)
+})
+
+// ---- §15.4 the loop's own brake (no crash ping-pong) ----
+
+test('wakeBudgetReduce: progress re-arms the loop, a streak cuts the wake and warns once', () => {
+  const crash = { state: 'crashed' as const, limit: 3, sessionId: 'w1' }
+
+  const first = wakeBudgetReduce(INITIAL_WAKE_BUDGET, crash)
+  assert.equal(first.action, 'wake')
+  const second = wakeBudgetReduce(first.next, crash)
+  assert.equal(second.action, 'wake')
+
+  const third = wakeBudgetReduce(second.next, crash)
+  assert.equal(third.action, 'cut')
+  assert.equal(third.next.cut, true)
+  assert.match(third.notice!, /w1/)
+  assert.match(third.notice!, /resumes/)
+
+  // Already cut: silent. A stuck loop must not spam the chat once per task.
+  const fourth = wakeBudgetReduce(third.next, crash)
+  assert.equal(fourth.action, 'cut')
+  assert.equal(fourth.notice, undefined)
+
+  // One success clears the streak and re-arms it.
+  assert.deepEqual(
+    wakeBudgetReduce(fourth.next, { state: 'done', limit: 3, sessionId: 'w1' }),
+    { action: 'wake', next: INITIAL_WAKE_BUDGET },
+  )
+  assert.equal(wakeBudgetReduce(INITIAL_WAKE_BUDGET, { state: 'done', limit: 3, sessionId: 'w1' }).action, 'wake')
+
+  // limit 0 is the escape hatch: the pre-brake behavior, forever.
+  assert.equal(wakeBudgetReduce(third.next, { ...crash, limit: 0 }).action, 'wake')
+
+  // A label reads better than a raw id in the notice.
+  assert.match(
+    (wakeBudgetReduce({ streak: 2, cut: false }, { state: 'failed', limit: 3, sessionId: 'w1', label: 'docs' }).notice) ?? '',
+    /"docs"/,
+  )
+})
+
+test('a session that keeps failing stops being woken after the limit, and the humans are told', async () => {
+  const h = await harness({ config: ENABLED, presets: {} })
+  await conciergeWithWorker(h)
+  const concierge = h.agents.agents.get(CONCIERGE_SESSION_ID)!
+  const worker = (await h.manager.list()).find((entry) => entry.label === 'docs')!
+  const agent = h.agents.agents.get(worker.sessionId)!
+  h.manager.watch('channel:telegram:1', CONCIERGE_SESSION_ID, ['notify'])
+
+  for (let i = 0; i < 4; i++) {
+    await h.manager.dispatch({ sessionId: worker.sessionId, message: userMsg('go'), by: CONCIERGE_SESSION_ID })
+    runTurn(h.root, agent, i + 1, { reason: 'interrupted' })
+    await flush()
+  }
+
+  // The brake engages ON the third failure, so exactly two followups land.
+  assert.equal(concierge.followed.length, DEFAULT_WAKE_LIMIT - 1, 'the last task is settled without a followup')
+  const notices = h.manager.pending('channel:telegram:1').filter((row) => row.text.includes('re-awakening stopped'))
+  assert.equal(notices.length, 1)
+  assert.match(notices[0]!.text, /"docs"/)
+  // Every task is stamped, so a restart re-decides none of them.
+  assert.ok(h.manager['store'].listTasks(worker.sessionId).every((task) => task.wokeAt !== undefined))
+})
+
+test('the brake is per session: one broken session never silences a healthy one', async () => {
+  const h = await harness({ config: ENABLED, presets: {} })
+  await conciergeWithWorker(h)
+  const concierge = h.agents.agents.get(CONCIERGE_SESSION_ID)!
+  const broken = (await h.manager.list()).find((entry) => entry.label === 'docs')!
+  const healthy = await h.manager.create({ cwd: '/tmp/w2', by: CONCIERGE_SESSION_ID, label: 'tests' })
+
+  for (let i = 0; i < DEFAULT_WAKE_LIMIT + 1; i++) {
+    await h.manager.dispatch({ sessionId: broken.sessionId, message: userMsg('go'), by: CONCIERGE_SESSION_ID })
+    runTurn(h.root, h.agents.agents.get(broken.sessionId)!, i + 1, { reason: 'interrupted' })
+    await flush()
+  }
+  const afterBroken = concierge.followed.length
+
+  await h.manager.dispatch({ sessionId: healthy.sessionId, message: userMsg('go'), by: CONCIERGE_SESSION_ID })
+  runTurn(h.root, h.agents.agents.get(healthy.sessionId)!, 1)
+  await flush()
+
+  assert.equal(afterBroken, DEFAULT_WAKE_LIMIT - 1)
+  assert.equal(concierge.followed.length, afterBroken + 1)
+  assert.match((concierge.followed.at(-1)!.content[0] as { text: string }).text, /ended: done/)
 })
 
 // ---- the real manager as tool host (C4 through the real dispatch path) ----

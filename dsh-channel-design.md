@@ -1282,9 +1282,30 @@ concierge turn                        →  describe_session(X) as needed → str
   with no `wokeAt`; the startup scan finds it, adopts the concierge (the manager owns its
   existence — the one place a wake path spawns it), and wakes it. (b) crash between the wake
   dispatch and the stamp — the followup is already in the concierge's log (the log is the truth,
-  R7) AND the scan re-wakes once: a rare, benign duplicate rather than a lost report. The scan
-  runs BEFORE the live listener registers, so restart-folded tasks are handled by the scan
-  alone — no double path.
+  R7) AND the scan re-wakes once: a rare, benign duplicate rather than a lost report.
+- **Only `manager/task` waits for the scan; the fold listeners do not.** The scan must be the
+  only path for restart-folded tasks, so `manager/task` registers after it. The `session/event`
+  and `agent/status` listeners are the *fold*, not the wake edge, and they register BEFORE it:
+  a recovery wake starts a real turn on the concierge, and that turn has to fold like any other
+  — its wake task binds to a turn and closes instead of lying in the table as `queued` forever,
+  and its turn-end reaches the subscribers. One edge (the wake) cannot afford to be seen twice;
+  the other three can afford nothing.
+- **A wake that never landed is retried in-process.** A throw inside `wakeConcierge` leaves the
+  task unstamped, and without a second reader that report is lost until the next restart — the
+  live path was at-most-once, not at-least-once as §15.4 claims. So the concierge's own **idle
+  edge** sweeps the same candidate set as the startup scan: that is the next moment we know for
+  certain the agent is live and free. It never spawns (by construction the agent just went idle),
+  it is deferred one microtask (never drive an agent from inside its own status emit), and it
+  costs nothing when there is nothing to find. No timer: an idle edge is a retry trigger that
+  only fires while the loop is live anyway.
+- **The loop's own brake.** Nothing bounded the loop: a session that keeps crashing ping-pongs
+  against the concierge forever, two LLM turns per cycle with nobody asking for it. A per-target
+  streak of consecutive `failed`/`crashed` tasks (`wakeBudgetReduce`, pure, in-memory — a
+  liveness guard for THIS process, not a durable fact) engages at `wakeLimit`. A cut task is
+  stamped like a woken one and gets **no** followup; instead one `notify` row goes to the
+  *concierge's* subscribers — the concierge is not being told, because it is not being woken.
+  A single `done` clears the streak and re-arms it: progress re-opens the loop, not time.
+  Per target session, so one broken session cannot silence a healthy one.
 - If the concierge agent is not live when a live-process wake fires, the glue skips with one
   warn — a wake must never spawn the agent outside startup recovery.
 - Re-awaken applies to terminal states only; a `queued`/`running` emit (e.g. a steer join) is
@@ -1299,6 +1320,7 @@ concierge: object({
   agentPreset: string(),        // default: the host's default preset (resolvePresetId ladder)
   cwd: string(),                // default: the manager cwd
   instructions: string(),       // default: the built-in text below
+  wakeLimit: number().default(3), // consecutive failures per session before the brake; 0 = off
 })
 ```
 
@@ -1335,6 +1357,13 @@ alone. Default text (v1):
 - **Integration (in-memory fakes):** the full loop — chat focuses the concierge, concierge
   dispatches to a worker, worker's turn ends, concierge re-awakened exactly once; crash-restart
   mid-loop re-folds and re-awakens without doubling.
+- **Loop hardening (M19 follow-up):** the recovery wake's OWN turn folds (an `autoTurn` harness —
+  one whose `followup` opens a turn the way dsh's driver does — pins the listener ordering of
+  §15.4: without the fold listeners coming up before the scan, the recovery wake task stays
+  `queued` forever); a wake lost in-process is re-swept at the concierge's next idle edge;
+  `wakeBudgetReduce` exhaustively (wake / cut-once / re-arm-on-success / `limit: 0`), plus the
+  two integration shapes — a failing session stops being woken and the humans get exactly one
+  notice, and a broken session never silences a healthy one.
 - **Headless real-stack self-test** (`scripts/concierge-selftest.mjs`, manual, needs
   `DEEPSEEK_API_KEY`; validated 2026-10 on 0.2.1-alpha.2, 14/14): the REAL AgentLoop + LlmRuntime
   + ToolRuntime + SystemPrompt composition — the model genuinely calls the tools (tool

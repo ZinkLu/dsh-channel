@@ -42,11 +42,14 @@ export {
   CONCIERGE_SECTION_ORDER,
   DEFAULT_CONCIERGE_INSTRUCTIONS,
   DEFAULT_CONCIERGE_LABEL,
+  DEFAULT_WAKE_LIMIT,
+  INITIAL_WAKE_BUDGET,
   conciergeSection,
   reawakenText,
   resolveConciergeConfig,
+  wakeBudgetReduce,
 } from './concierge.js'
-export type { ResolvedConciergeConfig } from './concierge.js'
+export type { ResolvedConciergeConfig, WakeBudget, WakeDecision } from './concierge.js'
 export { conciergeTools, CONCIERGE_TOOL_NAMES, resolveSessionRef } from './concierge-tools.js'
 export type { ConciergeToolDefinition, ConciergeToolExec, ConciergeToolHost } from './concierge-tools.js'
 export type { ConciergeConfig } from './config.js'
